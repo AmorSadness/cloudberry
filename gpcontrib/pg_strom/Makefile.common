@@ -1,7 +1,11 @@
 PG_CONFIG ?= pg_config
 VERSION ?= 6.1
 RELEASE ?= 0
-GITHASH_IF_NOT_GIVEN := HEAD
+GITHASH_IF_NOT_GIVEN := 4d12ef415759dc48cd4c1421565e9c694b7bd3f9
+# This vendored tree has no nested .git directory.  Do not accidentally stamp
+# the surrounding Cloudberry repository commit into the PG-Strom binary.
+GITHASH := $(GITHASH_IF_NOT_GIVEN)
+PGSTROM_GITHASH := $(GITHASH_IF_NOT_GIVEN)::cloudberry_mvp
 
 #
 # PostgreSQL major version

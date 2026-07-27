@@ -32,6 +32,13 @@ static gpumask_t gpudirect_supported_gpus = 0UL;
 static bool
 pgstrom_gpudirect_enabled_checker(bool *newval, void **extra, GucSource source)
 {
+#ifdef GP_VERSION_NUM
+	if (*newval)
+	{
+		GUC_check_errdetail("GPU-Direct SQL is outside the Cloudberry GpuScan MVP.");
+		return false;
+	}
+#endif
 	if (*newval && gpudirect_supported_gpus == 0UL)
 	{
 		elog(ERROR, "unable to turn on pg_strom.gpudirect_enabled without any GPU device that supports GPU-Direct SQL");
@@ -1013,7 +1020,11 @@ pgstrom_init_gpu_options(void)
 							 "enables GPUDirect SQL",
 							 NULL,
 							 &pgstrom_gpudirect_enabled,
-							 (gpudirect_supported_gpus != 0UL),
+#ifdef GP_VERSION_NUM
+								 false,
+#else
+								 (gpudirect_supported_gpus != 0UL),
+#endif
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 pgstrom_gpudirect_enabled_checker, NULL, NULL);

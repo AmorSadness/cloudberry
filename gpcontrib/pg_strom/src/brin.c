@@ -240,7 +240,11 @@ estimateBrinIndexScanNBlocks(PlannerInfo *root,
 											 indexQuals,
 											 baserel->relid,
 											 JOIN_INNER,
-											 NULL);
+											 NULL
+#ifdef GP_VERSION_NUM
+											 , false
+#endif
+											 );
 
 	/* estimate number of blocks to read */
 	indexRanges = ceil((double) baserel->pages / statsData.pagesPerRange);

@@ -1368,7 +1368,7 @@ aggfunc_catalog_lookup_by_oid(Oid aggfn_oid)
 				for (int j=0; j < proc->pronargs; j++)
 				{
 					Oid		type_oid = proc->proargtypes.values[j];
-					char   *type_name = get_type_name(type_oid, false);
+					char   *type_name = pgstrom_get_type_name(type_oid, false);
 
 					off += sprintf(buf + off, "%s%s",
 								   (j>0 ? "," : ""),
@@ -1454,7 +1454,7 @@ finalfunc_catalog_lookup_by_oid(Oid func_oid)
 			for (int j=0; j < proc->pronargs; j++)
 			{
 				Oid		type_oid = proc->proargtypes.values[j];
-				char   *type_name = get_type_name(type_oid, false);
+				char   *type_name = pgstrom_get_type_name(type_oid, false);
 
 				if (j > 0)
 					buf[off++] = ',';
@@ -2100,13 +2100,20 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con, Path *part_path)
 										 con->target_agg_final,
 										 AGG_HASHED,
 										 AGGSPLIT_SIMPLE,
+#ifdef GP_VERSION_NUM
+										 false,
+#endif
 										 parse->groupClause,
 										 con->havingAggQuals,
 										 &con->final_agg_clause_costs,
 										 con->num_groups);
 		if (con->has_aggfuncs)
 			__path = pgstrom_create_dummy_path(con->root, __path);
-		add_path(con->group_rel, __path);
+		add_path(con->group_rel, __path
+#ifdef GP_VERSION_NUM
+				 , con->root
+#endif
+				 );
 	}
 	else if (parse->distinctClause)
 	{
@@ -2117,12 +2124,19 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con, Path *part_path)
 										 con->target_agg_final,
 										 AGG_HASHED,
 										 AGGSPLIT_SIMPLE,
+#ifdef GP_VERSION_NUM
+										 false,
+#endif
 										 parse->distinctClause,
 										 con->havingAggQuals,
 										 &con->final_agg_clause_costs,
 										 con->num_groups);
 		Assert(!con->has_aggfuncs);
-		add_path(con->group_rel, __path);
+		add_path(con->group_rel, __path
+#ifdef GP_VERSION_NUM
+				 , con->root
+#endif
+				 );
 	}
 	else
 	{
@@ -2132,13 +2146,20 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con, Path *part_path)
 										 con->target_agg_final,
 										 AGG_PLAIN,
 										 AGGSPLIT_SIMPLE,
+#ifdef GP_VERSION_NUM
+										 false,
+#endif
 										 parse->groupClause,
 										 con->havingAggQuals,
 										 &con->final_agg_clause_costs,
 										 con->num_groups);
 		if (con->has_aggfuncs)
 			__path = pgstrom_create_dummy_path(con->root, __path);
-		add_path(con->group_rel, __path);
+		add_path(con->group_rel, __path
+#ifdef GP_VERSION_NUM
+				 , con->root
+#endif
+				 );
 	}
 }
 
@@ -2258,7 +2279,7 @@ lookup_gpusort_keykind(Node *f_expr, PathTarget *part_target)
 		off += sprintf(namebuf+off, "%s(", get_func_name(func->funcid));
 		if (farg)
 		{
-			char   *type_name = get_type_name(exprType(farg), true);
+			char   *type_name = pgstrom_get_type_name(exprType(farg), true);
 
 			if (type_name)
 				off += sprintf(namebuf+off, "%s", type_name);
@@ -2587,7 +2608,11 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 		if (con.has_aggfuncs)
 			__path = pgstrom_create_dummy_path(root, __path);
 		/* add fully-work */
-		add_path(group_rel, __path);
+		add_path(group_rel, __path
+#ifdef GP_VERSION_NUM
+				 , root
+#endif
+				 );
 
 		/*
 		 * consider the Sorted GPU-PreAgg Path opportunity, if available
@@ -3357,7 +3382,11 @@ XpuPreAggAddCustomPath(PlannerInfo *root,
 
 			__path = tryGpuSortWithWindowRankPath(root, NULL, __path);
 			if (__path)
-				add_path(upper_rel, __path);
+				add_path(upper_rel, __path
+#ifdef GP_VERSION_NUM
+						 , root
+#endif
+						 );
 		}
 	}
 	else if (upper_stage == UPPERREL_FINAL && pgstrom_enable_gpusort)
@@ -3370,7 +3399,11 @@ XpuPreAggAddCustomPath(PlannerInfo *root,
 
 			__path = tryGpuSortWithLimitPath(root, __path);
 			if (__path)
-				add_path(upper_rel, __path);
+				add_path(upper_rel, __path
+#ifdef GP_VERSION_NUM
+						 , root
+#endif
+						 );
 		}
 	}
 }

@@ -31,6 +31,10 @@
 #include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
+#ifdef GP_VERSION_NUM
+#include "catalog/gp_distribution_policy.h"
+#include "cdb/cdbpathlocus.h"
+#endif
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
 #include "catalog/indexing.h"
@@ -1113,7 +1117,7 @@ extern size_t	appendBinaryLargeStringInfo(LargeStringInfo buf,
 extern size_t	appendStringLargeStringInfo(LargeStringInfo buf, const char *str);
 extern size_t	appendZeroLargeStringInfo(LargeStringInfo buf, size_t nbytes);
 extern void		enlargeLargeStringInfo(LargeStringInfo buf, size_t needed);
-extern char	   *get_type_name(Oid type_oid, bool missing_ok);
+extern char	   *pgstrom_get_type_name(Oid type_oid, bool missing_ok);
 extern Oid		get_type_namespace(Oid type_oid);
 extern char	   *get_type_extension_name(Oid type_oid);
 extern char	   *get_func_extension_name(Oid func_oid);

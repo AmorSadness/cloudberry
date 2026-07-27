@@ -411,7 +411,11 @@ __relScanDirectFallbackBlock(pgstromTaskState *pts,
 		htup.t_len = ItemIdGetLength(lpp);
 		ItemPointerSet(&htup.t_self, block_num, lineoff);
 
-		valid = HeapTupleSatisfiesVisibility(&htup, snapshot, buffer);
+		valid = HeapTupleSatisfiesVisibility(
+#ifdef GP_VERSION_NUM
+											 relation,
+#endif
+											 &htup, snapshot, buffer);
 		HeapCheckForSerializableConflictOut(valid, relation, &htup,
 											buffer, snapshot);
 		if (valid)
@@ -481,7 +485,11 @@ __relScanDirectCachedBlock(pgstromTaskState *pts, BlockNumber block_num)
 			htup.t_len = ItemIdGetLength(lpp);
 			ItemPointerSet(&htup.t_self, block_num, lineoff);
 
-			valid = HeapTupleSatisfiesVisibility(&htup, snapshot, buffer);
+			valid = HeapTupleSatisfiesVisibility(
+#ifdef GP_VERSION_NUM
+												 relation,
+#endif
+												 &htup, snapshot, buffer);
 			HeapCheckForSerializableConflictOut(valid, relation, &htup,
 												buffer, snapshot);
 			if (valid)

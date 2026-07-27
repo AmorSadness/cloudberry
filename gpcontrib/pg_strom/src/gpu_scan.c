@@ -46,7 +46,7 @@ pgstrom_is_gpuscan_plan(const Plan *plan)
 {
 	if (IsA(plan, CustomScan))
 	{
-		const CustomScan *cscan = (const CustomScan *)cscan;
+		const CustomScan *cscan = (const CustomScan *)plan;
 
 		if (cscan->methods == &gpuscan_plan_methods)
 			return true;
@@ -149,9 +149,23 @@ __buildSimpleScanPlanInfo(PlannerInfo *root,
 	double			avg_seq_page_cost;
 	double			xpu_ratio;
 	double			xpu_tuple_cost;
+	double			segment_divisor = 1.0;
 	QualCost		qcost;
 	double			ntuples = baserel->tuples;
 	double			selectivity;
+
+#ifdef GP_VERSION_NUM
+	/*
+	 * Cloudberry's RelOptInfo statistics cover the whole distributed table,
+	 * but Path rows and run costs are per QE.  Startup work happens on every
+	 * QE, so it is deliberately left unscaled.
+	 */
+	segment_divisor = (double) planner_segment_count(baserel->cdbpolicy);
+	if (segment_divisor < 1.0)
+		segment_divisor = 1.0;
+	ntuples /= segment_divisor;
+	scan_nrows /= segment_divisor;
+#endif
 
 	/*
 	 * CPU Parallel parameters
@@ -160,7 +174,11 @@ __buildSimpleScanPlanInfo(PlannerInfo *root,
 	{
 		double	leader_contribution;
 
-		parallel_nworkers = compute_parallel_worker(baserel,
+		parallel_nworkers = compute_parallel_worker(
+#ifdef GP_VERSION_NUM
+													root,
+#endif
+													baserel,
 													baserel->pages, -1,
 													max_parallel_workers_per_gather);
 		if (parallel_nworkers <= 0)
@@ -231,7 +249,7 @@ __buildSimpleScanPlanInfo(PlannerInfo *root,
 	 * to the referenced columns, to adjust total amount of disk i/o.
 	 * So, we have nothing special to do here.
 	 */
-	disk_cost = avg_seq_page_cost * baserel->pages;
+	disk_cost = avg_seq_page_cost * baserel->pages / segment_divisor;
 	if (parallel_path)
 		disk_cost /= parallel_divisor;
 
@@ -273,7 +291,11 @@ __buildSimpleScanPlanInfo(PlannerInfo *root,
 											 dev_quals,
 											 baserel->relid,
 											 JOIN_INNER,
-											 NULL);
+											 NULL
+#ifdef GP_VERSION_NUM
+											 , false
+#endif
+											 );
 		ntuples *= selectivity;		/* rows after dev_quals */
 	}
 
@@ -295,7 +317,11 @@ __buildSimpleScanPlanInfo(PlannerInfo *root,
 											 host_quals,
 											 baserel->relid,
 											 JOIN_INNER,
-											 NULL);
+											 NULL
+#ifdef GP_VERSION_NUM
+											 , false
+#endif
+											 );
 		ntuples *= selectivity;		/* rows after host_quals */
 	}
 	/*
@@ -311,14 +337,14 @@ __buildSimpleScanPlanInfo(PlannerInfo *root,
 	pp_info->scan_relid = baserel->relid;
 	pp_info->host_quals = extract_actual_clauses(host_quals, false);
 	pp_info->scan_quals = extract_actual_clauses(dev_quals, false);
-	pp_info->scan_tuples = baserel->tuples;
+	pp_info->scan_tuples = baserel->tuples / segment_divisor;
 	pp_info->scan_nrows = clamp_row_est(scan_nrows);
 	pp_info->parallel_nworkers = parallel_nworkers;
 	pp_info->parallel_divisor = parallel_divisor;
 	pp_info->startup_cost = startup_cost;
 	pp_info->run_cost = run_cost;
 	pp_info->final_cost = final_cost;
-	pp_info->final_nrows = baserel->rows;
+	pp_info->final_nrows = baserel->rows / segment_divisor;
 	if (indexOpt)
 	{
 		pp_info->brin_index_oid = indexOpt->indexoid;
@@ -439,11 +465,19 @@ try_add_simple_scan_path(PlannerInfo *root,
 {
 	pgstromOuterPathLeafInfo *op_leaf = NULL;
 
-	if (rte->relkind == RELKIND_RELATION ||
-		rte->relkind == RELKIND_MATVIEW)
+	if (rte->relkind == RELKIND_RELATION
+#ifndef GP_VERSION_NUM
+		|| rte->relkind == RELKIND_MATVIEW
+#endif
+		)
 	{
 		if (rte->rtekind == RTE_RELATION &&
-			get_relation_am(rte->relid, true) == HEAP_TABLE_AM_OID)
+			get_relation_am(rte->relid, true) == HEAP_TABLE_AM_OID
+#ifdef GP_VERSION_NUM
+			/* MVP: ordinary distributed Cloudberry heap tables only. */
+			&& GpPolicyIsPartitioned(baserel->cdbpolicy)
+#endif
+			)
 		{
 			op_leaf = buildSimpleScanPlanInfo(root,
 											  baserel,
@@ -453,6 +487,7 @@ try_add_simple_scan_path(PlannerInfo *root,
 	}
 	else if (rte->relkind == RELKIND_FOREIGN_TABLE)
 	{
+#ifndef GP_VERSION_NUM
 		if (baseRelIsArrowFdw(baserel))
 		{
 			op_leaf = buildSimpleScanPlanInfo(root,
@@ -460,12 +495,16 @@ try_add_simple_scan_path(PlannerInfo *root,
 											  xpu_task_flags,
 											  be_parallel);
 		}
+#endif
 	}
 
 	if (op_leaf)
 	{
 		pgstromPlanInfo *pp_info = op_leaf->pp_info;
 
+		if ((!allow_host_quals && pp_info->host_quals != NIL) ||
+			(!allow_no_device_quals && pp_info->scan_quals == NIL))
+			return;
 		if (pp_info->scan_quals != NIL)
 		{
 			CustomPath *cpath = makeNode(CustomPath);
@@ -483,6 +522,17 @@ try_add_simple_scan_path(PlannerInfo *root,
 			cpath->path.total_cost  = (pp_info->startup_cost +
 									   pp_info->run_cost +
 									   pp_info->final_cost);
+			cpath->path.memory      = 0;
+#ifdef GP_VERSION_NUM
+			cpath->path.locus       = cdbpathlocus_from_baserel(root,
+													 baserel,
+													 pp_info->parallel_nworkers);
+			cpath->path.parallel_workers = cpath->path.locus.parallel_workers;
+			cpath->path.motionHazard = false;
+			cpath->path.barrierHazard = false;
+			cpath->path.rescannable = true;
+			cpath->path.sameslice_relids = baserel->relids;
+#endif
 			cpath->path.pathkeys    = NIL;	/* unsorted results */
 			cpath->flags            = CUSTOMPATH_SUPPORT_PROJECTION;
 			cpath->custom_paths     = NIL;
@@ -491,7 +541,11 @@ try_add_simple_scan_path(PlannerInfo *root,
 			/* try attach GPU-Sorted version */
 			try_add_sorted_gpujoin_path(root, baserel, cpath, be_parallel);
 			if (be_parallel == 0)
-				add_path(baserel, &cpath->path);
+				add_path(baserel, &cpath->path
+#ifdef GP_VERSION_NUM
+						 , root
+#endif
+						 );
 			else
 				add_partial_path(baserel, &cpath->path);
 		}
@@ -596,16 +650,22 @@ __xpuScanAddScanPathCommon(PlannerInfo *root,
 									 rte,
 									 xpu_task_flags,
 									 (try_parallel > 0),
+#ifdef GP_VERSION_NUM
+									 false,	/* MVP: reject host-only quals */
+#else
 									 true,	/* allow host quals */
+#endif
 									 false,	/* disallow no device quals*/
 									 xpuscan_path_methods);
 		}
 		else if (rte->relkind == RELKIND_PARTITIONED_TABLE)
 		{
+#ifndef GP_VERSION_NUM
 			try_add_partitioned_scan_path(root,
 										  baserel,
 										  xpu_task_flags,
 										  (try_parallel > 0));
+#endif
 		}
 		if (!baserel->consider_parallel)
 			break;
@@ -622,6 +682,11 @@ XpuScanAddScanPath(PlannerInfo *root,
 	if (set_rel_pathlist_next)
 		set_rel_pathlist_next(root, baserel, rtindex, rte);
 
+#ifdef GP_VERSION_NUM
+	/* ORCA, including an ORCA-to-standard-planner fallback, is not MVP scope. */
+	if (optimizer)
+		return;
+#endif
 	if (pgstrom_enabled())
 	{
 		if (enable_gpuscan && gpuserv_ready_accept())

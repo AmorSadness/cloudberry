@@ -3,6 +3,11 @@
 #
 include ../Makefile.common
 
+PGSTROM_WITH_ARROW ?= 1
+ifeq ($(filter $(PGSTROM_WITH_ARROW),0 1),)
+$(error PGSTROM_WITH_ARROW must be either 0 or 1)
+endif
+
 #
 # Source of PG-Strom host code
 #
@@ -10,8 +15,12 @@ STROM_OBJS = main.o githash.o extra.o codegen.o executor.o fallback.o \
              gpu_device.o gpu_service.o dpu_device.o \
              gpu_scan.o gpu_join.o gpu_preagg.o \
              relscan.o brin.o gist.o gpu_cache.o select_into.o \
-             arrow_fdw.o arrow_meta.o parquet_read.o \
              misc.o float2.o tinyint.o aggfuncs.o
+ifeq ($(PGSTROM_WITH_ARROW),1)
+STROM_OBJS += arrow_fdw.o arrow_meta.o parquet_read.o
+else
+STROM_OBJS += arrow_stubs.o
+endif
 GENERATED-HEADERS = gpu_devattrs.h githash.c
 STROM_HEADERS = arrow_defs.h arrow_ipc.h float2.h
 
@@ -69,8 +78,21 @@ endif
 #
 # libarrow / libparquet
 #
+# Make this opt-in/opt-out explicit so packages installed on the builder do
+# not silently change the MVP artifact.
+ifeq ($(PGSTROM_WITH_ARROW),1)
 HAS_LIBARROW = $(shell pkgconf --exists arrow>/dev/null 2>&1   && echo -n yes)
 HAS_PARQUET  = $(shell pkgconf --exists parquet>/dev/null 2>&1 && echo -n yes)
+ifneq ($(HAS_LIBARROW),yes)
+$(error PGSTROM_WITH_ARROW=1 requires the Arrow development package)
+endif
+ifneq ($(HAS_PARQUET),yes)
+$(error PGSTROM_WITH_ARROW=1 requires the Parquet development package)
+endif
+else
+HAS_LIBARROW = no
+HAS_PARQUET  = no
+endif
 ifeq ($(HAS_LIBARROW),yes)
 PGSTROM_FLAGS += -DHAS_LIBARROW=1
 PG_CXXFLAGS += $(shell pkgconf --cflags arrow)
@@ -122,6 +144,10 @@ BITCODE_CXXFLAGS += $(PG_CXXFLAGS)
 # Device Attributes
 #
 submake-generated-headers: $(GENERATED-HEADERS)
+
+# PGXS does not make a directly requested module target wait for this custom
+# submake target.  Express the real dependency as well, including for -j.
+$(STROM_OBJS): | $(GENERATED-HEADERS)
 
 gpu_devattrs.h: $(CUDA_IPATH)/cuda.h
 	cat $(CUDA_IPATH)/cuda.h | \

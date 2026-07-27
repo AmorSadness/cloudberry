@@ -364,7 +364,7 @@ __devtype_resolve_alias(TypeCacheEntry *tcache)
 	const char	   *ext_name;
 
 	/* check alias list */
-	type_name = get_type_name(tcache->type_id, false);
+	type_name = pgstrom_get_type_name(tcache->type_id, false);
 	ext_name = get_extension_name_by_object(TypeRelationId,
 											tcache->type_id);
 	for (int i=0; devtype_alias_catalog[i].type_name != NULL; i++)

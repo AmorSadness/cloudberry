@@ -260,7 +260,7 @@ static struct {
 static char *
 __get_type_signature(Oid type_oid)
 {
-	char   *type_name = get_type_name(type_oid, false);
+	char   *type_name = pgstrom_get_type_name(type_oid, false);
 	char   *ext_name = get_type_extension_name(type_oid);
 
 	if (ext_name)
@@ -482,7 +482,11 @@ match_clause_to_gist_index(PlannerInfo *root,
 												   iclause->indexquals,
 												   heap_rel->relid,
 												   JOIN_INNER,
-												   NULL);
+														NULL
+#ifdef GP_VERSION_NUM
+														, false
+#endif
+														);
 			if (!clause || selectivity > __selectivity)
 			{
 				clause = __clause;

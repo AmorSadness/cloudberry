@@ -447,7 +447,11 @@ __build_session_param_info(pgstromTaskState *pts,
 			if (prm->execPlan)
 			{
 				/* Parameter not evaluated yet, so go do it */
-				ExecSetParamPlan(prm->execPlan, econtext);
+				ExecSetParamPlan(prm->execPlan, econtext
+#ifdef GP_VERSION_NUM
+								 , NULL
+#endif
+								 );
 				/* ExecSetParamPlan should have processed this param... */
 				Assert(prm->execPlan == NULL);
 			}
@@ -2103,7 +2107,13 @@ skip:
 	*p_inner_buffer_id    = pts->ps_state->query_plan_id;
 
 	if (pts->css.ss.ps.instrument)
-		InstrStopNode(pts->css.ss.ps.instrument, -1.0);
+		InstrStopNode(pts->css.ss.ps.instrument,
+#ifdef GP_VERSION_NUM
+					  UINT64_MAX	/* unsigned equivalent of upstream -1 */
+#else
+					  -1.0
+#endif
+					  );
 }
 
 /*

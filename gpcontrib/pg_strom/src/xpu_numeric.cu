@@ -75,7 +75,7 @@ xpu_numeric_datum_arrow_read(kern_context *kcxt,
 		result->kind = XPU_NUMERIC_KIND__VALID;
 		result->weight = cmeta->attopts.decimal.scale;
 		result->u.value = *addr;
-		NUMERIC_NORMALIZE(&result->weight,
+		XPU_NUMERIC_NORMALIZE(&result->weight,
 						  &result->u.value);
 	}
 	return true;
@@ -217,7 +217,7 @@ PGSTROM_SQLTYPE_OPERATORS(numeric, false, 4, -1);
 INLINE_FUNCTION(void)
 set_normalized_numeric(xpu_numeric_t *result, int128_t value, int16_t weight)
 {
-	NUMERIC_NORMALIZE(&weight, &value);
+	XPU_NUMERIC_NORMALIZE(&weight, &value);
 	result->expr_ops = &xpu_numeric_ops;
 	result->kind     = XPU_NUMERIC_KIND__VALID;
 	result->weight   = weight;
@@ -417,7 +417,7 @@ PG_NUMERIC_TO_FLOAT_TEMPLATE(float8, __to_fp64)
 			result->kind = XPU_NUMERIC_KIND__VALID;					\
 			result->weight = 0;										\
 			result->u.value = ival.value;							\
-			NUMERIC_NORMALIZE(&result->weight,						\
+			XPU_NUMERIC_NORMALIZE(&result->weight,						\
 							  &result->u.value);					\
 		}															\
 		return true;												\
@@ -445,7 +445,7 @@ pgfn_money_to_numeric(XPU_PGFUNCTION_ARGS)
 		result->kind = XPU_NUMERIC_KIND__VALID;
 		result->weight = fpoint;
 		result->u.value = ival.value;
-		NUMERIC_NORMALIZE(&result->weight,
+		XPU_NUMERIC_NORMALIZE(&result->weight,
 						  &result->u.value);
 	}
 	return true;
@@ -765,19 +765,19 @@ pg_numeric_to_cstring(kern_context *kcxt,
 					  varlena *numeric,
 					  char *buf, char *endp)
 {
-	NumericChoice *nc = (NumericChoice *)VARDATA_ANY(numeric);
+	XpuNumericChoice *nc = (XpuNumericChoice *)VARDATA_ANY(numeric);
 	uint32_t	nc_len = VARSIZE_ANY_EXHDR(numeric);
 	uint16_t	n_head = __Fetch(&nc->n_header);
-	int			ndigits = NUMERIC_NDIGITS(n_head, nc_len);
-	int			weight = NUMERIC_WEIGHT(nc, n_head);
-	int			sign = NUMERIC_SIGN(n_head);
-	int			dscale = NUMERIC_DSCALE(nc, n_head);
+	int			ndigits = XPU_NUMERIC_NDIGITS(n_head, nc_len);
+	int			weight = XPU_NUMERIC_WEIGHT(nc, n_head);
+	int			sign = XPU_NUMERIC_SIGN(n_head);
+	int			dscale = XPU_NUMERIC_DSCALE(nc, n_head);
 	int			d;
 	char	   *cp = buf;
-	NumericDigit *n_data = NUMERIC_DIGITS(nc, n_head);
+	NumericDigit *n_data = XPU_NUMERIC_DIGITS(nc, n_head);
 	NumericDigit  dig, d1 __attribute__ ((unused));
 
-	if (sign == NUMERIC_NEG)
+	if (sign == XPU_NUMERIC_NEG)
 	{
 		if (cp >= endp)
 			return -1;

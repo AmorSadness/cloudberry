@@ -641,7 +641,7 @@ enlargeLargeStringInfo(LargeStringInfo buf, size_t needed)
  * get_type_name
  */
 char *
-get_type_name(Oid type_oid, bool missing_ok)
+pgstrom_get_type_name(Oid type_oid, bool missing_ok)
 {
 	HeapTuple	tup;
 	char	   *retval;

@@ -854,7 +854,11 @@ try_add_xpujoin_simple_path(PlannerInfo *root,
 	/* try attach GPU-Sorted Path, if any */
 	try_add_sorted_gpujoin_path(root, join_rel, cpath, try_parallel_path);
 	if (!try_parallel_path)
-		add_path(join_rel, &cpath->path);
+		add_path(join_rel, &cpath->path
+#ifdef GP_VERSION_NUM
+				 , root
+#endif
+				 );
 	else
 		add_partial_path(join_rel, &cpath->path);
 }
@@ -1024,7 +1028,11 @@ try_add_sorted_gpujoin_path(PlannerInfo *root,
 								+ per_tuple_cost * cpath->path.rows / 2.0);
 	/* add path */
 	if (!be_parallel)
-		add_path(join_rel, &cpath->path);
+		add_path(join_rel, &cpath->path
+#ifdef GP_VERSION_NUM
+				 , root
+#endif
+				 );
 	else
 	{
 		GatherPath *gpath = create_gather_path(root,
@@ -1035,7 +1043,11 @@ try_add_sorted_gpujoin_path(PlannerInfo *root,
 											   &cpath->path.rows);
 		gpath->path.pathkeys = sortkeys_upper;
 
-		add_path(join_rel, &gpath->path);
+		add_path(join_rel, &gpath->path
+#ifdef GP_VERSION_NUM
+				 , root
+#endif
+				 );
 	}
 }
 
@@ -1396,7 +1408,11 @@ try_add_xpujoin_partition_path(PlannerInfo *root,
 							  op_leaf_list,
 							  try_parallel_path);
 	if (!try_parallel_path)
-		add_path(join_rel, append_path);
+		add_path(join_rel, append_path
+#ifdef GP_VERSION_NUM
+				 , root
+#endif
+				 );
 	else
 		add_partial_path(join_rel, append_path);
 }

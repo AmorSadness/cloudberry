@@ -1,0 +1,13 @@
+# Apply this file to the coordinator and the single primary segment.
+shared_preload_libraries = 'pg_strom'
+max_worker_processes = 16
+
+# One GPU is shared serially by QD and QE during MVP validation.
+pg_strom.gpu_mempool_max_ratio = 0.40
+pg_strom.cpu_fallback = 'off'
+pg_strom.enabled = on
+pg_strom.enable_gpuscan = on
+
+# The Cloudberry MVP does not register GpuJoin/GpuPreAgg/GpuSort/GpuCache,
+# BRIN acceleration, Arrow, SELECT-INTO-Direct, or DPU planner hooks.
+# GPU-Direct and SELECT-INTO-Direct are also hard-disabled by the build.

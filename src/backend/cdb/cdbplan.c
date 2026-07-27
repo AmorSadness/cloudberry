@@ -340,6 +340,15 @@ plan_tree_mutator(Node *node,
 
 				FLATCOPY(newcscan, cscan, CustomScan);
 				SCANMUTATE(newcscan, cscan);
+				/*
+				 * These extension-owned plan and expression fields need the same
+				 * QD-to-QE rewrites as the core Scan fields.  custom_private is an
+				 * opaque extension payload and must not be interpreted here.
+				 */
+				MUTATE(newcscan->custom_plans, cscan->custom_plans, List *);
+				MUTATE(newcscan->custom_exprs, cscan->custom_exprs, List *);
+				MUTATE(newcscan->custom_scan_tlist,
+					   cscan->custom_scan_tlist, List *);
 				return (Node *) newcscan;
 			}
 			break;

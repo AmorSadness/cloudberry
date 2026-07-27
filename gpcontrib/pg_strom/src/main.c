@@ -26,6 +26,20 @@ long		PHYS_PAGES;
 long		PAGES_PER_BLOCK;
 static bool	pgstrom_enable_select_into_direct;		/* GUC */
 
+#ifdef GP_VERSION_NUM
+static bool
+pgstrom_cloudberry_mvp_disabled_checker(bool *newval, void **extra,
+										GucSource source)
+{
+	if (*newval)
+	{
+		GUC_check_errdetail("This feature is outside the Cloudberry GpuScan MVP.");
+		return false;
+	}
+	return true;
+}
+#endif
+
 static planner_hook_type	planner_hook_next = NULL;
 static CustomPathMethods	pgstrom_dummy_path_methods;
 static CustomScanMethods	pgstrom_dummy_plan_methods;
@@ -138,13 +152,21 @@ pgstrom_init_gucs(void)
 							 NULL, NULL, NULL);
 	/* turns on/off SELECT INTO direct mode */
 	DefineCustomBoolVariable("pg_strom.enable_select_into_direct",
-							 "Enables SELECT INTO direct mode",
-							 NULL,
-							 &pgstrom_enable_select_into_direct,
-							 true,
-							 PGC_USERSET,
-							 GUC_NOT_IN_SAMPLE,
-							 NULL, NULL, NULL);
+								 "Enables SELECT INTO direct mode",
+								 NULL,
+								 &pgstrom_enable_select_into_direct,
+#ifdef GP_VERSION_NUM
+								 false,
+								 PGC_USERSET,
+								 GUC_NOT_IN_SAMPLE,
+								 pgstrom_cloudberry_mvp_disabled_checker,
+								 NULL, NULL);
+#else
+								 true,
+								 PGC_USERSET,
+								 GUC_NOT_IN_SAMPLE,
+								 NULL, NULL, NULL);
+#endif
 }
 
 /* --------------------------------------------------------------------------------
@@ -737,7 +759,11 @@ static PlannedStmt *
 pgstrom_post_planner(Query *parse,
 					 const char *query_string,
 					 int cursorOptions,
-					 ParamListInfo boundParams)
+					 ParamListInfo boundParams
+#ifdef GP_VERSION_NUM
+					 , OptimizerOptions *optimizer_options
+#endif
+					 )
 {
 	HTAB	   *saved_paths_htable = pgstrom_paths_htable;
 	PlannedStmt *pstmt;
@@ -750,7 +776,11 @@ pgstrom_post_planner(Query *parse,
 		pstmt = planner_hook_next(parse,
 								  query_string,
 								  cursorOptions,
-								  boundParams);
+								  boundParams
+#ifdef GP_VERSION_NUM
+								  , optimizer_options
+#endif
+								  );
 		/* remove dummy plan & push-down Result + GpuPreAgg */
 		pgstrom_removal_dummy_plans(pstmt, &pstmt->planTree);
 		foreach (lc, pstmt->subplans)
@@ -940,8 +970,10 @@ _PG_init(void)
 	pgstrom_init_extra();
 	pgstrom_init_codegen();
 	pgstrom_init_relscan();
+#ifndef GP_VERSION_NUM
 	pgstrom_init_brin();
 	pgstrom_init_arrow_fdw();
+#endif
 	pgstrom_init_executor();
 	/* dump version number */
 	elog(LOG, "PG-Strom version %s built for PostgreSQL %s (githash: %s)",
@@ -953,18 +985,22 @@ _PG_init(void)
 	{
 		pgstrom_init_gpu_service();
 		pgstrom_init_gpu_scan();
+#ifndef GP_VERSION_NUM
 		pgstrom_init_gpu_join();
 		pgstrom_init_gpu_preagg();
 		pgstrom_init_gpu_cache();
 		pgstrom_init_select_into();
+#endif
 	}
 	/* init DPU related stuff */
+#ifndef GP_VERSION_NUM
 	if (pgstrom_init_dpu_device())
 	{
 		pgstrom_init_dpu_scan();
 		pgstrom_init_dpu_join();
 		pgstrom_init_dpu_preagg();
 	}
+#endif
 	/* callback for the extension checker */
 	CacheRegisterSyscacheCallback(NAMESPACEOID, pgstrom_extension_checker_callback, 0);
 	/* dummy custom-scan node */
