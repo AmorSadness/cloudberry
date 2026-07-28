@@ -687,6 +687,15 @@ XpuScanAddScanPath(PlannerInfo *root,
 	/* ORCA, including an ORCA-to-standard-planner fallback, is not MVP scope. */
 	if (optimizer)
 		return;
+	/*
+	 * Partitioned scans are not supported by the Cloudberry MVP.  Reject the
+	 * partition members too: although the parent RTE has rte->inh set, the
+	 * planner invokes this hook again for every leaf with rte->inh clear and
+	 * RELOPT_OTHER_MEMBER_REL.  Without this guard a GpuScan can therefore
+	 * leak into the Append plan through an otherwise ordinary-looking leaf.
+	 */
+	if (baserel->reloptkind == RELOPT_OTHER_MEMBER_REL)
+		return;
 #endif
 	if (pgstrom_enabled())
 	{
