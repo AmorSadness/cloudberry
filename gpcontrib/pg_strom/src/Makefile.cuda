@@ -7,6 +7,36 @@ ifeq ($(STROM_BUILD_ROOT),)
 PG_CONFIG       ?= pg_config
 endif
 
+# PostgreSQL storage constants required by code that cannot include
+# postgres.h.  Keep standalone device builds synchronized as well as builds
+# driven by the extension Makefile.
+PG_INCLUDEDIR_SERVER := $(shell $(PG_CONFIG) --includedir-server)
+PG_CONFIG_HEADER := $(PG_INCLUDEDIR_SERVER)/pg_config.h
+PG_CONFIG_MANUAL_HEADER := $(PG_INCLUDEDIR_SERVER)/pg_config_manual.h
+PG_BUFPAGE_HEADER := $(PG_INCLUDEDIR_SERVER)/storage/bufpage.h
+
+PGSTROM_DEVICE_NAMEDATALEN := $(shell awk 'substr($$1, 2) == "define" && $$2 == "NAMEDATALEN" {print $$3; exit}' $(PG_CONFIG_MANUAL_HEADER) 2>/dev/null)
+PGSTROM_DEVICE_BLCKSZ := $(shell awk 'substr($$1, 2) == "define" && $$2 == "BLCKSZ" {print $$3; exit}' $(PG_CONFIG_HEADER) 2>/dev/null)
+PGSTROM_DEVICE_RELSEG_SIZE := $(shell awk 'substr($$1, 2) == "define" && $$2 == "RELSEG_SIZE" {print $$3; exit}' $(PG_CONFIG_HEADER) 2>/dev/null)
+PGSTROM_DEVICE_PAGE_LAYOUT_VERSION := $(shell awk 'substr($$1, 2) == "define" && $$2 == "PG_PAGE_LAYOUT_VERSION" {print $$3; exit}' $(PG_BUFPAGE_HEADER) 2>/dev/null)
+PGSTROM_DEVICE_MAXIMUM_ALIGNOF := $(shell awk 'substr($$1, 2) == "define" && $$2 == "MAXIMUM_ALIGNOF" {print $$3; exit}' $(PG_CONFIG_HEADER) 2>/dev/null)
+
+ifeq ($(strip $(PGSTROM_DEVICE_NAMEDATALEN)),)
+$(error unable to read NAMEDATALEN from $(PG_CONFIG_MANUAL_HEADER))
+endif
+ifeq ($(strip $(PGSTROM_DEVICE_BLCKSZ)),)
+$(error unable to read BLCKSZ from $(PG_CONFIG_HEADER))
+endif
+ifeq ($(strip $(PGSTROM_DEVICE_RELSEG_SIZE)),)
+$(error unable to read RELSEG_SIZE from $(PG_CONFIG_HEADER))
+endif
+ifeq ($(strip $(PGSTROM_DEVICE_PAGE_LAYOUT_VERSION)),)
+$(error unable to read PG_PAGE_LAYOUT_VERSION from $(PG_BUFPAGE_HEADER))
+endif
+ifeq ($(strip $(PGSTROM_DEVICE_MAXIMUM_ALIGNOF)),)
+$(error unable to read MAXIMUM_ALIGNOF from $(PG_CONFIG_HEADER))
+endif
+
 #
 # Header and Libraries of CUDA
 #
@@ -36,7 +66,7 @@ __NVCC_TARGET := --gpu-architecture=native
 endif
 
 # flags to build GPU libraries
-__NVCC_CFLAGS += -I $(shell $(PG_CONFIG) --includedir-server) \
+__NVCC_CFLAGS += -I $(PG_INCLUDEDIR_SERVER)             \
                  --maxrregcount=$(MAXREGCOUNT)           \
                  --source-in-ptx -lineinfo               \
                  -DHAVE_FLOAT2                           \
@@ -52,11 +82,14 @@ NVCC_LDFLAGS = $(__NVCC_LDFLAGS) $(NVCC_FLAGS_CUSTOM) $(NVCC_LDFLAGS_CUSTOM)
 __CUDA_CORE_FILES = xpu_common cuda_gpuscan cuda_gpujoin cuda_gpupreagg cuda_gpusort \
                     xpu_basetype xpu_numeric xpu_timelib xpu_textlib \
                     xpu_misclib  xpu_jsonlib xpu_postgis
-__CUDA_CORE_HEADERS = cuda_common.h xpu_common.h xpu_opcodes.h xpu_basetype.h \
+__CUDA_CORE_HEADERS = pgstrom_device_config.h \
+                      cuda_common.h xpu_common.h xpu_opcodes.h xpu_basetype.h \
                       xpu_numeric.h xpu_textlib.h xpu_timelib.h xpu_misclib.h \
                       xpu_jsonlib.h xpu_postgis.h
 CUDA_OBJS = $(addsuffix .o, $(__CUDA_CORE_FILES) $(CUDA_CUSTOM_FILES))
 CUDA_SRCS = $(addsuffix .cu,$(__CUDA_CORE_FILES) $(CUDA_CUSTOM_FILES))
 CUDA_HEADERS = $(__CUDA_CORE_HEADERS) $(CUDA_CUSTOM_HEADERS)
-CUDA_MD5SUM = $(shell cat $(CUDA_HEADERS) $(CUDA_SRCS) | md5sum | awk '{print $$1}')
+CUDA_HASH_HEADERS = $(filter-out pgstrom_device_config.h,$(CUDA_HEADERS))
+CUDA_BUILD_CONFIG = NAMEDATALEN=$(PGSTROM_DEVICE_NAMEDATALEN),BLCKSZ=$(PGSTROM_DEVICE_BLCKSZ),RELSEG_SIZE=$(PGSTROM_DEVICE_RELSEG_SIZE),PG_PAGE_LAYOUT_VERSION=$(PGSTROM_DEVICE_PAGE_LAYOUT_VERSION),MAXIMUM_ALIGNOF=$(PGSTROM_DEVICE_MAXIMUM_ALIGNOF)
+CUDA_MD5SUM = $(shell (printf '%s' '$(CUDA_BUILD_CONFIG)'; cat $(CUDA_HASH_HEADERS) $(CUDA_SRCS)) | md5sum | awk '{print $$1}')
 CUDA_FATBIN = pgstrom-gpucode-V$(NVCC_VERSION)-$(CUDA_MD5SUM).fatbin

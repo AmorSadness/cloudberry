@@ -36,6 +36,20 @@ if grep -A18 'case T_CustomScan:' "$cdbplan" | grep -q 'MUTATE.*custom_private';
     exit 1
 fi
 require_text 'PGSTROM_WITH_ARROW.*\?= 1' "$makefile"
+require_text 'GENERATED-HEADERS.*pgstrom_device_config\.h' "$makefile"
+require_text 'PGSTROM_DEVICE_BLCKSZ.*BLCKSZ' "$repo_root/gpcontrib/pg_strom/src/Makefile.cuda"
+require_text 'PGSTROM_DEVICE_RELSEG_SIZE.*RELSEG_SIZE' "$repo_root/gpcontrib/pg_strom/src/Makefile.cuda"
+require_text 'PGSTROM_DEVICE_PAGE_LAYOUT_VERSION.*PG_PAGE_LAYOUT_VERSION' "$repo_root/gpcontrib/pg_strom/src/Makefile.cuda"
+require_text '__CUDA_CORE_HEADERS = pgstrom_device_config\.h' "$repo_root/gpcontrib/pg_strom/src/Makefile.cuda"
+require_text 'CUDA_BUILD_CONFIG = NAMEDATALEN=.*BLCKSZ=.*RELSEG_SIZE=.*PG_PAGE_LAYOUT_VERSION=.*MAXIMUM_ALIGNOF=' "$repo_root/gpcontrib/pg_strom/src/Makefile.cuda"
+require_text '#include "pgstrom_device_config\.h"' "$repo_root/gpcontrib/pg_strom/src/xpu_common.h"
+require_text '#define BLCKSZ.*PGSTROM_DEVICE_BLCKSZ' "$repo_root/gpcontrib/pg_strom/src/xpu_common.h"
+require_text 'Must match CUDA_BUILD_CONFIG in Makefile\.cuda exactly' "$gpu_service"
+if grep -Eq '^#define BLCKSZ[[:space:]]+8192' \
+    "$repo_root/gpcontrib/pg_strom/src/xpu_common.h"; then
+    echo 'device BLCKSZ must come from the target server configuration' >&2
+    exit 1
+fi
 require_text '#ifndef GP_VERSION_NUM' "$main_c"
 require_text 'pgstromGpuCacheIsInitialized\(\) &&' "$gpu_scan"
 require_text 'pgstromGpuCacheIsInitialized\(void\)' "$gpu_cache"

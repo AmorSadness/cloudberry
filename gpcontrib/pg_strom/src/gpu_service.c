@@ -10,6 +10,7 @@
  * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
+#include "pgstrom_device_config.h"
 #include "cuda_common.h"
 #include <cudaProfiler.h>
 /*
@@ -670,13 +671,24 @@ __setup_gpu_fatbin_filename(void)
 	namebuf = alloca(Max(sizeof(CUDA_CORE_HEADERS),
 						 sizeof(CUDA_CORE_FILES)) + 1);
 	initStringInfo(&buf);
+	/* Must match CUDA_BUILD_CONFIG in Makefile.cuda exactly. */
+	appendStringInfo(&buf,
+					 "NAMEDATALEN=%u,BLCKSZ=%u,RELSEG_SIZE=%u,"
+					 "PG_PAGE_LAYOUT_VERSION=%u,MAXIMUM_ALIGNOF=%u",
+					 PGSTROM_DEVICE_NAMEDATALEN,
+					 PGSTROM_DEVICE_BLCKSZ,
+					 PGSTROM_DEVICE_RELSEG_SIZE,
+					 PGSTROM_DEVICE_PAGE_LAYOUT_VERSION,
+					 PGSTROM_DEVICE_MAXIMUM_ALIGNOF);
 	/* CUDA_CORE_HEADERS */
 	strcpy(namebuf, CUDA_CORE_HEADERS);
 	for (tok = strtok_r(namebuf, " ", &pos);
 		 tok != NULL;
 		 tok = strtok_r(NULL, " ", &pos))
 	{
-		__appendTextFromFile(&buf, tok, NULL);
+		/* Its semantic content is represented by CUDA_BUILD_CONFIG above. */
+		if (strcmp(tok, "pgstrom_device_config.h") != 0)
+			__appendTextFromFile(&buf, tok, NULL);
 	}
 
 	/* CUDA_CORE_SRCS */

@@ -21,8 +21,17 @@ STROM_OBJS += arrow_fdw.o arrow_meta.o parquet_read.o
 else
 STROM_OBJS += arrow_stubs.o
 endif
-GENERATED-HEADERS = gpu_devattrs.h githash.c
+GENERATED-HEADERS = gpu_devattrs.h githash.c pgstrom_device_config.h
 STROM_HEADERS = arrow_defs.h arrow_ipc.h float2.h
+
+#
+# PostgreSQL storage constants used by CUDA/DPU code
+#
+# Device sources cannot include postgres.h, so keep their fundamental storage
+# layout constants synchronized with the server selected by PG_CONFIG.
+# pgstrom_device_config.h is installed with the CUDA sources and participates
+# in the fatbin content hash; the runtime fatbin builder therefore consumes
+# exactly the same configuration as the host extension build.
 
 #
 # Githash.c checker
@@ -148,6 +157,7 @@ submake-generated-headers: $(GENERATED-HEADERS)
 # PGXS does not make a directly requested module target wait for this custom
 # submake target.  Express the real dependency as well, including for -j.
 $(STROM_OBJS): | $(GENERATED-HEADERS)
+gpu_service.o: pgstrom_device_config.h
 
 gpu_devattrs.h: $(CUDA_IPATH)/cuda.h
 	cat $(CUDA_IPATH)/cuda.h | \
@@ -161,6 +171,21 @@ gpu_devattrs.h: $(CUDA_IPATH)/cuda.h
 
 githash.c:
 	echo "const char *pgstrom_githash_cstring = \"$(PGSTROM_GITHASH)\";" > githash.c
+
+pgstrom_device_config.h: $(PG_CONFIG_HEADER) $(PG_CONFIG_MANUAL_HEADER) \
+						 $(PG_BUFPAGE_HEADER) Makefile Makefile.cuda
+	@{ \
+		echo '/* auto-generated from the server selected by PG_CONFIG */'; \
+		echo '#ifndef PGSTROM_DEVICE_CONFIG_H'; \
+		echo '#define PGSTROM_DEVICE_CONFIG_H'; \
+		echo '#define PGSTROM_DEVICE_NAMEDATALEN $(PGSTROM_DEVICE_NAMEDATALEN)'; \
+		echo '#define PGSTROM_DEVICE_BLCKSZ $(PGSTROM_DEVICE_BLCKSZ)'; \
+		echo '#define PGSTROM_DEVICE_RELSEG_SIZE $(PGSTROM_DEVICE_RELSEG_SIZE)'; \
+		echo '#define PGSTROM_DEVICE_PAGE_LAYOUT_VERSION $(PGSTROM_DEVICE_PAGE_LAYOUT_VERSION)'; \
+		echo '#define PGSTROM_DEVICE_MAXIMUM_ALIGNOF $(PGSTROM_DEVICE_MAXIMUM_ALIGNOF)'; \
+		echo '#endif /* PGSTROM_DEVICE_CONFIG_H */'; \
+	} > $@.tmp
+	@if ! cmp -s $@.tmp $@; then mv -f $@.tmp $@; else rm -f $@.tmp; fi
 
 #
 # GPU Device Code

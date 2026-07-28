@@ -165,13 +165,15 @@
 #define Or(a,b)				((a) | (b))
 #endif
 #ifndef POSTGRES_H
+#include "pgstrom_device_config.h"
+
 typedef uint64_t			Datum;
 typedef unsigned int		Oid;
 
-#define NAMEDATALEN			64		/* must follow the host configuration */
-#define BLCKSZ				8192	/* must follow the host configuration */
-#define RELSEG_SIZE			131072	/* must follow the host configuration */
-#define PG_PAGE_LAYOUT_VERSION 4	/* must follow the host configuration */
+#define NAMEDATALEN			PGSTROM_DEVICE_NAMEDATALEN
+#define BLCKSZ				PGSTROM_DEVICE_BLCKSZ
+#define RELSEG_SIZE			PGSTROM_DEVICE_RELSEG_SIZE
+#define PG_PAGE_LAYOUT_VERSION PGSTROM_DEVICE_PAGE_LAYOUT_VERSION
 
 #ifndef lengthof
 #define lengthof(array)		(sizeof (array) / sizeof ((array)[0]))
@@ -182,7 +184,7 @@ typedef unsigned int		Oid;
 	(((uint64_t)(LEN) + ((ALIGNVAL) - 1)) & ~((uint64_t)((ALIGNVAL) - 1)))
 #define TYPEALIGN_DOWN(ALIGNVAL,LEN)                        \
 	(((uint64_t) (LEN)) & ~((uint64_t) ((ALIGNVAL) - 1)))
-#define MAXIMUM_ALIGNOF		8
+#define MAXIMUM_ALIGNOF		PGSTROM_DEVICE_MAXIMUM_ALIGNOF
 #define MAXALIGN(LEN)		TYPEALIGN(MAXIMUM_ALIGNOF,LEN)
 #define MAXALIGN_DOWN(LEN)	TYPEALIGN_DOWN(MAXIMUM_ALIGNOF,LEN)
 #define LONGALIGN(LEN)		TYPEALIGN(8,LEN)

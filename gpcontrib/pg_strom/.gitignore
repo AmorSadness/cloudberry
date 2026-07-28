@@ -3,4 +3,4 @@ Makefile.custom
 *.o
 *.fatbin
 *.gfatbin
-
+src/pgstrom_device_config.h
