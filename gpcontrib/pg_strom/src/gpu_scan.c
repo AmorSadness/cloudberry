@@ -207,7 +207,8 @@ __buildSimpleScanPlanInfo(PlannerInfo *root,
 		xpu_tuple_cost = pgstrom_gpu_tuple_cost;
 		startup_cost += pgstrom_gpu_setup_cost;
 
-		if (baseRelHasGpuCache(root, baserel) >= 0)
+		if (pgstromGpuCacheIsInitialized() &&
+			baseRelHasGpuCache(root, baserel) >= 0)
 		{
 			/* assume GPU-Cache is available */
 			avg_seq_page_cost = 0;

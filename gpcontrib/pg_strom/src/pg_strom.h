@@ -865,6 +865,7 @@ extern void		pgstrom_init_gpu_service(void);
  * gpu_cache.c
  */
 extern void		pgstrom_init_gpu_cache(void);
+extern bool		pgstromGpuCacheIsInitialized(void);
 extern int		baseRelHasGpuCache(PlannerInfo *root,
 								   RelOptInfo *baserel);
 extern bool		RelationHasGpuCache(Relation rel);

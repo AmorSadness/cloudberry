@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 gpu_scan="$repo_root/gpcontrib/pg_strom/src/gpu_scan.c"
+gpu_cache="$repo_root/gpcontrib/pg_strom/src/gpu_cache.c"
 cdbplan="$repo_root/src/backend/cdb/cdbplan.c"
 makefile="$repo_root/gpcontrib/pg_strom/src/Makefile"
 main_c="$repo_root/gpcontrib/pg_strom/src/main.c"
@@ -36,10 +37,12 @@ if grep -A18 'case T_CustomScan:' "$cdbplan" | grep -q 'MUTATE.*custom_private';
 fi
 require_text 'PGSTROM_WITH_ARROW.*\?= 1' "$makefile"
 require_text '#ifndef GP_VERSION_NUM' "$main_c"
-require_text 'gpuservGpuCacheEnabled\(void\)' "$gpu_service"
-require_text 'has_gpucache = !gpuservGpuCacheEnabled\(\)' "$gpu_service"
-require_text 'gpuservGpuCacheEnabled\(\) && !has_gpucache' "$gpu_service"
-require_text 'if \(gpuservGpuCacheEnabled\(\)\)' "$gpu_service"
+require_text 'pgstromGpuCacheIsInitialized\(\) &&' "$gpu_scan"
+require_text 'pgstromGpuCacheIsInitialized\(void\)' "$gpu_cache"
+require_text '!pgstrom_enable_gpucache \|\| !pgstromGpuCacheIsInitialized\(\)' "$gpu_cache"
+require_text 'has_gpucache = !pgstromGpuCacheIsInitialized\(\)' "$gpu_service"
+require_text 'pgstromGpuCacheIsInitialized\(\) && !has_gpucache' "$gpu_service"
+require_text 'if \(pgstromGpuCacheIsInitialized\(\)\)' "$gpu_service"
 require_text 'Motion .*slice\[1-9\].*segments: 1' "$demo_runner"
 
 echo 'Cloudberry PG-Strom MVP static checks: PASS'

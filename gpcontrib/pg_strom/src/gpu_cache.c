@@ -246,6 +246,22 @@ static void		gpuCacheInvokeDropUnload(const GpuCacheDesc *gc_desc,
 void	gpuCacheStartupPreloader(Datum arg);
 
 /*
+ * pgstromGpuCacheIsInitialized
+ *
+ * GpuCache callers are also linked into the Cloudberry GpuScan-only build,
+ * but pgstrom_init_gpu_cache() is intentionally not called there.  Keep a
+ * single lifecycle predicate so no caller touches its private hash tables or
+ * shared synchronization objects unless the entire subsystem was initialized.
+ */
+bool
+pgstromGpuCacheIsInitialized(void)
+{
+	return (gcache_shared_head != NULL &&
+			gcache_descriptors_htab != NULL &&
+			gcache_signatures_htab != NULL);
+}
+
+/*
  * gpucache_sync_trigger_function_oid
  */
 static Oid	__gpucache_sync_trigger_function_oid = InvalidOid;
@@ -2125,6 +2141,9 @@ baseRelHasGpuCache(PlannerInfo *root, RelOptInfo *baserel)
 	RangeTblEntry *rte = root->simple_rte_array[baserel->relid];
 	int		cuda_dindex = -1;
 
+	if (!pgstrom_enable_gpucache || !pgstromGpuCacheIsInitialized())
+		return -1;
+
 	if (rte->rtekind == RTE_RELATION &&
 		(baserel->reloptkind == RELOPT_BASEREL ||
 		 baserel->reloptkind == RELOPT_OTHER_MEMBER_REL))
@@ -2151,7 +2170,7 @@ baseRelHasGpuCache(PlannerInfo *root, RelOptInfo *baserel)
 		}
 		table_close(rel, NoLock);
 	}
-	return (pgstrom_enable_gpucache ? cuda_dindex : -1);
+	return cuda_dindex;
 }
 
 /*
@@ -2160,7 +2179,7 @@ baseRelHasGpuCache(PlannerInfo *root, RelOptInfo *baserel)
 bool
 RelationHasGpuCache(Relation rel)
 {
-	if (pgstrom_enable_gpucache)
+	if (pgstrom_enable_gpucache && pgstromGpuCacheIsInitialized())
 		return (gpuCacheTableSignature(rel,NULL) != 0UL);
 	return false;
 }
@@ -2693,7 +2712,7 @@ pgstromGpuCacheExecInit(pgstromTaskState *pts)
 		return NULL;
 	}
 	/* check pg_strom.enable_gpucache */
-	if (!pgstrom_enable_gpucache)
+	if (!pgstrom_enable_gpucache || !pgstromGpuCacheIsInitialized())
 		return NULL;
 	/* table must be configured for GpuCache */
 	signature = gpuCacheTableSignature(rel, &gc_options);
