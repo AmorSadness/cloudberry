@@ -152,6 +152,22 @@ static int			__pgstrom_cuda_stack_limit_kb;
 static char		   *pgstrom_cuda_toolkit_basedir = CUDA_TOOLKIT_BASEDIR; /* GUC */
 static const char  *pgstrom_fatbin_image_filename = "/dev/null";
 
+/*
+ * Keep the GPU Service worker lifecycle aligned with the subsystems that
+ * _PG_init() initialized.  The Cloudberry GpuScan MVP deliberately does not
+ * initialize GpuCache, so its shared state and process-shared synchronization
+ * objects do not exist there.
+ */
+static inline bool
+gpuservGpuCacheEnabled(void)
+{
+#ifdef GP_VERSION_NUM
+	return false;
+#else
+	return true;
+#endif
+}
+
 #define __gsLogCxt(gcontext,fmt,...)					\
 	__gsLogLabel(((gcontext) ? (gcontext)->gpu_label : "GPU-Serv"), fmt, ##__VA_ARGS__)
 #define __gsLog(fmt,...)								\
@@ -4200,6 +4216,12 @@ gpuservHandleGpuTaskExec(gpuContext *gcontext,
 		char		errbuf[120];
 
 		Assert(xcmd->tag == XpuCommandTag__XpuTaskExecGpuCache);
+		if (!gpuservGpuCacheEnabled())
+		{
+			gpuClientELog(gclient,
+						  "GpuCache is not available in this PG-Strom build");
+			return;
+		}
 		gc_lmap = gpuCacheGetDeviceBuffer(ident,
 										  &m_kds_src,
 										  &m_kds_extra,
@@ -6064,8 +6086,14 @@ gpuservGpuWorkerMain(void *__arg)
 				switch (xcmd->tag)
 				{
 					case XpuCommandTag__XpuTaskExec:
-					case XpuCommandTag__XpuTaskExecGpuCache:
 						gpuservHandleGpuTaskExec(gcontext, gclient, xcmd);
+						break;
+					case XpuCommandTag__XpuTaskExecGpuCache:
+						if (!gpuservGpuCacheEnabled())
+							gpuClientELog(gclient,
+										  "GpuCache is not available in this PG-Strom build");
+						else
+							gpuservHandleGpuTaskExec(gcontext, gclient, xcmd);
 						break;
 					case XpuCommandTag__XpuTaskFinal:
 						gpuservHandleGpuTaskFinal(gcontext, gclient, xcmd);
@@ -6436,7 +6464,7 @@ static void
 __gpuContextAdjustWorkersOne(gpuContext *gcontext, uint32_t nworkers)
 {
 	pthread_attr_t th_attr;
-	bool		has_gpucache = false;
+	bool		has_gpucache = !gpuservGpuCacheEnabled();
 	bool		needs_wakeup = false;
 	uint32_t	count = 0;
 	int			nr_startup = 0;
@@ -6505,7 +6533,7 @@ __gpuContextAdjustWorkersOne(gpuContext *gcontext, uint32_t nworkers)
 		count++;
 		nr_startup += 2;
 	}
-	if (!has_gpucache)
+	if (gpuservGpuCacheEnabled() && !has_gpucache)
 	{
 		gpuWorker  *gworker = calloc(1, sizeof(gpuWorker));
 
@@ -6646,7 +6674,8 @@ gpuservCleanupGpuContext(gpuContext *gcontext)
 	for (;;)
 	{
 		pthreadCondBroadcast(&gcontext->cond);
-		gpucacheManagerWakeUp(gcontext->cuda_dindex);
+		if (gpuservGpuCacheEnabled())
+			gpucacheManagerWakeUp(gcontext->cuda_dindex);
 
 		pthreadMutexLock(&gcontext->worker_lock);
 		if (dlist_is_empty(&gcontext->worker_list))
