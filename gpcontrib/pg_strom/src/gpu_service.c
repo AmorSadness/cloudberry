@@ -6444,7 +6444,7 @@ gpuservSetupGpuModule(gpuContext *gcontext)
 /*
  * __gpuContextAdjustWorkers
  */
-static void
+static uint32_t
 __gpuContextAdjustWorkersOne(gpuContext *gcontext, uint32_t nworkers)
 {
 	pthread_attr_t th_attr;
@@ -6524,7 +6524,7 @@ __gpuContextAdjustWorkersOne(gpuContext *gcontext, uint32_t nworkers)
 		if (!gworker)
 		{
 			elog(LOG, "out of memory");
-			return;
+			goto out;
 		}
 		gworker->gcontext = gcontext;
 		gworker->kind = GPUSERV_WORKER_KIND__GPUCACHE;
@@ -6535,7 +6535,7 @@ __gpuContextAdjustWorkersOne(gpuContext *gcontext, uint32_t nworkers)
 		{
 			elog(LOG, "failed on pthread_create: %m");
 			free(gworker);
-			return;
+			goto out;
 		}
 		pthreadMutexLock(&gcontext->worker_lock);
 		dlist_push_tail(&gcontext->worker_list, &gworker->chain);
@@ -6551,6 +6551,7 @@ out:
 			 (nr_startup & 1) ? " (with GpuCacheManager)" : "",
 			 nr_terminate);
 	}
+	return count;
 }
 
 static void
@@ -6581,6 +6582,40 @@ __gpuContextAdjustWorkers(void)
 			pg_atomic_compare_exchange_u64(&gpuserv_shared_state->max_async_tasks,
 										   &conf_val, (uint64_t)nworkers);
 		}
+	}
+}
+
+/*
+ * __gpuContextStartWorkers
+ *
+ * The desired worker count is kept in shared memory, but gpuContext and its
+ * worker list belong to an individual GPU-Service process.  In particular,
+ * when the background worker is restarted after a device error, the shared
+ * max_async_tasks value normally has no pending-update timestamp anymore.
+ * Therefore, __gpuContextAdjustWorkers() alone would never populate the new
+ * process' empty worker lists.
+ *
+ * Build the initial worker pool unconditionally for every GPU-Service
+ * process.  __gpuContextAdjustWorkers() remains responsible for delayed
+ * application of subsequent GUC changes.
+ */
+static void
+__gpuContextStartWorkers(void)
+{
+	uint32_t	nworkers = pgstrom_max_async_tasks();
+	dlist_iter	iter;
+
+	dlist_foreach(iter, &gpuserv_gpucontext_list)
+	{
+		gpuContext *gcontext = dlist_container(gpuContext,
+											   chain, iter.cur);
+		uint32_t	count;
+
+		count = __gpuContextAdjustWorkersOne(gcontext, nworkers);
+		if (count < nworkers)
+			elog(ERROR,
+				 "unable to start GPU%d worker pool: %u of %u workers started",
+				 gcontext->cuda_dindex, count, nworkers);
 	}
 }
 
@@ -6733,6 +6768,10 @@ gpuservBgWorkerMain(Datum arg)
 	pqsignal(SIGHUP,  gpuservBgWorkerSignal);	/* restart GpuServ */
 	BackgroundWorkerUnblockSignals();
 
+	/* Do not advertise a restarting service until its worker pool is ready. */
+	gpuserv_shared_state->gpuserv_ready_accept = false;
+	pg_memory_barrier();
+
 	/* Registration of resource cleanup handler */
 	dlist_init(&gpuserv_gpucontext_list);
 	before_shmem_exit(gpuservCleanupOnProcExit, 0);
@@ -6764,11 +6803,18 @@ gpuservBgWorkerMain(Datum arg)
 			gpuContext *gcontext = gpuservSetupGpuContext(dindex);
 			dlist_push_tail(&gpuserv_gpucontext_list, &gcontext->chain);
 		}
-		/* ready to accept connection from the PostgreSQL backend */
-		gpuserv_shared_state->gpuserv_ready_accept = true;
-
 		if (!gpuDirectOpenDriver())
 			elog(ERROR, "failed on gpuDirectOpenDriver");
+
+		/*
+		 * gpuServSharedState survives a background-worker restart, whereas
+		 * gpuContext worker lists do not.  Always rebuild the initial worker
+		 * pool before accepting backend connections.
+		 */
+		__gpuContextStartWorkers();
+		pg_memory_barrier();
+		gpuserv_shared_state->gpuserv_ready_accept = true;
+
 		while (!gpuServiceGoingTerminate())
 		{
 			struct epoll_event	ep_ev;

@@ -43,6 +43,20 @@ require_text '!pgstrom_enable_gpucache \|\| !pgstromGpuCacheIsInitialized\(\)' "
 require_text 'has_gpucache = !pgstromGpuCacheIsInitialized\(\)' "$gpu_service"
 require_text 'pgstromGpuCacheIsInitialized\(\) && !has_gpucache' "$gpu_service"
 require_text 'if \(pgstromGpuCacheIsInitialized\(\)\)' "$gpu_service"
+require_text '__gpuContextStartWorkers\(void\)' "$gpu_service"
+require_text '__gpuContextStartWorkers\(\);' "$gpu_service"
+require_text 'unable to start GPU%d worker pool' "$gpu_service"
+require_text 'gpuserv_shared_state->gpuserv_ready_accept = false;' "$gpu_service"
 require_text 'Motion .*slice\[1-9\].*segments: 1' "$demo_runner"
+
+initial_workers_line=$(grep -n '__gpuContextStartWorkers();' "$gpu_service" |
+    cut -d: -f1)
+ready_line=$(grep -n 'gpuserv_shared_state->gpuserv_ready_accept = true;' "$gpu_service" |
+    cut -d: -f1)
+if [[ -z "$initial_workers_line" || -z "$ready_line" ||
+      "$initial_workers_line" -ge "$ready_line" ]]; then
+    echo 'GPU Service must start workers before advertising readiness' >&2
+    exit 1
+fi
 
 echo 'Cloudberry PG-Strom MVP static checks: PASS'
