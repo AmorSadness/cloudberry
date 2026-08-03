@@ -9,6 +9,9 @@ makefile="$repo_root/gpcontrib/pg_strom/src/Makefile"
 main_c="$repo_root/gpcontrib/pg_strom/src/main.c"
 gpu_service="$repo_root/gpcontrib/pg_strom/src/gpu_service.c"
 demo_runner="$repo_root/gpcontrib/pg_strom/cloudberry/demo/run_demo.sh"
+demo_config="$repo_root/gpcontrib/pg_strom/cloudberry/demo/postgresql.conf.mvp"
+demo_setup="$repo_root/gpcontrib/pg_strom/cloudberry/demo/setup.sql"
+demo_verify="$repo_root/gpcontrib/pg_strom/cloudberry/demo/verify.sql"
 
 require_text() {
     local pattern=$1
@@ -62,7 +65,26 @@ require_text '__gpuContextStartWorkers\(void\)' "$gpu_service"
 require_text '__gpuContextStartWorkers\(\);' "$gpu_service"
 require_text 'unable to start GPU%d worker pool' "$gpu_service"
 require_text 'gpuserv_shared_state->gpuserv_ready_accept = false;' "$gpu_service"
-require_text 'Motion .*slice\[1-9\].*segments: 1' "$demo_runner"
+require_text 'gp_segment_configuration' "$demo_runner"
+require_text 'primary_segment_count < 2' "$demo_runner"
+require_text 'segments: \$\{primary_segment_count\}' "$demo_runner"
+require_text 'PGSTROM_MVP_REPEAT' "$demo_runner"
+require_text 'require_distribution_shape "uniform heap" pgstrom_mvp_heap' "$demo_runner"
+require_text 'require_distribution_shape "skew heap" pgstrom_mvp_skew 1' "$demo_runner"
+require_text 'require_distribution_shape "small heap" pgstrom_mvp_small 1' "$demo_runner"
+require_text 'compare_signature "uniform heap"' "$demo_runner"
+require_text 'compare_signature "skew heap"' "$demo_runner"
+require_text 'compare_signature "small heap"' "$demo_runner"
+require_text "gpu_mempool_segment_sz = '256MB'" "$demo_config"
+require_text 'gpu_mempool_max_ratio = 0\.20' "$demo_config"
+require_text 'CREATE TABLE pgstrom_mvp_skew' "$demo_setup"
+require_text 'CREATE TABLE pgstrom_mvp_small' "$demo_setup"
+require_text 'DISTRIBUTED BY \(dist_key\)' "$demo_setup"
+require_text 'EXPLAIN \(ANALYZE, VERBOSE, COSTS OFF\)' "$demo_verify"
+if grep -Eq 'segments: 1([^0-9]|$)' "$demo_runner"; then
+    echo 'multi-segment demo must not hard-code a single QE segment' >&2
+    exit 1
+fi
 
 initial_workers_line=$(grep -n '__gpuContextStartWorkers();' "$gpu_service" |
     cut -d: -f1)

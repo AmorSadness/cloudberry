@@ -40,4 +40,29 @@ CROSS JOIN LATERAL
 ORDER BY p.grp, q.n
 LIMIT 3;
 
+-- A skewed distribution makes all but one QE execute an empty local scan.
+-- NULL-bearing columns are projected through GpuScan and consumed above it.
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF)
+SELECT id, amount, nullable_metric, payload
+FROM pgstrom_mvp_skew
+WHERE metric BETWEEN -500 AND 750
+  AND amount >= -250.00;
+
+SELECT count(*) AS n,
+       sum(id)::numeric AS sum_id,
+       sum(metric)::numeric AS sum_metric,
+       sum(amount)::numeric AS sum_amount,
+       count(*) FILTER (WHERE nullable_metric IS NULL) AS null_metrics,
+       count(*) FILTER (WHERE payload IS NULL) AS null_payloads
+FROM pgstrom_mvp_skew
+WHERE metric BETWEEN -500 AND 750
+  AND amount >= -250.00;
+
+-- The GPU path is forced only to validate distributed execution with a tiny
+-- input; this is deliberately not a performance claim.
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF)
+SELECT id, metric, amount, nullable_metric, payload
+FROM pgstrom_mvp_small
+WHERE id BETWEEN 1 AND 16;
+
 DEALLOCATE pgstrom_mvp_q;

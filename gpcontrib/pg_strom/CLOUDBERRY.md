@@ -50,8 +50,11 @@ synchronizes the effective parallel worker count with the locus.
 
 The GPU host must be Linux x86_64 with a compute capability 7.5 or newer GPU
 and CUDA Toolkit 12.2 update 1 or newer.  PG-Strom must be present in
-`shared_preload_libraries` on both coordinator and segment instances.  See
-`cloudberry/demo/README.md` for the single-primary setup and acceptance steps.
+`shared_preload_libraries` on the coordinator and all primary/mirror segment
+instances.  See `cloudberry/demo/README.md` for the experimental multi-segment
+technical demo.  It requires at least two up preferred primaries, dynamically
+checks the Motion segment count, and validates uniform, skewed, and tiny heap
+tables.  A single-host run remains serial because its services share one GPU.
 
 The current source-only environment can run:
 

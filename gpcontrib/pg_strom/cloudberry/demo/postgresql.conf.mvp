@@ -1,9 +1,14 @@
-# Apply this file to the coordinator and the single primary segment.
+# Apply this file to the coordinator, all primaries, and all mirrors before
+# starting the multi-segment demo.
 shared_preload_libraries = 'pg_strom'
 max_worker_processes = 16
 
-# One GPU is shared serially by QD and QE during MVP validation.
-pg_strom.gpu_mempool_max_ratio = 0.40
+# The single-host demo shares one GPU among independent QD/QE services.  This
+# is a per-service limit, not a host-wide quota.  Keep the demo serial and use
+# the minimum allowed ratio and allocation segment size when several primaries
+# and mirrors run on one host.  Idle services do not reserve the full limit.
+pg_strom.gpu_mempool_segment_sz = '256MB'
+pg_strom.gpu_mempool_max_ratio = 0.20
 pg_strom.cpu_fallback = 'off'
 pg_strom.enabled = on
 pg_strom.enable_gpuscan = on
