@@ -4,6 +4,13 @@
 > 上游基线：PG-Strom v6.1，commit `4d12ef415759dc48cd4c1421565e9c694b7bd3f9`  
 > 整理日期：2026-07-29
 
+> **历史基线说明（2026-08-03）**：本文保留单 Primary MVP 当时的设计和
+> 验收记录。当前能力边界应同时参考
+> `CLOUDBERRY_GPUSCAN_MULTI_SEGMENT_MILESTONE.md`；其中已经完成的单机双
+> Primary 与受控 GPU Service 重启验收，取代本文“多 Segment 未验证”的
+> 历史结论。正在开发的 SQL 可观测性、query cancel 与 SIGKILL 验收见
+> `CLOUDBERRY_GPUSCAN_OBSERVABILITY_RECOVERY_DESIGN.md`。
+
 ## 1. 结论
 
 当前版本已经形成一个**功能正确、范围受控、具备可重复验收流程的 Cloudberry 单 Primary GpuScan MVP**。它可以在一个 Coordinator（QD）和一个 Primary Segment（QE）组成的单机 Cloudberry 集群中，对普通分布式 heap 表生成并实际执行 `Custom Scan (GpuScan)`，把可支持的过滤表达式和投影交给 GPU 执行，并通过 Motion 将 QE 结果返回 QD。

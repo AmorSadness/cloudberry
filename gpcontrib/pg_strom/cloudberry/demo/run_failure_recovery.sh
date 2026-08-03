@@ -7,6 +7,8 @@ target_content=${PGSTROM_MVP_TARGET_CONTENT:-0}
 recovery_cycles=${PGSTROM_MVP_RECOVERY_CYCLES:-3}
 recovery_timeout=${PGSTROM_MVP_RECOVERY_TIMEOUT:-30}
 allow_restart=${PGSTROM_MVP_ALLOW_SERVICE_RESTART:-0}
+allow_hard_failure=${PGSTROM_MVP_ALLOW_HARD_FAILURE:-0}
+service_signal=${PGSTROM_MVP_SERVICE_SIGNAL:-HUP}
 
 psql_cmd=("$psql_bin" -X -v ON_ERROR_STOP=1 -d "$database")
 
@@ -26,6 +28,13 @@ if (( recovery_cycles < 1 || recovery_timeout < 5 )); then
 fi
 if [[ $allow_restart != 1 ]]; then
     die "set PGSTROM_MVP_ALLOW_SERVICE_RESTART=1 to authorize signaling the target GPU Service"
+fi
+service_signal=${service_signal^^}
+if [[ $service_signal != HUP && $service_signal != KILL ]]; then
+    die "PGSTROM_MVP_SERVICE_SIGNAL must be HUP or KILL: $service_signal"
+fi
+if [[ $service_signal == KILL && $allow_hard_failure != 1 ]]; then
+    die "set PGSTROM_MVP_ALLOW_HARD_FAILURE=1 to authorize SIGKILL fault injection"
 fi
 
 topology=$("${psql_cmd[@]}" -AtF '|' -c "
@@ -155,6 +164,9 @@ failure_query="
 if [[ $("${psql_cmd[@]}" -Atqc "SELECT to_regclass('public.pgstrom_mvp_heap') IS NOT NULL;") != t ]]; then
     die "pgstrom_mvp_heap is missing; run run_demo.sh successfully before this test"
 fi
+if [[ $("${psql_cmd[@]}" -Atqc "SELECT to_regclass('pgstrom.gpu_service_status') IS NOT NULL;") != t ]]; then
+    die "pgstrom.gpu_service_status is missing; install PG-Strom 6.1 and ALTER EXTENSION pg_strom UPDATE"
+fi
 
 plan=$("${psql_cmd[@]}" -Atqc "
     $gpu_settings
@@ -183,6 +195,7 @@ echo "Failure/recovery target: content=$target_content dbid=$target_dbid host=$t
 echo "Target postmaster: pid=$postmaster_pid datadir=$target_datadir"
 echo "Baseline signature: $gpu_signature"
 echo "Expected worker log pattern: $worker_pattern"
+echo "Fault signal: SIG$service_signal"
 
 for ((cycle = 1; cycle <= recovery_cycles; cycle++)); do
     old_service_pid=$(find_gpu_service_pid || true)
@@ -191,8 +204,18 @@ for ((cycle = 1; cycle <= recovery_cycles; cycle++)); do
     fi
     old_worker_logs=$(worker_log_count "$worker_pattern")
 
-    echo "cycle $cycle/$recovery_cycles: signaling GPU Service pid=$old_service_pid with SIGHUP"
-    kill -HUP "$old_service_pid"
+    old_generation=$("${psql_cmd[@]}" -Atqc "
+        SELECT min(service_generation)
+        FROM pgstrom.gpu_service_status_segments()
+        WHERE content_id = $target_content
+        HAVING count(*) > 0
+           AND min(service_generation) = max(service_generation);")
+    if [[ ! $old_generation =~ ^[0-9]+$ ]]; then
+        die "cycle $cycle: unable to read service generation for content $target_content: $old_generation"
+    fi
+
+    echo "cycle $cycle/$recovery_cycles: signaling GPU Service pid=$old_service_pid with SIG$service_signal"
+    kill -"$service_signal" "$old_service_pid"
     if ! wait_for_old_service_exit "$old_service_pid"; then
         die "cycle $cycle: GPU Service $old_service_pid did not exit within ${recovery_timeout}s"
     fi
@@ -207,7 +230,7 @@ for ((cycle = 1; cycle <= recovery_cycles; cycle++)); do
     if grep -q 'UNEXPECTED_PARTIAL_RESULT' <<<"$failure_output"; then
         die "cycle $cycle: query emitted a partial result before failing: $failure_output"
     fi
-    if ! grep -Eiq 'failed on connect|gpu[ -]?service|gpuserv|pg_strom.*sock|segment.*(fail|error)' <<<"$failure_output"; then
+    if ! grep -Eiq 'failed on connect|gpu[ -]?service|gpuserv|pg_strom.*sock|segment.*(fail|error)|terminating connection|recovery mode' <<<"$failure_output"; then
         die "cycle $cycle: failure was not clearly attributed to GPU/segment service: $failure_output"
     fi
     echo "cycle $cycle/$recovery_cycles: distributed query failed without a partial row (expected)"
@@ -234,6 +257,17 @@ for ((cycle = 1; cycle <= recovery_cycles; cycle++)); do
         die "cycle $cycle: service restarted but signature did not recover: expected=$cpu_signature actual=$recovered_signature"
     fi
 
+    new_generation=$("${psql_cmd[@]}" -Atqc "
+        SELECT min(service_generation)
+        FROM pgstrom.gpu_service_status_segments()
+        WHERE content_id = $target_content
+        HAVING count(*) > 0
+           AND bool_and(ready AND actual_workers = configured_workers)
+           AND min(service_generation) = max(service_generation);")
+    if [[ ! $new_generation =~ ^[0-9]+$ ]] || (( new_generation <= old_generation )); then
+        die "cycle $cycle: SQL status did not show a ready replacement generation: old=$old_generation new=$new_generation"
+    fi
+
     worker_deadline=$((SECONDS + recovery_timeout))
     new_worker_logs=$(worker_log_count "$worker_pattern")
     while (( new_worker_logs <= old_worker_logs && SECONDS < worker_deadline )); do
@@ -247,7 +281,7 @@ for ((cycle = 1; cycle <= recovery_cycles; cycle++)); do
     if ! kill -0 "$postmaster_pid" 2>/dev/null; then
         die "cycle $cycle: target segment postmaster unexpectedly stopped"
     fi
-    echo "cycle $cycle/$recovery_cycles: generation $old_service_pid -> $new_service_pid, worker logs $old_worker_logs -> $new_worker_logs, signature recovered"
+    echo "cycle $cycle/$recovery_cycles: pid $old_service_pid -> $new_service_pid, status generation $old_generation -> $new_generation, worker logs $old_worker_logs -> $new_worker_logs, signature recovered"
 done
 
-echo "GPU Service failure propagation and recovery passed for $recovery_cycles cycles on content $target_content."
+echo "GPU Service SIG$service_signal failure propagation and recovery passed for $recovery_cycles cycles on content $target_content."

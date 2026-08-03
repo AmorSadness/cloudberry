@@ -34,6 +34,7 @@
 #ifdef GP_VERSION_NUM
 #include "catalog/gp_distribution_policy.h"
 #include "cdb/cdbpathlocus.h"
+#include "cdb/cdbvars.h"
 #endif
 #include "catalog/dependency.h"
 #include "catalog/heap.h"

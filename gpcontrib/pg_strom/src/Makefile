@@ -49,7 +49,8 @@ include Makefile.cuda
 __STROM_SQL = pg_strom--4.0--5.0.sql \
               pg_strom--5.0.sql \
               pg_strom--5.0--5.1.sql \
-              pg_strom--5.1--6.0.sql
+              pg_strom--5.1--6.0.sql \
+              pg_strom--6.0--6.1.sql
 STROM_SQL = $(addprefix sql/,$(__STROM_SQL))
 
 #

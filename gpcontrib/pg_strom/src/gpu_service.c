@@ -111,7 +111,23 @@ typedef struct
  */
 typedef struct
 {
+	pg_atomic_uint32 actual_workers;
+	pg_atomic_uint32 queued_commands;
+	pg_atomic_uint32 active_commands;
+	pg_atomic_uint64 submitted_commands;
+	pg_atomic_uint64 completed_commands;
+	pg_atomic_uint64 failed_commands;
+	pg_atomic_uint64 cancelled_commands;
+} gpuServDeviceStats;
+
+typedef struct
+{
 	volatile bool		gpuserv_ready_accept;
+	pg_atomic_uint32 service_pid;
+	pg_atomic_uint32 active_clients;
+	pg_atomic_uint64 service_generation;
+	slock_t			status_lock;
+	char			fatbin_name[MAXPGPATH];
 	/*
 	 * For worker startup delay (issue #811), max_async_tasks records
 	 * the timestamp when configuration was updated.
@@ -123,12 +139,15 @@ typedef struct
 #define MAX_ASYNC_TASKS_BITS	10
 #define MAX_ASYNC_TASKS_MASK	((1UL<<MAX_ASYNC_TASKS_BITS)-1)
 	pg_atomic_uint64	max_async_tasks;
+	gpuServDeviceStats device_stats[FLEXIBLE_ARRAY_MEMBER];
 } gpuServSharedState;
 
 /*
  * variables
  */
 static __thread gpuContext		*GpuWorkerCurrentContext = NULL;
+static __thread bool			GpuWorkerCommandFailed = false;
+static __thread bool			GpuWorkerCommandCancelled = false;
 #define MY_DINDEX_PER_THREAD	(GpuWorkerCurrentContext->cuda_dindex)
 #define MY_DEVICE_PER_THREAD	(GpuWorkerCurrentContext->cuda_device)
 #define MY_CONTEXT_PER_THREAD	(GpuWorkerCurrentContext->cuda_context)
@@ -152,6 +171,21 @@ static int			__pgstrom_max_async_tasks_dummy;
 static int			__pgstrom_cuda_stack_limit_kb;
 static char		   *pgstrom_cuda_toolkit_basedir = CUDA_TOOLKIT_BASEDIR; /* GUC */
 static const char  *pgstrom_fatbin_image_filename = "/dev/null";
+
+static inline size_t
+gpuServSharedStateSize(void)
+{
+	return MAXALIGN(offsetof(gpuServSharedState, device_stats) +
+					sizeof(gpuServDeviceStats) * numGpuDevAttrs);
+}
+
+static inline gpuServDeviceStats *
+gpuServGetDeviceStats(const gpuContext *gcontext)
+{
+	Assert(gpuserv_shared_state != NULL);
+	Assert(gcontext->cuda_dindex >= 0 && gcontext->cuda_dindex < numGpuDevAttrs);
+	return &gpuserv_shared_state->device_stats[gcontext->cuda_dindex];
+}
 
 #define __gsLogCxt(gcontext,fmt,...)					\
 	__gsLogLabel(((gcontext) ? (gcontext)->gpu_label : "GPU-Serv"), fmt, ##__VA_ARGS__)
@@ -1427,6 +1461,7 @@ __gpuClientELogRaw(gpuClient *gclient, kern_errorbuf *errorbuf)
 	resp.tag = XpuCommandTag__Error;
 	resp.length = offsetof(XpuCommand, u.error) + sizeof(kern_errorbuf);
 	memcpy(&resp.u.error, errorbuf, sizeof(kern_errorbuf));
+	GpuWorkerCommandFailed = true;
 
 	iov.iov_base = &resp;
 	iov.iov_len  = resp.length;
@@ -1458,6 +1493,7 @@ __gpuClientELog(gpuClient *gclient,
 	va_start(ap, fmt);
 	vsnprintf(resp.u.error.message, KERN_ERRORBUF_MESSAGE_LEN, fmt, ap);
 	va_end(ap);
+	GpuWorkerCommandFailed = true;
 
 	iov.iov_base = &resp;
 	iov.iov_len  = resp.length;
@@ -2770,6 +2806,7 @@ gpuClientPut(gpuClient *gclient, bool exit_monitor_thread)
 		pthreadMutexLock(&gpuserv_client_lock);
 		dlist_delete(&gclient->chain);
 		pthreadMutexUnlock(&gpuserv_client_lock);
+		pg_atomic_fetch_sub_u32(&gpuserv_shared_state->active_clients, 1);
 
 		if (gclient->sockfd >= 0)
 			close(gclient->sockfd);
@@ -2826,6 +2863,7 @@ __gpuClientWriteBack(gpuClient *gclient, struct iovec *iov, int iovcnt)
 				 * to send back the message any more. So, clean up this gpuClient.
 				 */
 				pg_atomic_fetch_and_u32(&gclient->refcnt, ~1U);
+				GpuWorkerCommandCancelled = true;
 				close(gclient->sockfd);
 				gclient->sockfd = -1;
 				break;
@@ -3119,10 +3157,13 @@ __gpuServiceAttachCommand(void *__priv, XpuCommand *xcmd)
 	else
 	{
 		gpuContext *gcontext = packed->gcontext;
+		gpuServDeviceStats *dstats = gpuServGetDeviceStats(gcontext);
 
 		pthreadMutexLock(&gcontext->lock);
 		dlist_push_tail(&gcontext->command_list, &xcmd->chain);
 		pg_atomic_fetch_add_u32(&gcontext->num_commands, 1);
+		pg_atomic_fetch_add_u32(&dstats->queued_commands, 1);
+		pg_atomic_fetch_add_u64(&dstats->submitted_commands, 1);
 		pthreadMutexUnlock(&gcontext->lock);
 		pthreadCondSignal(&gcontext->cond);
 	}
@@ -6047,6 +6088,7 @@ gpuservGpuWorkerMain(void *__arg)
 {
 	gpuWorker  *gworker = (gpuWorker *)__arg;
 	gpuContext *gcontext = gworker->gcontext;
+	gpuServDeviceStats *dstats = gpuServGetDeviceStats(gcontext);
 	gpuClient  *gclient;
 
 	/* switch heterodb-extra ereport callback */
@@ -6067,11 +6109,16 @@ gpuservGpuWorkerMain(void *__arg)
 		THREAD_GPU_CONTEXT_VALIDATION_CHECK(gcontext);
 		if (!dlist_is_empty(&gcontext->command_list))
 		{
+			bool	command_executed = false;
+
 			dnode = dlist_pop_head_node(&gcontext->command_list);
 			xcmd = dlist_container(XpuCommand, chain, dnode);
+			pg_atomic_fetch_sub_u32(&dstats->queued_commands, 1);
 			pthreadMutexUnlock(&gcontext->lock);
 
 			gclient = xcmd->priv;
+			GpuWorkerCommandFailed = false;
+			GpuWorkerCommandCancelled = false;
 			/*
 			 * MEMO: If the least bit of gclient->refcnt is not set,
 			 * it means the gpu-client connection is no longer available.
@@ -6079,6 +6126,8 @@ gpuservGpuWorkerMain(void *__arg)
 			 */
 			if ((pg_atomic_read_u32(&gclient->refcnt) & 1) == 1)
 			{
+				command_executed = true;
+				pg_atomic_fetch_add_u32(&dstats->active_commands, 1);
 				switch (xcmd->tag)
 				{
 					case XpuCommandTag__XpuTaskExec:
@@ -6099,7 +6148,17 @@ gpuservGpuWorkerMain(void *__arg)
 									  (int)xcmd->tag);
 						break;
 				}
+				pg_atomic_fetch_sub_u32(&dstats->active_commands, 1);
 			}
+			else
+				GpuWorkerCommandCancelled = true;
+
+			if (GpuWorkerCommandCancelled)
+				pg_atomic_fetch_add_u64(&dstats->cancelled_commands, 1);
+			else if (GpuWorkerCommandFailed)
+				pg_atomic_fetch_add_u64(&dstats->failed_commands, 1);
+			else if (command_executed)
+				pg_atomic_fetch_add_u64(&dstats->completed_commands, 1);
 			__gpuServiceFreeCommand(xcmd);
 			gpuClientPut(gclient, false);
 			pthreadMutexLock(&gcontext->lock);
@@ -6219,6 +6278,11 @@ gpuservAcceptClient(void)
 	pg_atomic_init_u32(&gclient->refcnt, 1);
 	pthreadMutexInit(&gclient->mutex);
 	gclient->sockfd = sockfd;
+	/* Publish the client before its monitor thread can release it. */
+	pthreadMutexLock(&gpuserv_client_lock);
+	dlist_push_tail(&gpuserv_client_list, &gclient->chain);
+	pg_atomic_fetch_add_u32(&gpuserv_shared_state->active_clients, 1);
+	pthreadMutexUnlock(&gpuserv_client_lock);
 
 	/* launch workers */
 	if (pthread_attr_init(&th_attr) != 0)
@@ -6232,13 +6296,14 @@ gpuservAcceptClient(void)
 								  gclient)) != 0)
 	{
 		elog(LOG, "failed on pthread_create: %s", strerror(errcode));
+		pthreadMutexLock(&gpuserv_client_lock);
+		dlist_delete(&gclient->chain);
+		pg_atomic_fetch_sub_u32(&gpuserv_shared_state->active_clients, 1);
+		pthreadMutexUnlock(&gpuserv_client_lock);
 		close(sockfd);
 		free(gclient);
 		return;
 	}
-	pthreadMutexLock(&gpuserv_client_lock);
-	dlist_push_tail(&gpuserv_client_list, &gclient->chain);
-	pthreadMutexUnlock(&gpuserv_client_lock);
 }
 
 /*
@@ -6555,6 +6620,8 @@ __gpuContextAdjustWorkersOne(gpuContext *gcontext, uint32_t nworkers)
 		nr_startup += 3;
 	}
 out:
+	pg_atomic_write_u32(&gpuServGetDeviceStats(gcontext)->actual_workers,
+						count);
 	if (nr_startup > 0 || nr_terminate > 0)
 	{
 		elog(LOG, "GPU%d workers - %d startup%s, %d terminate",
@@ -6718,6 +6785,7 @@ gpuservCleanupGpuContext(gpuContext *gcontext)
 		/* wait 2ms */
 		pg_usleep(2000L);
 	}
+	pg_atomic_write_u32(&gpuServGetDeviceStats(gcontext)->actual_workers, 0);
 
 	/* Stop CUDA Profiler */
 	if (gcontext->cuda_profiler_started)
@@ -6738,6 +6806,8 @@ gpuservBgWorkerSignal(SIGNAL_ARGS)
 {
 	int		saved_errno = errno;
 
+	if (gpuserv_shared_state)
+		gpuserv_shared_state->gpuserv_ready_accept = false;
 	gpuserv_bgworker_got_signal |= (1 << postgres_signal_arg);
 
 	pg_memory_barrier();
@@ -6782,6 +6852,17 @@ gpuservBgWorkerMain(Datum arg)
 
 	/* Do not advertise a restarting service until its worker pool is ready. */
 	gpuserv_shared_state->gpuserv_ready_accept = false;
+	pg_atomic_write_u32(&gpuserv_shared_state->service_pid, MyProcPid);
+	pg_atomic_write_u32(&gpuserv_shared_state->active_clients, 0);
+	pg_atomic_fetch_add_u64(&gpuserv_shared_state->service_generation, 1);
+	for (dindex=0; dindex < numGpuDevAttrs; dindex++)
+	{
+		gpuServDeviceStats *dstats = &gpuserv_shared_state->device_stats[dindex];
+
+		pg_atomic_write_u32(&dstats->actual_workers, 0);
+		pg_atomic_write_u32(&dstats->queued_commands, 0);
+		pg_atomic_write_u32(&dstats->active_commands, 0);
+	}
 	pg_memory_barrier();
 
 	/* Registration of resource cleanup handler */
@@ -6796,6 +6877,11 @@ gpuservBgWorkerMain(Datum arg)
 	gpuservLoggerOpen();
 	/* Build the fatbin binary image on demand */
 	gpuservSetupFatbin();
+	SpinLockAcquire(&gpuserv_shared_state->status_lock);
+	strlcpy(gpuserv_shared_state->fatbin_name,
+			pgstrom_fatbin_image_filename,
+			sizeof(gpuserv_shared_state->fatbin_name));
+	SpinLockRelease(&gpuserv_shared_state->status_lock);
 	/* Open the server socket */
 	gpuservOpenServerSocket();
 	/* Init GPU Context for each devices */
@@ -6900,6 +6986,107 @@ gpuservBgWorkerMain(Datum arg)
 }
 
 /*
+ * pgstrom_gpu_service_status
+ *
+ * Returns one row per GPU for the postmaster that executes this function.
+ * Cloudberry declares separate coordinator and all-primary SQL wrappers, so
+ * this C function never opens connections to other database instances.
+ */
+PG_FUNCTION_INFO_V1(pgstrom_gpu_service_status);
+PUBLIC_FUNCTION(Datum)
+pgstrom_gpu_service_status(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *fncxt;
+	int			dindex;
+	uint32_t	service_pid;
+	bool		ready;
+	char		fatbin_name[MAXPGPATH];
+	char	   *device_config;
+	Datum		values[18];
+	bool		isnull[18];
+	HeapTuple	tuple;
+	gpuServDeviceStats *dstats;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		TupleDesc		tupdesc;
+		MemoryContext	oldcxt;
+
+		fncxt = SRF_FIRSTCALL_INIT();
+		oldcxt = MemoryContextSwitchTo(fncxt->multi_call_memory_ctx);
+		tupdesc = CreateTemplateTupleDesc(18);
+		TupleDescInitEntry(tupdesc, 1, "content_id", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 2, "postmaster_pid", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 3, "service_pid", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 4, "service_generation", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 5, "ready", BOOLOID, -1, 0);
+		TupleDescInitEntry(tupdesc, 6, "gpu_id", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 7, "device_name", TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, 8, "configured_workers", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 9, "actual_workers", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 10, "active_clients", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 11, "queued_commands", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 12, "active_commands", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 13, "submitted_commands", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 14, "completed_commands", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 15, "failed_commands", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 16, "cancelled_commands", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 17, "fatbin_name", TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, 18, "device_config", TEXTOID, -1, 0);
+		fncxt->tuple_desc = BlessTupleDesc(tupdesc);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	fncxt = SRF_PERCALL_SETUP();
+	dindex = fncxt->call_cntr;
+	if (!gpuserv_shared_state || dindex >= numGpuDevAttrs)
+		SRF_RETURN_DONE(fncxt);
+
+	dstats = &gpuserv_shared_state->device_stats[dindex];
+	service_pid = pg_atomic_read_u32(&gpuserv_shared_state->service_pid);
+	ready = gpuserv_shared_state->gpuserv_ready_accept && service_pid > 0;
+	if (ready && kill((pid_t)service_pid, 0) != 0 && errno != EPERM)
+		ready = false;
+	SpinLockAcquire(&gpuserv_shared_state->status_lock);
+	strlcpy(fatbin_name, gpuserv_shared_state->fatbin_name,
+			sizeof(fatbin_name));
+	SpinLockRelease(&gpuserv_shared_state->status_lock);
+	device_config = psprintf("NAMEDATALEN=%u,BLCKSZ=%u,RELSEG_SIZE=%u,"
+						 "PG_PAGE_LAYOUT_VERSION=%u,MAXIMUM_ALIGNOF=%u",
+						 PGSTROM_DEVICE_NAMEDATALEN,
+						 PGSTROM_DEVICE_BLCKSZ,
+						 PGSTROM_DEVICE_RELSEG_SIZE,
+						 PGSTROM_DEVICE_PAGE_LAYOUT_VERSION,
+						 PGSTROM_DEVICE_MAXIMUM_ALIGNOF);
+
+	memset(isnull, 0, sizeof(isnull));
+#ifdef GP_VERSION_NUM
+	values[0] = Int32GetDatum(GpIdentity.segindex);
+#else
+	values[0] = Int32GetDatum(-1);
+#endif
+	values[1] = Int32GetDatum(PostmasterPid);
+	values[2] = Int32GetDatum(service_pid);
+	values[3] = Int64GetDatum(pg_atomic_read_u64(&gpuserv_shared_state->service_generation));
+	values[4] = BoolGetDatum(ready);
+	values[5] = Int32GetDatum(dindex);
+	values[6] = CStringGetTextDatum(gpuDevAttrs[dindex].DEV_NAME);
+	values[7] = Int32GetDatum(pgstrom_max_async_tasks());
+	values[8] = Int32GetDatum(pg_atomic_read_u32(&dstats->actual_workers));
+	values[9] = Int32GetDatum(pg_atomic_read_u32(&gpuserv_shared_state->active_clients));
+	values[10] = Int64GetDatum(pg_atomic_read_u32(&dstats->queued_commands));
+	values[11] = Int64GetDatum(pg_atomic_read_u32(&dstats->active_commands));
+	values[12] = Int64GetDatum(pg_atomic_read_u64(&dstats->submitted_commands));
+	values[13] = Int64GetDatum(pg_atomic_read_u64(&dstats->completed_commands));
+	values[14] = Int64GetDatum(pg_atomic_read_u64(&dstats->failed_commands));
+	values[15] = Int64GetDatum(pg_atomic_read_u64(&dstats->cancelled_commands));
+	values[16] = CStringGetTextDatum(fatbin_name);
+	values[17] = CStringGetTextDatum(device_config);
+
+	tuple = heap_form_tuple(fncxt->tuple_desc, values, isnull);
+	SRF_RETURN_NEXT(fncxt, HeapTupleGetDatum(tuple));
+}
+
+/*
  * pgstrom_request_executor
  */
 static void
@@ -6907,7 +7094,7 @@ pgstrom_request_executor(void)
 {
 	if (shmem_request_next)
 		(*shmem_request_next)();
-	RequestAddinShmemSpace(MAXALIGN(sizeof(gpuServSharedState)));
+	RequestAddinShmemSpace(gpuServSharedStateSize());
 }
 
 /*
@@ -6921,11 +7108,31 @@ pgstrom_startup_executor(void)
 	if (shmem_startup_next)
 		(*shmem_startup_next)();
 	gpuserv_shared_state = ShmemInitStruct("gpuServSharedState",
-										   MAXALIGN(sizeof(gpuServSharedState)),
+										   gpuServSharedStateSize(),
 										   &found);
-	memset(gpuserv_shared_state, 0, sizeof(gpuServSharedState));
-	pg_atomic_init_u64(&gpuserv_shared_state->max_async_tasks,
-					   __pgstrom_max_async_tasks_dummy | (1UL<<MAX_ASYNC_TASKS_BITS));
+	if (!found)
+	{
+		memset(gpuserv_shared_state, 0, gpuServSharedStateSize());
+		pg_atomic_init_u32(&gpuserv_shared_state->service_pid, 0);
+		pg_atomic_init_u32(&gpuserv_shared_state->active_clients, 0);
+		pg_atomic_init_u64(&gpuserv_shared_state->service_generation, 0);
+		pg_atomic_init_u64(&gpuserv_shared_state->max_async_tasks,
+						   __pgstrom_max_async_tasks_dummy |
+						   (1UL << MAX_ASYNC_TASKS_BITS));
+		SpinLockInit(&gpuserv_shared_state->status_lock);
+		for (int i=0; i < numGpuDevAttrs; i++)
+		{
+			gpuServDeviceStats *dstats = &gpuserv_shared_state->device_stats[i];
+
+			pg_atomic_init_u32(&dstats->actual_workers, 0);
+			pg_atomic_init_u32(&dstats->queued_commands, 0);
+			pg_atomic_init_u32(&dstats->active_commands, 0);
+			pg_atomic_init_u64(&dstats->submitted_commands, 0);
+			pg_atomic_init_u64(&dstats->completed_commands, 0);
+			pg_atomic_init_u64(&dstats->failed_commands, 0);
+			pg_atomic_init_u64(&dstats->cancelled_commands, 0);
+		}
+	}
 }
 
 /*

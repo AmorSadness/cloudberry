@@ -46,6 +46,25 @@ echo "Cloudberry PG-Strom topology: $primary_segment_count up preferred primary 
 
 "${psql_cmd[@]}" -f "$demo_dir/setup.sql"
 
+if [[ $("${psql_cmd[@]}" -Atqc "SELECT to_regclass('pgstrom.gpu_service_status') IS NOT NULL;") != t ]]; then
+    echo "pgstrom.gpu_service_status is missing; install PG-Strom 6.1 and ALTER EXTENSION pg_strom UPDATE" >&2
+    exit 1
+fi
+service_status=$("${psql_cmd[@]}" -AtF '|' -qc "
+    SELECT count(DISTINCT content_id) FILTER (WHERE content_id >= 0),
+           count(DISTINCT content_id) FILTER (WHERE content_id = -1),
+           bool_and(ready AND actual_workers = configured_workers),
+           count(*)
+    FROM pgstrom.gpu_service_status;")
+IFS='|' read -r status_primary_count status_qd_count status_ready status_rows <<<"$service_status"
+if [[ $status_primary_count != "$primary_segment_count" ||
+      $status_qd_count != 1 || $status_ready != t ||
+      ! $status_rows =~ ^[1-9][0-9]*$ ]]; then
+    echo "GPU Service status is incomplete or unready: $service_status" >&2
+    exit 1
+fi
+echo "GPU Service status: primaries=$status_primary_count coordinator=$status_qd_count rows=$status_rows ready=$status_ready"
+
 gpu_settings="
     SET optimizer=off;
     SET pg_strom.enabled=on;

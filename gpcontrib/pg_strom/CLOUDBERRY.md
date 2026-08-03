@@ -63,7 +63,24 @@ gpcontrib/pg_strom/cloudberry/test_static_mvp.sh
 make -C src/backend/cdb cdbplan.o
 ```
 
-The PG-Strom host sources have also been compile-checked against Cloudberry
-16.9 server headers with temporary CUDA API declarations.  A real build still
-requires CUDA headers, `nvcc`, and the CUDA driver library; declarations alone
-are not a substitute for the GPU-host acceptance run.
+The pre-observability PG-Strom host baseline was compile-checked against
+Cloudberry 16.9 server headers with temporary CUDA API declarations.  The 6.1
+service-status changes in the current tree still require a fresh build on the
+GPU host.  A real build requires CUDA headers, `nvcc`, and the CUDA driver
+library; declarations alone are not a substitute for the GPU-host acceptance
+run.
+
+## Service observability and recovery development
+
+The Cloudberry extension version is 6.1.  It exposes the postmaster-local GPU
+Service state through `pgstrom.gpu_service_status_local()` on the coordinator,
+`pgstrom.gpu_service_status_segments()` on all Primaries, and the combined
+`pgstrom.gpu_service_status` view.  The rows include service PID/generation,
+readiness, configured/actual workers, clients and command counters, fatbin
+name, and the host/device storage configuration signature.
+
+`cloudberry/demo/run_query_cancel.sh` automates cancellation and command-drain
+checks.  `run_failure_recovery.sh` supports the established SIGHUP model and an
+explicitly double-opted-in SIGKILL model.  These new paths require validation
+on a real multi-Segment GPU host before they are treated as accepted; see
+`CLOUDBERRY_GPUSCAN_OBSERVABILITY_RECOVERY_DESIGN.md`.

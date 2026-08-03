@@ -5,6 +5,11 @@
 > 上游基线：PG-Strom v6.1，commit `4d12ef415759dc48cd4c1421565e9c694b7bd3f9`  
 > 验收日期：2026-08-03
 
+> **后续开发说明**：本文是已经完成验收的多 Segment 基线。SQL Service
+> 可观测性、自动 query cancel 和 SIGKILL 故障模型属于下一里程碑，设计及
+> 待验收状态记录在 `CLOUDBERRY_GPUSCAN_OBSERVABILITY_RECOVERY_DESIGN.md`；
+> 在 GPU 环境完成该文档出口前，不应把这些新增能力描述为已验收。
+
 ## 1. 结论
 
 当前版本已经在原单 Primary GpuScan MVP 的基础上，完成了一个**单机、双 Primary、范围受控且包含 GPU Service 故障恢复验收的多 Segment 技术里程碑**。

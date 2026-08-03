@@ -160,6 +160,23 @@ psql -X -d postgres -c "
   ORDER BY gp_segment_id;"
 ```
 
+PG-Strom 6.1 adds the Cloudberry-local GPU Service status functions.  After
+installing the new library and SQL files, restart every QD/QE postmaster so it
+allocates the enlarged shared-state structure.  Then upgrade an existing
+acceptance database; a new `CREATE EXTENSION` installs 6.1 directly:
+
+```sh
+psql -X -d pgstrom_mvp -c "ALTER EXTENSION pg_strom UPDATE TO '6.1';"
+psql -X -d pgstrom_mvp -c "SELECT * FROM pgstrom.gpu_service_status ORDER BY content_id, gpu_id;"
+```
+
+The combined view contains the coordinator (`content_id=-1`) and every
+Primary.  `gpu_service_status_local()` and `gpu_service_status_segments()`
+are also available when a caller needs only one placement.  Every ready row
+must show `actual_workers=configured_workers`.  Counters and generation are
+postmaster-shared and survive a GPU Service background-worker restart; queued,
+active, client, PID and readiness fields describe the current generation.
+
 Run the source-only checks, create the acceptance database, and execute the
 multi-segment runner:
 
@@ -249,6 +266,8 @@ For every cycle the runner verifies all of the following:
 - a distributed GpuScan fails with a GPU/service error and emits no partial
   result row while the target service is unavailable;
 - the postmaster creates a new service PID;
+- the SQL-visible service generation increases and reports a ready, fully
+  populated worker pool;
 - a new `GPU0 workers - N startup` log entry appears;
 - the recovered GPU signature again equals the CPU signature.
 
@@ -257,11 +276,44 @@ The runner intentionally refuses a remote target host; multi-host process
 coordination is outside this milestone.  A successful run ends with `GPU
 Service failure propagation and recovery passed`.
 
-Query cancellation remains a separate manual observation: run the filtered
-aggregate from one `psql`, cancel it using `pg_cancel_backend` from another,
-and confirm that the client receives query cancellation and a subsequent GPU
-signature still succeeds.  Cancellation automation is not required for the
-five agreed milestone exit conditions.
+`SIGKILL` is a separate, stronger fault model.  It requires a second explicit
+authorization and may cause the Segment postmaster to enter crash recovery,
+depending on background-worker and platform behavior:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_MVP_ALLOW_SERVICE_RESTART=1 \
+PGSTROM_MVP_ALLOW_HARD_FAILURE=1 \
+PGSTROM_MVP_SERVICE_SIGNAL=KILL \
+PGSTROM_MVP_TARGET_CONTENT=0 \
+PGSTROM_MVP_RECOVERY_CYCLES=3 \
+./gpcontrib/pg_strom/cloudberry/demo/run_failure_recovery.sh
+```
+
+Run this only on a disposable acceptance cluster.  The runner still signals
+only the uniquely identified GPU Service child; it checks that the Segment
+postmaster remains available, the distributed query does not emit a partial
+row, the generation increases, queues/workers recover, and the result
+signature is restored.  CUDA-fatal recovery is not claimed by this runner.
+
+## Query cancellation
+
+The cancellation runner starts a repeated parameterized GpuScan, waits until
+the SQL status interface observes an in-flight GPU command, calls
+`pg_cancel_backend` on its coordinator backend, then verifies that commands
+drain and a fresh CPU/GPU signature still agrees:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_MVP_CANCEL_CYCLES=3 \
+PGSTROM_MVP_CANCEL_TIMEOUT=30 \
+./gpcontrib/pg_strom/cloudberry/demo/run_query_cancel.sh
+```
+
+The acceptance cluster must otherwise be idle because the runner requires
+`active_clients`, `queued_commands`, and `active_commands` to return to zero.
+`cancelled_commands` counts commands skipped or unable to return a response
+after the backend closes its Service socket; it does not count SQL statements.
 
 Do not run concurrent acceptance traffic while QD and QEs share one GPU.  The
 configured pool limit applies independently to each GPU Service; it is not
