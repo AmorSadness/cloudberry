@@ -221,16 +221,47 @@ The tiny-table GpuScan is forced with `enable_seqscan=off` to test distributed
 execution, not to make a performance claim.  Inspect the verbose plans and the
 reported per-segment row distribution when diagnosing a failure.
 
-Cancellation and service-failure checks are deliberately manual because the
-service PID and cluster manager are installation-specific:
+## GPU Service failure and recovery
 
-1. Run the filtered aggregate from one `psql`, cancel it with `pg_cancel_backend`
-   from another, and confirm the client receives query cancellation.
-2. Stop only the primary segment's PG-Strom GPU Service and run a query whose
-   earlier plan showed GpuScan.  It must report a clear GPU/service error and
-   cancel the whole query; it must not silently return CPU results.
-3. Restart that instance and run `SELECT 1` and the CPU/GPU signature again to
-   confirm the cluster remains usable.
+After `run_demo.sh` succeeds, the single-host failure runner can exercise one
+QE's service restart path.  It reads the target segment's postmaster PID file,
+verifies the process parent/arguments, and identifies exactly one direct child
+named `PG-Strom GPU Service`.  It never signals the postmaster or QE backend.
+
+The action requires an explicit opt-in because it sends `SIGHUP` directly to
+the selected service.  PG-Strom defines this signal as a controlled exit with
+status 1; the postmaster restarts the background worker after its configured
+five-second delay.
+
+```sh
+cd "$CB_SRC"
+
+PGDATABASE=pgstrom_mvp \
+PGSTROM_MVP_ALLOW_SERVICE_RESTART=1 \
+PGSTROM_MVP_TARGET_CONTENT=0 \
+PGSTROM_MVP_RECOVERY_CYCLES=3 \
+./gpcontrib/pg_strom/cloudberry/demo/run_failure_recovery.sh
+```
+
+For every cycle the runner verifies all of the following:
+
+- the old GPU Service PID exits while its segment postmaster stays up;
+- a distributed GpuScan fails with a GPU/service error and emits no partial
+  result row while the target service is unavailable;
+- the postmaster creates a new service PID;
+- a new `GPU0 workers - N startup` log entry appears;
+- the recovered GPU signature again equals the CPU signature.
+
+`PGSTROM_MVP_RECOVERY_TIMEOUT` controls each wait and defaults to 30 seconds.
+The runner intentionally refuses a remote target host; multi-host process
+coordination is outside this milestone.  A successful run ends with `GPU
+Service failure propagation and recovery passed`.
+
+Query cancellation remains a separate manual observation: run the filtered
+aggregate from one `psql`, cancel it using `pg_cancel_backend` from another,
+and confirm that the client receives query cancellation and a subsequent GPU
+signature still succeeds.  Cancellation automation is not required for the
+five agreed milestone exit conditions.
 
 Do not run concurrent acceptance traffic while QD and QEs share one GPU.  The
 configured pool limit applies independently to each GPU Service; it is not
