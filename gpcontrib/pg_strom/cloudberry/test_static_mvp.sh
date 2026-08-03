@@ -12,6 +12,7 @@ demo_runner="$repo_root/gpcontrib/pg_strom/cloudberry/demo/run_demo.sh"
 demo_config="$repo_root/gpcontrib/pg_strom/cloudberry/demo/postgresql.conf.mvp"
 demo_setup="$repo_root/gpcontrib/pg_strom/cloudberry/demo/setup.sql"
 demo_verify="$repo_root/gpcontrib/pg_strom/cloudberry/demo/verify.sql"
+demo_readme="$repo_root/gpcontrib/pg_strom/cloudberry/demo/README.md"
 
 require_text() {
     local pattern=$1
@@ -81,6 +82,13 @@ require_text 'CREATE TABLE pgstrom_mvp_skew' "$demo_setup"
 require_text 'CREATE TABLE pgstrom_mvp_small' "$demo_setup"
 require_text 'DISTRIBUTED BY \(dist_key\)' "$demo_setup"
 require_text 'EXPLAIN \(ANALYZE, VERBOSE, COSTS OFF\)' "$demo_verify"
+require_text 'with-blocksize=32' "$demo_readme"
+require_text 'with-wal-blocksize=32' "$demo_readme"
+require_text 'PG_CONFIG="\$CB_INSTALL/bin/pg_config"' "$demo_readme"
+require_text 'NUM_PRIMARY_MIRROR_PAIRS=2' "$demo_readme"
+require_text 'WITH_MIRRORS=false' "$demo_readme"
+require_text 'shared_preload_libraries=pg_strom' "$demo_readme"
+require_text 'query must return .*2\|2' "$demo_readme"
 if grep -Eq 'segments: 1([^0-9]|$)' "$demo_runner"; then
     echo 'multi-segment demo must not hard-code a single QE segment' >&2
     exit 1

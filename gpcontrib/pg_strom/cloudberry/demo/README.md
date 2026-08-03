@@ -2,18 +2,196 @@
 
 Use one coordinator and at least two up preferred primary segments.  The
 initial technical demo may run every instance on one host and share one NVIDIA
-GPU, but it must run serially.  Copy the settings in `postgresql.conf.mvp` to
-the coordinator, every primary, and every mirror, install PG-Strom using the
-Cloudberry `pg_config`, and restart the cluster.  Do not use `LOAD 'pg_strom'`:
-the module requires `shared_preload_libraries`.
+GPU, but it must run serially.  Do not use `LOAD 'pg_strom'`: the module
+requires `shared_preload_libraries`.
 
-Confirm CUDA 12.2 update 1 or newer, compute capability 7.5 or newer, and a
-GPU Service startup message in both coordinator and segment logs.  Then run:
+## End-to-end build and validation
+
+The following procedure builds the current checkout, creates an isolated
+mirrorless cluster with one QD and two preferred primaries, and runs the GPU
+acceptance test.  Run it as a non-root Cloudberry development user.  The host
+must have the Cloudberry build dependencies, passwordless SSH to its own
+hostname, free demo ports, CUDA Toolkit 12.2 update 1 or newer, and a GPU with
+compute capability 7.5 or newer.
+
+Choose an installation directory and a new empty demo directory outside the
+source tree:
 
 ```sh
-source /path/to/cloudberry/greenplum_path.sh
+export CB_SRC=/path/to/cloudberry
+export CB_INSTALL=/path/to/cloudberry-install
+export CB_DEMO_ROOT=/path/to/cloudberry-pgstrom-demo
+export CB_BUILD_JOBS="$(nproc)"
+
+cd "$CB_SRC"
+git rev-parse HEAD
+git status --short
+nvidia-smi
+nvcc --version
+ssh "$(hostname)" true
+```
+
+Configure Cloudberry explicitly with its 32KB heap and WAL block sizes.  The
+remaining feature switches match the configuration used for this MVP; add
+site-specific include/library paths when dependencies are installed outside
+the system search path.
+
+```sh
+cd "$CB_SRC"
+
+./configure \
+  --prefix="$CB_INSTALL" \
+  --enable-orca \
+  --with-blocksize=32 \
+  --with-wal-blocksize=32 \
+  --with-ssl=openssl \
+  --with-libxml \
+  --with-lz4 \
+  --with-zstd \
+  --with-python \
+  --with-pythonsrc-ext \
+  --with-perl
+
+make -j"$CB_BUILD_JOBS"
+make -C contrib -j"$CB_BUILD_JOBS"
+make install
+make -C contrib install
+
+source "$CB_INSTALL/cloudberry-env.sh"
+postgres --version
+pg_config --configure
+```
+
+Build PG-Strom only after installing Cloudberry, and always select the new
+installation's `pg_config`.  Cleaning first prevents generated device headers
+from a different server build from being reused.
+
+```sh
+make -C "$CB_SRC/gpcontrib/pg_strom/src" \
+  PG_CONFIG="$CB_INSTALL/bin/pg_config" \
+  PGSTROM_WITH_ARROW=0 \
+  clean
+
+make -C "$CB_SRC/gpcontrib/pg_strom/src" \
+  PG_CONFIG="$CB_INSTALL/bin/pg_config" \
+  PGSTROM_WITH_ARROW=0 \
+  -j"$CB_BUILD_JOBS"
+
+make -C "$CB_SRC/gpcontrib/pg_strom/src" \
+  PG_CONFIG="$CB_INSTALL/bin/pg_config" \
+  PGSTROM_WITH_ARROW=0 \
+  install
+
+test -f "$(pg_config --pkglibdir)/pg_strom.so"
+test -f "$(pg_config --sharedir)/extension/pg_strom.control"
+grep PGSTROM_DEVICE_BLCKSZ \
+  "$CB_SRC/gpcontrib/pg_strom/src/pgstrom_device_config.h"
+```
+
+The generated header must report `PGSTROM_DEVICE_BLCKSZ 32768`.
+
+Create a fresh mirrorless demo cluster.  `gpdemo` initializes and starts one
+QD plus two primary segments.  Passing the PG-Strom settings during cluster
+initialization ensures that every instance starts with the same preload and
+memory-pool configuration.  The chosen demo directory must not contain an
+existing cluster because `gpdemo` owns and may replace its generated files.
+
+```sh
+mkdir -p "$CB_DEMO_ROOT"
+cd "$CB_DEMO_ROOT"
+
+export PORT_BASE=7000
+export NUM_PRIMARY_MIRROR_PAIRS=2
+export WITH_MIRRORS=false
+export WITH_STANDBY=false
+export DATADIRS="$CB_DEMO_ROOT/datadirs"
+export BLDWRAP_POSTGRES_CONF_ADDONS='fsync=on|shared_preload_libraries=pg_strom|max_worker_processes=16|pg_strom.gpu_mempool_segment_sz=256MB|pg_strom.gpu_mempool_max_ratio=0.20|pg_strom.cpu_fallback=off|pg_strom.enabled=on|pg_strom.enable_gpuscan=on'
+
+gpdemo -c
+gpdemo
+source "$CB_DEMO_ROOT/gpdemo-env.sh"
+gpstate -s
+```
+
+For a previously initialized cluster, source both environment files before
+starting it:
+
+```sh
+source "$CB_INSTALL/cloudberry-env.sh"
+source "$CB_DEMO_ROOT/gpdemo-env.sh"
+gpstart -a
+```
+
+Verify that both preferred primaries are up and no mirror is acting as a
+primary:
+
+```sh
+psql -X -d postgres -c "
+  SELECT content, hostname, port, role, preferred_role, status
+  FROM gp_segment_configuration
+  WHERE content >= 0
+  ORDER BY content, preferred_role;"
+
+psql -X -At -d postgres -c "
+  SELECT count(DISTINCT content) FILTER (
+           WHERE preferred_role='p' AND content >= 0) AS configured,
+         count(DISTINCT content) FILTER (
+           WHERE role='p' AND preferred_role='p'
+             AND status='u' AND content >= 0) AS up_preferred
+  FROM gp_segment_configuration;"
+```
+
+The second query must return `2|2`.  Confirm that PG-Strom is preloaded on the
+QD and both QEs:
+
+```sh
+psql -X -d postgres -c "
+  SHOW shared_preload_libraries;
+  SHOW pg_strom.gpu_mempool_segment_sz;
+  SHOW pg_strom.gpu_mempool_max_ratio;
+  SHOW pg_strom.cpu_fallback;"
+
+psql -X -d postgres -c "
+  SELECT gp_segment_id,
+         current_setting('shared_preload_libraries') AS preload,
+         current_setting('pg_strom.gpu_mempool_max_ratio') AS pool_ratio,
+         current_setting('pg_strom.cpu_fallback') AS cpu_fallback
+  FROM gp_dist_random('gp_id')
+  ORDER BY gp_segment_id;"
+```
+
+Run the source-only checks, create the acceptance database, and execute the
+multi-segment runner:
+
+```sh
+cd "$CB_SRC"
+bash -n gpcontrib/pg_strom/cloudberry/demo/run_demo.sh
+gpcontrib/pg_strom/cloudberry/test_static_mvp.sh
+make -C src/backend/cdb cdbplan.o
+
 createdb pgstrom_mvp
-PGDATABASE=pgstrom_mvp ./gpcontrib/pg_strom/cloudberry/demo/run_demo.sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_MVP_REPEAT=3 \
+./gpcontrib/pg_strom/cloudberry/demo/run_demo.sh
+```
+
+If `pgstrom_mvp` already exists, skip `createdb`.  A successful run exits with
+status zero and ends with `Multi-segment GpuScan plans and CPU/GPU signatures
+passed on 2 primaries.`  Check the QD and QE logs for the fatbin and worker
+startup messages:
+
+```sh
+grep -R -E 'PG-Strom fatbin image is ready|GPU[0-9]+ workers' \
+  "$CB_DEMO_ROOT/datadirs"/*/*/log \
+  "$CB_DEMO_ROOT/datadirs"/qddir/*/log
+```
+
+Stop the validation cluster without deleting its data using:
+
+```sh
+source "$CB_INSTALL/cloudberry-env.sh"
+source "$CB_DEMO_ROOT/gpdemo-env.sh"
+gpstop -a
 ```
 
 The runner discovers the number of up preferred primaries from
@@ -56,7 +234,8 @@ service PID and cluster manager are installation-specific:
 
 Do not run concurrent acceptance traffic while QD and QEs share one GPU.  The
 configured pool limit applies independently to each GPU Service; it is not
-resource isolation between processes.  A coordinator, three primaries, and
-three mirrors can start seven independent services even though mirrors do not
-normally execute the query.  The sample uses the minimum accepted 20% hard
-limit and a 256MB allocation segment; idle services do not reserve 20% eagerly.
+resource isolation between processes.  The mirrorless sample starts three
+independent services: one for the QD and one for each of its two primaries.
+Enabling mirrors starts additional services even though mirrors do not normally
+execute the query.  The sample uses the minimum accepted 20% hard limit and a
+256MB allocation segment; idle services do not reserve 20% eagerly.
