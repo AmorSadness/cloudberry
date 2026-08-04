@@ -47,24 +47,37 @@ gpu_settings="
     SET pg_strom.enabled=on;
     SET pg_strom.enable_gpuscan=on;
     SET pg_strom.cpu_fallback=off;
-    SET enable_material=off;
     SET enable_seqscan=off;"
 
-# Disabling materialization is essential here.  Otherwise PostgreSQL can run
-# GpuScan once, cache its output below the parameter-dependent Result node,
-# and spend the rest of the query in CPU filtering.  With materialization
-# disabled, rescans from the lateral aggregate reach GpuScan and keep
-# producing GPU submissions until the coordinator backend is cancelled.  The
-# comment is used only to identify that backend in pg_stat_activity.
+# Probe the statement executed by every loop iteration independently.  A
+# lateral SQL formulation is not suitable here because Cloudberry may insert
+# a required Materialize node below Motion even with enable_material=off.  It
+# would then run GpuScan only once and spend the remaining time filtering the
+# cached rows on the CPU.
+cancel_scan_query="
+    SELECT count(*)
+    FROM pgstrom_mvp_heap t
+    WHERE t.grp = 1
+      AND t.amount >= 250.00;"
+
+# A server-side loop keeps one identifiable coordinator backend alive while
+# executing a fresh distributed GpuScan statement on every iteration.  The
+# loop is intentionally much longer than the cancellation timeout.  The
+# comment is used only to identify this backend in pg_stat_activity.
 cancel_query="
     /* pgstrom_mvp_cancel_target */
-    SELECT sum(q.n)
-    FROM generate_series(1, 100000) AS p(grp)
-    CROSS JOIN LATERAL
-      (SELECT count(*) AS n
-       FROM pgstrom_mvp_heap t
-       WHERE t.grp = (p.grp % 900)
-         AND t.amount >= 250.00) AS q;"
+    DO \$pgstrom_cancel\$
+    DECLARE
+        target_grp integer;
+    BEGIN
+        FOR target_grp IN 1..100000 LOOP
+            PERFORM count(*)
+            FROM pgstrom_mvp_heap t
+            WHERE t.grp = (target_grp % 900)
+              AND t.amount >= 250.00;
+        END LOOP;
+    END
+    \$pgstrom_cancel\$;"
 
 signature_query="
     SELECT count(*) || '|' || coalesce(sum(id)::text,'') || '|' ||
@@ -72,12 +85,9 @@ signature_query="
     FROM pgstrom_mvp_heap
     WHERE grp BETWEEN 101 AND 207 AND amount >= 500.00;"
 
-plan=$("${psql_cmd[@]}" -Atqc "$gpu_settings EXPLAIN (VERBOSE, COSTS OFF) $cancel_query")
+plan=$("${psql_cmd[@]}" -Atqc "$gpu_settings EXPLAIN (VERBOSE, COSTS OFF) $cancel_scan_query")
 if ! grep -q 'Custom Scan (GpuScan)' <<<"$plan"; then
-    die "cancel target does not contain GpuScan"
-fi
-if grep -q 'Materialize' <<<"$plan"; then
-    die "cancel target still materializes GpuScan output; repeated GPU submissions are not guaranteed: $plan"
+    die "cancel loop statement does not contain GpuScan: $plan"
 fi
 
 cpu_signature=$("${psql_cmd[@]}" -Atqc "

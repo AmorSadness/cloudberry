@@ -81,9 +81,11 @@ ready 还会检查共享 PID 是否仍存活，以降低 SIGKILL 后旧 ready �
 
 `cloudberry/demo/run_query_cancel.sh`：
 
-1. 禁用 executor materialization，检查目标 SQL 的计划包含 GpuScan 且不含
-   `Materialize`，避免只执行一次 GPU scan 后长期在 CPU 上过滤缓存；
-2. 启动由 lateral aggregate 驱动的重复 GpuScan；
+1. 检查循环中单次 SQL 的计划包含 GpuScan；
+2. 在一个可识别的 coordinator backend 中启动 PL/pgSQL 服务端循环，每轮独立
+   执行上述 SQL。不能依赖 correlated lateral query 驱动 rescan，因为
+   Cloudberry 可能在 Motion 下插入必要的 `Materialize`，导致 GpuScan 只执行
+   一次，剩余时间都在 CPU 上过滤缓存；
 3. 从 SQL status 等待单调递增的 `submitted_commands` 增长。queued、active 和
    client 是瞬时 gauge，快速命令可能在两次分布式采样之间经过这些状态，
    因此只用于诊断，不作为发出 cancel 的前置条件；

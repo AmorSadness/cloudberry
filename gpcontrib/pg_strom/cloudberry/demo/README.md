@@ -305,12 +305,14 @@ signature is restored.  CUDA-fatal recovery is not claimed by this runner.
 
 ## Query cancellation
 
-The cancellation runner disables executor materialization and verifies that
-the target plan contains GpuScan without a `Materialize` node.  This makes the
-parameter-dependent lateral aggregate rescan GpuScan instead of scanning once
-and spending the remaining runtime filtering a cached result on the CPU.  The
-runner waits for the monotonic `submitted_commands` counter to increase, calls
-`pg_cancel_backend` on the still-active coordinator backend, then verifies that
+The cancellation runner first verifies that its per-iteration statement uses
+GpuScan.  It then executes that statement repeatedly from a server-side
+PL/pgSQL loop in one identifiable coordinator backend.  Separate statement
+executions are intentional: Cloudberry may place a required `Materialize`
+below Motion for a correlated lateral query, causing GpuScan to run only once
+while the remaining work filters cached rows on the CPU.  The runner waits for
+the monotonic `submitted_commands` counter to increase, calls
+`pg_cancel_backend` on the still-active loop backend, then verifies that
 commands drain and a fresh CPU/GPU signature still agrees:
 
 ```sh
