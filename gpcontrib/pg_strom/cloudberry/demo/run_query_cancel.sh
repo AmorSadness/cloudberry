@@ -80,6 +80,8 @@ cpu_signature=$("${psql_cmd[@]}" -Atqc "
 read_segment_counters() {
     "${psql_cmd[@]}" -AtF '|' -qc "
         SELECT coalesce(sum(submitted_commands),0),
+               coalesce(sum(completed_commands),0),
+               coalesce(sum(failed_commands),0),
                coalesce(sum(cancelled_commands),0),
                coalesce(sum(queued_commands),0),
                coalesce(sum(active_commands),0),
@@ -92,8 +94,10 @@ echo "Query-cancel baseline signature: $cpu_signature"
 
 for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
     counters=$(read_segment_counters)
-    IFS='|' read -r old_submitted old_cancelled _ _ _ old_ready <<<"$counters"
-    if [[ ! $old_submitted =~ ^[0-9]+$ || ! $old_cancelled =~ ^[0-9]+$ || $old_ready != t ]]; then
+    IFS='|' read -r old_submitted old_completed old_failed old_cancelled _ _ _ old_ready <<<"$counters"
+    if [[ ! $old_submitted =~ ^[0-9]+$ || ! $old_completed =~ ^[0-9]+$ ||
+          ! $old_failed =~ ^[0-9]+$ || ! $old_cancelled =~ ^[0-9]+$ ||
+          $old_ready != t ]]; then
         die "cycle $cycle: invalid or unready baseline service counters: $counters"
     fi
 
@@ -119,7 +123,7 @@ for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
             LIMIT 1;" || true)
         if [[ $backend_pid =~ ^[0-9]+$ ]]; then
             counters=$(read_segment_counters)
-            IFS='|' read -r submitted _ queued active clients ready <<<"$counters"
+            IFS='|' read -r submitted _ _ _ queued active clients ready <<<"$counters"
             if [[ $submitted =~ ^[0-9]+$ && $queued =~ ^[0-9]+$ &&
                   $active =~ ^[0-9]+$ && $clients =~ ^[0-9]+$ &&
                   $ready == t ]] &&
@@ -142,6 +146,9 @@ for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
     fi
 
     deadline=$((SECONDS + cancel_timeout))
+    new_submitted=$old_submitted
+    new_completed=$old_completed
+    new_failed=$old_failed
     new_cancelled=$old_cancelled
     queued=1
     active=1
@@ -168,16 +175,27 @@ for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
     deadline=$((SECONDS + cancel_timeout))
     while (( SECONDS < deadline )); do
         counters=$(read_segment_counters)
-        IFS='|' read -r _ new_cancelled queued active clients ready <<<"$counters"
-        if [[ $new_cancelled =~ ^[0-9]+$ && $queued =~ ^[0-9]+$ &&
-              $active =~ ^[0-9]+$ && $clients =~ ^[0-9]+$ &&
-              $ready == t ]] &&
-           (( new_cancelled > old_cancelled && queued == 0 && active == 0 && clients == 0 )); then
+        IFS='|' read -r new_submitted new_completed new_failed new_cancelled queued active clients ready <<<"$counters"
+        if [[ $new_submitted =~ ^[0-9]+$ && $new_completed =~ ^[0-9]+$ &&
+              $new_failed =~ ^[0-9]+$ && $new_cancelled =~ ^[0-9]+$ &&
+              $queued =~ ^[0-9]+$ && $active =~ ^[0-9]+$ &&
+              $clients =~ ^[0-9]+$ && $ready == t ]] &&
+           (( new_submitted > old_submitted &&
+              new_completed - old_completed +
+              new_failed - old_failed +
+              new_cancelled - old_cancelled >= new_submitted - old_submitted &&
+              queued == 0 && active == 0 && clients == 0 )); then
             break
         fi
         sleep 0.1
     done
-    if (( new_cancelled <= old_cancelled || queued != 0 || active != 0 || clients != 0 )); then
+    submitted_delta=$((new_submitted - old_submitted))
+    completed_delta=$((new_completed - old_completed))
+    failed_delta=$((new_failed - old_failed))
+    cancelled_delta=$((new_cancelled - old_cancelled))
+    terminal_delta=$((completed_delta + failed_delta + cancelled_delta))
+    if (( submitted_delta <= 0 || terminal_delta < submitted_delta ||
+          queued != 0 || active != 0 || clients != 0 )); then
         die "cycle $cycle: GPU commands did not drain after cancellation: $counters"
     fi
 
@@ -185,7 +203,7 @@ for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
     if [[ $gpu_signature != "$cpu_signature" ]]; then
         die "cycle $cycle: post-cancel signature mismatch: CPU=$cpu_signature GPU=$gpu_signature"
     fi
-    echo "cycle $cycle/$cancel_cycles: backend $backend_pid cancelled, cancelled commands $old_cancelled -> $new_cancelled, queues drained, signature recovered"
+    echo "cycle $cycle/$cancel_cycles: backend $backend_pid cancelled, submitted=$submitted_delta terminal=$terminal_delta (completed=$completed_delta failed=$failed_delta cancelled=$cancelled_delta), queues drained, signature recovered"
 done
 
 echo "GpuScan query cancellation passed for $cancel_cycles cycles."

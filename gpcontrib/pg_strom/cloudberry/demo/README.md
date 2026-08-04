@@ -63,22 +63,29 @@ pg_config --configure
 ```
 
 Build PG-Strom only after installing Cloudberry, and always select the new
-installation's `pg_config`.  Cleaning first prevents generated device headers
-from a different server build from being reused.
+installation's `pg_config`.  Do not assume that it is located at a particular
+`$CB_INSTALL/bin` path; resolve it from the environment installed by
+Cloudberry and verify its bindir first.  Cleaning prevents generated device
+headers from a different server build from being reused.
 
 ```sh
+source "$CB_INSTALL/cloudberry-env.sh"
+export PG_CONFIG="$(command -v pg_config)"
+test -x "$PG_CONFIG"
+"$PG_CONFIG" --bindir
+
 make -C "$CB_SRC/gpcontrib/pg_strom/src" \
-  PG_CONFIG="$CB_INSTALL/bin/pg_config" \
+  PG_CONFIG="$PG_CONFIG" \
   PGSTROM_WITH_ARROW=0 \
   clean
 
 make -C "$CB_SRC/gpcontrib/pg_strom/src" \
-  PG_CONFIG="$CB_INSTALL/bin/pg_config" \
+  PG_CONFIG="$PG_CONFIG" \
   PGSTROM_WITH_ARROW=0 \
   -j"$CB_BUILD_JOBS"
 
 make -C "$CB_SRC/gpcontrib/pg_strom/src" \
-  PG_CONFIG="$CB_INSTALL/bin/pg_config" \
+  PG_CONFIG="$PG_CONFIG" \
   PGSTROM_WITH_ARROW=0 \
   install
 
@@ -313,7 +320,12 @@ PGSTROM_MVP_CANCEL_TIMEOUT=30 \
 The acceptance cluster must otherwise be idle because the runner requires
 `active_clients`, `queued_commands`, and `active_commands` to return to zero.
 `cancelled_commands` counts commands skipped or unable to return a response
-after the backend closes its Service socket; it does not count SQL statements.
+after the backend closes its Service socket; it does not count SQL statements
+and need not increase for every `pg_cancel_backend()` call.  A cancellation can
+arrive just after the current GPU command has returned successfully.  The
+runner therefore requires every newly submitted command to reach one of the
+completed, failed, or cancelled terminal counters and requires all queues to
+drain.
 
 Do not run concurrent acceptance traffic while QD and QEs share one GPU.  The
 configured pool limit applies independently to each GPU Service; it is not

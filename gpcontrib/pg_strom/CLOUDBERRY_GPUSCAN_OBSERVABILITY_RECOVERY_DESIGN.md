@@ -87,7 +87,9 @@ ready 还会检查共享 PID 是否仍存活，以降低 SIGKILL 后旧 ready �
 4. 定位带唯一 `application_name` 的 QD backend 并调用
    `pg_cancel_backend()`；
 5. 要求客户端返回 cancellation 错误；
-6. 等待所有 QE client/queue/active 归零且 cancelled counter 增长；
+6. 等待所有 QE client/queue/active 归零，并确认本轮 submitted command 均已
+   归类为 completed、failed 或 cancelled；SQL cancel 若发生在 GPU command
+   已成功返回之后，cancelled counter 可以不增长；
 7. 再次比较 CPU/GPU 签名；
 8. 默认连续三轮。
 
