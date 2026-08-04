@@ -15,7 +15,9 @@ cancel、SIGHUP 和 SIGKILL 后的分布式失败传播与恢复。
 1. QD 和所有 Primary 都能报告 Service PID、generation、ready、worker、
    command counter、fatbin 和 device storage config；
 2. query cancel 后所有 QE 的客户端、排队和活动命令归零，后续签名恢复；
-3. SIGHUP 与 SIGKILL 均不返回部分结果，新 Service generation 增长；
+3. SIGHUP 与 SIGKILL 均不返回部分结果；SIGHUP 后新 Service generation
+   增长，SIGKILL 若触发 Segment crash recovery 则允许 shared-memory epoch
+   重建后 generation 重置；
 4. 新 Service 只有在实际 worker 数达到配置值后才报告 ready；
 5. 原多 Segment 正确性、负向边界和静态检查不退化。
 
@@ -33,8 +35,10 @@ cancel、SIGHUP 和 SIGKILL 后的分布式失败传播与恢复。
 
 ## 3. 共享状态设计
 
-`gpuServSharedState` 属于 postmaster shared memory，因此在 GPU Service
-background worker 重启后仍存在。全局状态包括：
+`gpuServSharedState` 属于 postmaster shared memory，因此在同一个
+shared-memory epoch 内的 GPU Service background worker 重启后仍存在。
+Segment crash recovery 会重建 shared memory，并开始新的 epoch。全局状态
+包括：
 
 - 当前/最近一次 `service_pid`；
 - 单调递增的 `service_generation`；
@@ -49,9 +53,10 @@ background worker 重启后仍存在。全局状态包括：
 - `submitted_commands`、`completed_commands`；
 - `failed_commands`、`cancelled_commands`。
 
-generation 和累计 command counter 在 Service 重启后保留。PID、ready、
-worker、queue、active 和 client 描述当前 generation；新 Service 启动时先
-清零这些瞬时值，重建 worker pool，最后才设置 ready。
+generation 和累计 command counter 在同一 epoch 的 Service 重启后保留，
+但在 Segment crash recovery 后重置。PID、ready、worker、queue、active 和
+client 描述当前 generation；新 Service 启动时先清零这些瞬时值，重建
+worker pool，最后才设置 ready。
 
 `cancelled_commands` 是 Service 命令计数，不是 SQL statement 计数。命令在
 执行前发现 backend socket 已关闭，或执行后无法向该 socket 返回响应时，
@@ -110,13 +115,15 @@ ready 还会检查共享 PID 是否仍存活，以降低 SIGKILL 后旧 ready �
 - 目标 PID 确实是指定 Segment postmaster 的唯一直属 GPU Service；
 - Service 不可用窗口内分布式查询失败且没有部分结果标记；
 - Segment postmaster 保持可用；
-- 新 PID 和 SQL generation 出现；
+- 新 PID 和 ready SQL generation 出现；SIGHUP 要求 generation 递增，
+  SIGKILL 触发 crash recovery 时允许新 epoch 的 generation 重置；
 - actual/configured worker 数一致并 ready；
 - worker startup 日志增加；
 - 恢复后的 GPU 签名等于 CPU 基线。
 
-SIGKILL 可能触发 Segment postmaster crash recovery；runner 记录实际行为，
-但不把该行为外推为 CUDA fatal 或 Mirror failover 语义。
+SIGKILL 可能触发 Segment postmaster crash recovery；此时 runner 依靠新 PID、
+ready/full worker、启动日志和恢复签名验收，并明确记录 shared-memory epoch
+重置，不把该行为外推为 CUDA fatal 或 Mirror failover 语义。
 
 ## 6. GPU 环境验收顺序
 

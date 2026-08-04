@@ -181,8 +181,10 @@ The combined view contains the coordinator (`content_id=-1`) and every
 Primary.  `gpu_service_status_local()` and `gpu_service_status_segments()`
 are also available when a caller needs only one placement.  Every ready row
 must show `actual_workers=configured_workers`.  Counters and generation are
-postmaster-shared and survive a GPU Service background-worker restart; queued,
-active, client, PID and readiness fields describe the current generation.
+postmaster-shared and survive a controlled GPU Service background-worker
+restart within one shared-memory epoch.  Segment crash recovery recreates
+shared memory, so these cumulative fields can reset.  Queued, active, client,
+PID and readiness fields describe the current generation.
 
 Run the source-only checks, create the acceptance database, and execute the
 multi-segment runner:
@@ -300,8 +302,12 @@ PGSTROM_MVP_RECOVERY_CYCLES=3 \
 Run this only on a disposable acceptance cluster.  The runner still signals
 only the uniquely identified GPU Service child; it checks that the Segment
 postmaster remains available, the distributed query does not emit a partial
-row, the generation increases, queues/workers recover, and the result
-signature is restored.  CUDA-fatal recovery is not claimed by this runner.
+row, a ready replacement PID and worker pool appear, queues recover, and the
+result signature is restored.  If SIGKILL triggers Segment crash recovery,
+the postmaster recreates shared memory and the generation can restart from a
+lower value; the runner reports this epoch reset instead of requiring an
+increase across incomparable shared-memory lifetimes.  CUDA-fatal recovery is
+not claimed by this runner.
 
 ## Query cancellation
 

@@ -264,8 +264,21 @@ for ((cycle = 1; cycle <= recovery_cycles; cycle++)); do
         HAVING count(*) > 0
            AND bool_and(ready AND actual_workers = configured_workers)
            AND min(service_generation) = max(service_generation);")
-    if [[ ! $new_generation =~ ^[0-9]+$ ]] || (( new_generation <= old_generation )); then
+    if [[ ! $new_generation =~ ^[1-9][0-9]*$ ]]; then
         die "cycle $cycle: SQL status did not show a ready replacement generation: old=$old_generation new=$new_generation"
+    fi
+    generation_note=
+    if [[ $service_signal == HUP ]]; then
+        if (( new_generation <= old_generation )); then
+            die "cycle $cycle: controlled restart did not advance service generation: old=$old_generation new=$new_generation"
+        fi
+    elif (( new_generation <= old_generation )); then
+        # A SIGKILL of a BGWORKER_SHMEM_ACCESS process may make the Segment
+        # postmaster run crash recovery and recreate shared memory.  Service
+        # generation is monotonic only within one shared-memory epoch, so a
+        # ready replacement PID, worker startup, and recovered signature are
+        # the durable hard-failure checks when the counter resets.
+        generation_note=" (shared-memory epoch reset after SIGKILL)"
     fi
 
     worker_deadline=$((SECONDS + recovery_timeout))
@@ -281,7 +294,7 @@ for ((cycle = 1; cycle <= recovery_cycles; cycle++)); do
     if ! kill -0 "$postmaster_pid" 2>/dev/null; then
         die "cycle $cycle: target segment postmaster unexpectedly stopped"
     fi
-    echo "cycle $cycle/$recovery_cycles: pid $old_service_pid -> $new_service_pid, status generation $old_generation -> $new_generation, worker logs $old_worker_logs -> $new_worker_logs, signature recovered"
+    echo "cycle $cycle/$recovery_cycles: pid $old_service_pid -> $new_service_pid, status generation $old_generation -> $new_generation$generation_note, worker logs $old_worker_logs -> $new_worker_logs, signature recovered"
 done
 
 echo "GPU Service SIG$service_signal failure propagation and recovery passed for $recovery_cycles cycles on content $target_content."
