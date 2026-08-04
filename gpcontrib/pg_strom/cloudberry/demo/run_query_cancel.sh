@@ -47,10 +47,15 @@ gpu_settings="
     SET pg_strom.enabled=on;
     SET pg_strom.enable_gpuscan=on;
     SET pg_strom.cpu_fallback=off;
+    SET enable_material=off;
     SET enable_seqscan=off;"
 
-# The outer values force repeated parameterized scans.  The comment is used
-# only to identify the coordinator backend in pg_stat_activity.
+# Disabling materialization is essential here.  Otherwise PostgreSQL can run
+# GpuScan once, cache its output below the parameter-dependent Result node,
+# and spend the rest of the query in CPU filtering.  With materialization
+# disabled, rescans from the lateral aggregate reach GpuScan and keep
+# producing GPU submissions until the coordinator backend is cancelled.  The
+# comment is used only to identify that backend in pg_stat_activity.
 cancel_query="
     /* pgstrom_mvp_cancel_target */
     SELECT sum(q.n)
@@ -70,6 +75,9 @@ signature_query="
 plan=$("${psql_cmd[@]}" -Atqc "$gpu_settings EXPLAIN (VERBOSE, COSTS OFF) $cancel_query")
 if ! grep -q 'Custom Scan (GpuScan)' <<<"$plan"; then
     die "cancel target does not contain GpuScan"
+fi
+if grep -q 'Materialize' <<<"$plan"; then
+    die "cancel target still materializes GpuScan output; repeated GPU submissions are not guaranteed: $plan"
 fi
 
 cpu_signature=$("${psql_cmd[@]}" -Atqc "
@@ -94,11 +102,15 @@ echo "Query-cancel baseline signature: $cpu_signature"
 
 for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
     counters=$(read_segment_counters)
-    IFS='|' read -r old_submitted old_completed old_failed old_cancelled _ _ _ old_ready <<<"$counters"
+    IFS='|' read -r old_submitted old_completed old_failed old_cancelled old_queued old_active old_clients old_ready <<<"$counters"
     if [[ ! $old_submitted =~ ^[0-9]+$ || ! $old_completed =~ ^[0-9]+$ ||
           ! $old_failed =~ ^[0-9]+$ || ! $old_cancelled =~ ^[0-9]+$ ||
-          $old_ready != t ]]; then
+          ! $old_queued =~ ^[0-9]+$ || ! $old_active =~ ^[0-9]+$ ||
+          ! $old_clients =~ ^[0-9]+$ || $old_ready != t ]]; then
         die "cycle $cycle: invalid or unready baseline service counters: $counters"
+    fi
+    if (( old_queued != 0 || old_active != 0 || old_clients != 0 )); then
+        die "cycle $cycle: acceptance cluster is not idle at baseline: $counters"
     fi
 
     : >"$output_file"
@@ -112,6 +124,8 @@ for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
     active=0
     clients=0
     ready=f
+    observed_busy=0
+    observed_client=0
     while (( SECONDS < deadline )); do
         backend_pid=$("${psql_cmd[@]}" -Atqc "
             SELECT pid
@@ -126,9 +140,24 @@ for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
             IFS='|' read -r submitted _ _ _ queued active clients ready <<<"$counters"
             if [[ $submitted =~ ^[0-9]+$ && $queued =~ ^[0-9]+$ &&
                   $active =~ ^[0-9]+$ && $clients =~ ^[0-9]+$ &&
-                  $ready == t ]] &&
-               (( submitted > old_submitted && queued + active > 0 && clients > 0 )); then
-                break
+                  $ready == t ]]; then
+                if (( queued + active > 0 )); then
+                    observed_busy=1
+                fi
+                if (( clients > 0 )); then
+                    observed_client=1
+                fi
+                # queued/active/client are instantaneous gauges sampled via
+                # a distributed SQL query.  A fast GPU command can move
+                # through all three states between samples.  submitted is a
+                # monotonic counter, so its increase is the reliable signal
+                # that this backend has reached GPU Service.  The target plan
+                # is deliberately rescannable and the backend is still active
+                # here; cancel it immediately instead of waiting for a gauge
+                # value that may never be observed.
+                if (( submitted > old_submitted )); then
+                    break
+                fi
             fi
         fi
         sleep 0.05
@@ -136,8 +165,8 @@ for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
     if [[ ! $backend_pid =~ ^[0-9]+$ ]]; then
         die "cycle $cycle: cancel target backend did not become active"
     fi
-    if (( submitted <= old_submitted || queued + active == 0 || clients == 0 )); then
-        die "cycle $cycle: no in-flight GPU command was observed before timeout: $counters"
+    if (( submitted <= old_submitted )); then
+        die "cycle $cycle: no GPU command submission was observed before timeout: $counters"
     fi
 
     cancel_result=$("${psql_cmd[@]}" -Atqc "SELECT pg_cancel_backend($backend_pid);")
@@ -203,7 +232,7 @@ for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
     if [[ $gpu_signature != "$cpu_signature" ]]; then
         die "cycle $cycle: post-cancel signature mismatch: CPU=$cpu_signature GPU=$gpu_signature"
     fi
-    echo "cycle $cycle/$cancel_cycles: backend $backend_pid cancelled, submitted=$submitted_delta terminal=$terminal_delta (completed=$completed_delta failed=$failed_delta cancelled=$cancelled_delta), queues drained, signature recovered"
+    echo "cycle $cycle/$cancel_cycles: backend $backend_pid cancelled, submitted=$submitted_delta terminal=$terminal_delta (completed=$completed_delta failed=$failed_delta cancelled=$cancelled_delta), sampled_busy=$observed_busy sampled_client=$observed_client, queues drained, signature recovered"
 done
 
 echo "GpuScan query cancellation passed for $cancel_cycles cycles."

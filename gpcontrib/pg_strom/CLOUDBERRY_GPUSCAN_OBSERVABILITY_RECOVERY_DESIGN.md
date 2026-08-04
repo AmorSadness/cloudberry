@@ -81,9 +81,12 @@ ready 还会检查共享 PID 是否仍存活，以降低 SIGKILL 后旧 ready �
 
 `cloudberry/demo/run_query_cancel.sh`：
 
-1. 检查目标 SQL 的计划包含 GpuScan；
-2. 启动重复参数化 GpuScan；
-3. 同时从 SQL status 等待 QE 出现 queued/active command；
+1. 禁用 executor materialization，检查目标 SQL 的计划包含 GpuScan 且不含
+   `Materialize`，避免只执行一次 GPU scan 后长期在 CPU 上过滤缓存；
+2. 启动由 lateral aggregate 驱动的重复 GpuScan；
+3. 从 SQL status 等待单调递增的 `submitted_commands` 增长。queued、active 和
+   client 是瞬时 gauge，快速命令可能在两次分布式采样之间经过这些状态，
+   因此只用于诊断，不作为发出 cancel 的前置条件；
 4. 定位带唯一 `application_name` 的 QD backend 并调用
    `pg_cancel_backend()`；
 5. 要求客户端返回 cancellation 错误；
@@ -93,8 +96,8 @@ ready 还会检查共享 PID 是否仍存活，以降低 SIGKILL 后旧 ready �
 7. 再次比较 CPU/GPU 签名；
 8. 默认连续三轮。
 
-该 runner 要求验收集群没有其他并发 PG-Strom 查询，否则全局 client/queue
-归零条件没有确定含义。
+该 runner 在每轮开始前检查验收集群处于 idle，并要求没有其他并发 PG-Strom
+查询，否则全局 counter 增量和 client/queue 归零条件没有确定含义。
 
 ### 5.2 SIGHUP 与 SIGKILL
 

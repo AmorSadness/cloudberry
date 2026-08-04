@@ -305,10 +305,13 @@ signature is restored.  CUDA-fatal recovery is not claimed by this runner.
 
 ## Query cancellation
 
-The cancellation runner starts a repeated parameterized GpuScan, waits until
-the SQL status interface observes an in-flight GPU command, calls
-`pg_cancel_backend` on its coordinator backend, then verifies that commands
-drain and a fresh CPU/GPU signature still agrees:
+The cancellation runner disables executor materialization and verifies that
+the target plan contains GpuScan without a `Materialize` node.  This makes the
+parameter-dependent lateral aggregate rescan GpuScan instead of scanning once
+and spending the remaining runtime filtering a cached result on the CPU.  The
+runner waits for the monotonic `submitted_commands` counter to increase, calls
+`pg_cancel_backend` on the still-active coordinator backend, then verifies that
+commands drain and a fresh CPU/GPU signature still agrees:
 
 ```sh
 PGDATABASE=pgstrom_mvp \
@@ -317,8 +320,13 @@ PGSTROM_MVP_CANCEL_TIMEOUT=30 \
 ./gpcontrib/pg_strom/cloudberry/demo/run_query_cancel.sh
 ```
 
-The acceptance cluster must otherwise be idle because the runner requires
-`active_clients`, `queued_commands`, and `active_commands` to return to zero.
+The acceptance cluster must otherwise be idle; the runner checks this before
+each cycle and requires `active_clients`, `queued_commands`, and
+`active_commands` to return to zero afterwards.  These three fields are
+instantaneous gauges, so a fast GPU command may pass through them between two
+distributed status samples.  They are recorded for diagnostics but are not a
+precondition for issuing cancel; an increase of the cumulative
+`submitted_commands` counter is the stable synchronization point.
 `cancelled_commands` counts commands skipped or unable to return a response
 after the backend closes its Service socket; it does not count SQL statements
 and need not increase for every `pg_cancel_backend()` call.  A cancellation can
