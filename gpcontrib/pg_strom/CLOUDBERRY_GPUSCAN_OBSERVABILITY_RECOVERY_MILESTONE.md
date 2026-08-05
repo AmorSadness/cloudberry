@@ -14,10 +14,10 @@
 > 通过；这两条 runner 变更仍需在真实 GPU 环境复验，不改变本文 2026-08-04
 > 里程碑的既有验收结论。
 
-> **P1 后续开发（2026-08-05）**：默认关闭的混合 host/device quals 实验路径
-> 已进入源码与静态检查阶段，设计和待验收出口见
-> `CLOUDBERRY_GPUSCAN_HOST_QUALS_DESIGN.md`。在真实 GPU 出口完成前，本文表格中
-> “完整 device qual”仍是已验收能力边界。
+> **P1 后续里程碑（2026-08-05）**：默认关闭的混合 host/device quals 实验路径
+> 已完成真实双 Primary GPU 验收，详细计划、签名、query cancel、SIGHUP 和
+> SIGKILL 证据见 `CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md`。本文表格继续
+> 保留 2026-08-04 前置里程碑当时的能力边界。
 
 ## 1. 结论
 
@@ -709,7 +709,7 @@ git diff --check
 7. 单独设计 Mirror/FTS 和 Segment postmaster 故障矩阵；
 8. 单独注入 CUDA API/device fatal，不能以 Service SIGKILL 代替；
 9. 在正确性与恢复边界稳定后，再分别评估 AO/AOCO、分区、host quals 和其他
-   GPU 算子（混合 host/device quals 已进入默认关闭的源码阶段，待 GPU 复验）。
+   GPU 算子（混合 host/device quals 的默认关闭实验路径已完成 GPU 验收）。
 
 ## 17. 推荐版本定位
 

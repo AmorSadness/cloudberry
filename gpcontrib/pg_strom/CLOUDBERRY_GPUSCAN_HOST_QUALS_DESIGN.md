@@ -2,7 +2,8 @@
 
 > 前置基线：`CLOUDBERRY_GPUSCAN_OBSERVABILITY_RECOVERY_MILESTONE.md`  
 > 开发日期：2026-08-05  
-> 当前状态：代码与无 GPU 静态检查阶段；真实双 Primary GPU 验收待完成
+> 当前状态：真实双 Primary GPU 验收已于 2026-08-05 完成；详细证据见
+> `CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md`
 
 ## 1. 目标
 
@@ -100,9 +101,9 @@ parallel worker 或 QD/QE Service 生命周期。
 
 静态测试保护 GUC、默认关闭、至少一个 device qual 约束及上述 runner 入口。
 
-## 6. GPU 验收出口
+## 6. GPU 验收结果
 
-在真实 GPU 环境中至少使用 1 QD + 2 Primary，依次执行：
+在真实 GPU、1 QD + 2 Primary 环境中依次执行：
 
 ```sh
 gpcontrib/pg_strom/cloudberry/test_static_mvp.sh
@@ -116,6 +117,8 @@ PGSTROM_MVP_CANCEL_CYCLES=3 \
 ./gpcontrib/pg_strom/cloudberry/demo/run_query_cancel.sh
 ```
 
-还应重新运行 SIGHUP 与 SIGKILL recovery runner，证明新增 planner 路径没有改变
-Service 失败传播。全部通过后才能把本设计状态更新为真实 GPU 已验收；在此之前
-该能力应描述为“默认关闭、源码完成、待 GPU 验收的实验特性”。
+随后重新运行三轮 SIGHUP 与仅限可丢弃集群的三轮 SIGKILL recovery runner。
+上述静态检查、mixed CPU/GPU 三轮签名、query cancel、SIGHUP 和
+SIGKILL/crash recovery 均已通过。该能力现在可描述为“默认关闭、已完成真实
+双 Primary GPU 验收的实验特性”；详细计划、签名、PID/generation 和 worker
+日志证据见 `CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md`。

@@ -277,9 +277,10 @@ The plan must show both `GPU Scan Quals` and a standard `Filter`.  A query with
 only the regular expression still uses a native scan even when the GUC is on.
 `run_demo.sh` compares CPU/GPU signatures for mixed qualifiers on the uniform,
 skewed, and tiny tables, including NULL, prepared parameters, LIMIT, and a
-lateral/rescan shape.  This capability remains default-off and experimental
-until the exit matrix in `CLOUDBERRY_GPUSCAN_HOST_QUALS_DESIGN.md` passes on a
-real multi-Segment GPU host.
+lateral/rescan shape.  This capability remains default-off and experimental,
+but its design exit matrix has passed on a real 1 QD + 2 Primary GPU host,
+including query cancel, SIGHUP, and SIGKILL/crash recovery.  See
+`CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md` for the recorded evidence.
 
 ## GPU Service failure and recovery
 

@@ -47,8 +47,9 @@ path.  `pg_strom.cloudberry_enable_host_quals` is off by default.  When enabled,
 a scan with at least one GPU-executable qualifier may evaluate remaining
 host-only qualifiers in each QE using `ExecQual()` after GPU filtering.  A
 pure host-only query still retains the native scan path.  This source change
-requires real multi-Segment GPU acceptance before it is treated as validated;
-see `CLOUDBERRY_GPUSCAN_HOST_QUALS_DESIGN.md`.
+has completed real multi-Segment GPU acceptance for plans, CPU/GPU signatures,
+query cancellation, SIGHUP, and SIGKILL/crash recovery; see
+`CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md`.
 
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.
@@ -71,12 +72,11 @@ gpcontrib/pg_strom/cloudberry/test_static_mvp.sh
 make -C src/backend/cdb cdbplan.o
 ```
 
-The pre-observability PG-Strom host baseline was compile-checked against
-Cloudberry 16.9 server headers with temporary CUDA API declarations.  The 6.1
-service-status changes in the current tree still require a fresh build on the
-GPU host.  A real build requires CUDA headers, `nvcc`, and the CUDA driver
-library; declarations alone are not a substitute for the GPU-host acceptance
-run.
+The host sources are compile-checked against Cloudberry 16.9 server headers.
+The service-observability and mixed-qualifier changes have also completed a
+fresh build and acceptance run on the GPU host.  A real build still requires
+CUDA headers, `nvcc`, and the CUDA driver library; temporary declarations are
+only suitable for source-level host compilation.
 
 ## Service observability and recovery development
 
@@ -89,6 +89,7 @@ name, and the host/device storage configuration signature.
 
 `cloudberry/demo/run_query_cancel.sh` automates cancellation and command-drain
 checks.  `run_failure_recovery.sh` supports the established SIGHUP model and an
-explicitly double-opted-in SIGKILL model.  These new paths require validation
-on a real multi-Segment GPU host before they are treated as accepted; see
-`CLOUDBERRY_GPUSCAN_OBSERVABILITY_RECOVERY_DESIGN.md`.
+explicitly double-opted-in SIGKILL model.  Query cancel, SIGHUP, and
+SIGKILL/crash recovery have completed real multi-Segment GPU acceptance; see
+`CLOUDBERRY_GPUSCAN_OBSERVABILITY_RECOVERY_MILESTONE.md` and
+`CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md`.

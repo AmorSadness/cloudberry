@@ -17,6 +17,7 @@ demo_setup="$repo_root/gpcontrib/pg_strom/cloudberry/demo/setup.sql"
 demo_verify="$repo_root/gpcontrib/pg_strom/cloudberry/demo/verify.sql"
 demo_readme="$repo_root/gpcontrib/pg_strom/cloudberry/demo/README.md"
 host_quals_design="$repo_root/gpcontrib/pg_strom/CLOUDBERRY_GPUSCAN_HOST_QUALS_DESIGN.md"
+host_quals_milestone="$repo_root/gpcontrib/pg_strom/CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md"
 
 require_text() {
     local pattern=$1
@@ -158,7 +159,12 @@ require_text 'run_failure_recovery\.sh' "$demo_readme"
 require_text 'run_query_cancel\.sh' "$demo_readme"
 require_text 'pg_strom\.cloudberry_enable_host_quals' "$host_quals_design"
 require_text '没有 device qual 都不生成 GpuScan' "$host_quals_design"
-require_text '真实双 Primary GPU 验收待完成' "$host_quals_design"
+require_text '真实双 Primary GPU 验收已于 2026-08-05 完成' "$host_quals_design"
+require_text '76f99fafc06c1efcddb4c0b7b1f3aa870176ab54' "$host_quals_milestone"
+require_text 'mixed host/device quals' "$host_quals_milestone"
+require_text 'Query cancel 三轮.*通过' "$host_quals_milestone"
+require_text 'SIGHUP 三轮.*通过' "$host_quals_milestone"
+require_text 'SIGKILL/crash recovery 三轮.*通过' "$host_quals_milestone"
 if grep -Eq 'segments: 1([^0-9]|$)' "$demo_runner"; then
     echo 'multi-segment demo must not hard-code a single QE segment' >&2
     exit 1
