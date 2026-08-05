@@ -252,6 +252,35 @@ The tiny-table GpuScan is forced with `enable_seqscan=off` to test distributed
 execution, not to make a performance claim.  Inspect the verbose plans and the
 reported per-segment row distribution when diagnosing a failure.
 
+## Experimental mixed host/device qualifiers
+
+Cloudberry builds expose `pg_strom.cloudberry_enable_host_quals`, a USERSET
+experimental GUC that is off by default.  Enabling it allows GpuScan only when
+the query has at least one GPU-executable condition; remaining host-only
+conditions are evaluated by `ExecQual` in each QE after GPU filtering:
+
+```sql
+SET optimizer=off;
+SET pg_strom.enabled=on;
+SET pg_strom.enable_gpuscan=on;
+SET pg_strom.cloudberry_enable_host_quals=on;
+
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF)
+SELECT id, amount, payload
+FROM pgstrom_mvp_heap
+WHERE grp BETWEEN 101 AND 207
+  AND amount >= 500.00
+  AND payload ~ '^[0-7]';
+```
+
+The plan must show both `GPU Scan Quals` and a standard `Filter`.  A query with
+only the regular expression still uses a native scan even when the GUC is on.
+`run_demo.sh` compares CPU/GPU signatures for mixed qualifiers on the uniform,
+skewed, and tiny tables, including NULL, prepared parameters, LIMIT, and a
+lateral/rescan shape.  This capability remains default-off and experimental
+until the exit matrix in `CLOUDBERRY_GPUSCAN_HOST_QUALS_DESIGN.md` passes on a
+real multi-Segment GPU host.
+
 ## GPU Service failure and recovery
 
 After `run_demo.sh` succeeds, the single-host failure runner can exercise one

@@ -42,6 +42,14 @@ work by `planner_segment_count(baserel->cdbpolicy)`, while leaving startup cost
 per QE.  It also initializes locus, memory/hazard/rescan/same-slice fields and
 synchronizes the effective parallel worker count with the locus.
 
+The current source also has an experimental, Cloudberry-only mixed qualifier
+path.  `pg_strom.cloudberry_enable_host_quals` is off by default.  When enabled,
+a scan with at least one GPU-executable qualifier may evaluate remaining
+host-only qualifiers in each QE using `ExecQual()` after GPU filtering.  A
+pure host-only query still retains the native scan path.  This source change
+requires real multi-Segment GPU acceptance before it is treated as validated;
+see `CLOUDBERRY_GPUSCAN_HOST_QUALS_DESIGN.md`.
+
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.
 `custom_private` remains opaque extension data.

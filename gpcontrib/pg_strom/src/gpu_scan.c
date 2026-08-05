@@ -17,6 +17,9 @@ static CustomPathMethods	gpuscan_path_methods;
 static CustomScanMethods	gpuscan_plan_methods;
 static CustomExecMethods	gpuscan_exec_methods;
 static bool					enable_gpuscan = false;		/* GUC */
+#ifdef GP_VERSION_NUM
+static bool					cloudberry_enable_host_quals = false;	/* GUC */
+#endif
 static CustomPathMethods	dpuscan_path_methods;
 static CustomScanMethods	dpuscan_plan_methods;
 static CustomExecMethods	dpuscan_exec_methods;
@@ -652,7 +655,8 @@ __xpuScanAddScanPathCommon(PlannerInfo *root,
 									 xpu_task_flags,
 									 (try_parallel > 0),
 #ifdef GP_VERSION_NUM
-									 false,	/* MVP: reject host-only quals */
+									 /* opt-in mixed device/host quals */
+									 cloudberry_enable_host_quals,
 #else
 									 true,	/* allow host quals */
 #endif
@@ -1103,6 +1107,17 @@ pgstrom_init_gpu_scan(void)
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
+#ifdef GP_VERSION_NUM
+	/* pg_strom.cloudberry_enable_host_quals */
+	DefineCustomBoolVariable("pg_strom.cloudberry_enable_host_quals",
+							 "Enables experimental mixed GPU and host qualifiers on Cloudberry",
+							 "At least one GPU executable qualifier is still required",
+							 &cloudberry_enable_host_quals,
+							 false,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
+#endif
 	/* setup path methods */
 	memset(&gpuscan_path_methods, 0, sizeof(gpuscan_path_methods));
 	gpuscan_path_methods.CustomName			= "GpuScan";

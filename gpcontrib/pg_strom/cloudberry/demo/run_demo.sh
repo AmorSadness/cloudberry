@@ -135,6 +135,9 @@ gpu_settings="
     SET pg_strom.enable_gpuscan=on;
     SET pg_strom.cpu_fallback=off;
     SET enable_seqscan=off;"
+mixed_gpu_settings="
+    $gpu_settings
+    SET pg_strom.cloudberry_enable_host_quals=on;"
 
 require_distribution_shape() {
     local label=$1
@@ -165,10 +168,11 @@ require_distribution_shape() {
 require_gpuscan_plan() {
     local label=$1
     local query=$2
+    local plan_settings=${3:-$gpu_settings}
     local plan
 
     plan=$("${psql_cmd[@]}" -Atqc "
-        $gpu_settings
+        $plan_settings
         EXPLAIN (ANALYZE, VERBOSE, COSTS OFF) $query")
     printf '\n[%s plan]\n%s\n' "$label" "$plan"
     if ! grep -q 'Custom Scan (GpuScan)' <<<"$plan"; then
@@ -181,9 +185,35 @@ require_gpuscan_plan() {
     fi
 }
 
+require_mixed_quals_plan() {
+    local label=$1
+    local query=$2
+    local plan
+
+    plan=$("${psql_cmd[@]}" -Atqc "
+        $mixed_gpu_settings
+        EXPLAIN (ANALYZE, VERBOSE, COSTS OFF) $query")
+    printf '\n[%s mixed-quals plan]\n%s\n' "$label" "$plan"
+    if ! grep -q 'Custom Scan (GpuScan)' <<<"$plan"; then
+        echo "$label did not produce a mixed-quals GpuScan" >&2
+        exit 1
+    fi
+    if ! grep -q 'GPU Scan Quals:' <<<"$plan" ||
+       ! grep -q 'Filter:' <<<"$plan" ||
+       ! grep -q 'payload.*~' <<<"$plan"; then
+        echo "$label did not expose both GPU Scan Quals and a host Filter" >&2
+        exit 1
+    fi
+    if ! grep -Eq "Motion .*\\(slice[1-9][0-9]*; segments: ${primary_segment_count}\\)" <<<"$plan"; then
+        echo "$label does not show mixed-quals GpuScan below a $primary_segment_count-primary QE Motion" >&2
+        exit 1
+    fi
+}
+
 compare_signature() {
     local label=$1
     local query=$2
+    local plan_settings=${3:-$gpu_settings}
     local cpu
     local gpu
     local iteration
@@ -200,7 +230,7 @@ compare_signature() {
     for ((iteration = 1; iteration <= repeat_count; iteration++)); do
         started_ns=$(date +%s%N)
         gpu=$("${psql_cmd[@]}" -Atqc "
-            $gpu_settings
+            $plan_settings
             $query")
         finished_ns=$(date +%s%N)
         elapsed_ms=$(((finished_ns - started_ns) / 1000000))
@@ -244,6 +274,32 @@ small_signature="
                           coalesce(payload, '<NULL>'), ',' ORDER BY id))
     FROM pgstrom_mvp_small
     WHERE id BETWEEN 1 AND 16;"
+mixed_uniform_signature="
+    SELECT count(*) || '|' || coalesce(sum(id)::text,'') || '|' ||
+           coalesce(sum(amount)::text,'') || '|' ||
+           md5(string_agg(id::text || ':' || payload, ',' ORDER BY id))
+    FROM pgstrom_mvp_heap
+    WHERE grp BETWEEN 101 AND 207
+      AND amount >= 500.00
+      AND payload ~ '^[0-7]';"
+mixed_skew_signature="
+    SELECT count(*) || '|' || coalesce(sum(id)::text,'') || '|' ||
+           coalesce(sum(metric)::text,'') || '|' ||
+           count(*) FILTER (WHERE payload IS NULL) || '|' ||
+           md5(string_agg(id::text || ':' || coalesce(payload, '<NULL>'),
+                          ',' ORDER BY id))
+    FROM pgstrom_mvp_skew
+    WHERE metric BETWEEN -500 AND 750
+      AND amount >= -250.00
+      AND (payload IS NULL OR payload ~ '^[0-7]');"
+mixed_small_signature="
+    SELECT count(*) || '|' || coalesce(sum(id)::text,'') || '|' ||
+           count(*) FILTER (WHERE payload IS NULL) || '|' ||
+           md5(string_agg(id::text || ':' || coalesce(payload, '<NULL>'),
+                          ',' ORDER BY id))
+    FROM pgstrom_mvp_small
+    WHERE id BETWEEN 1 AND 16
+      AND (payload IS NULL OR payload ~ '^[0-7]');"
 
 require_gpuscan_plan "uniform heap signature" "$uniform_signature"
 require_gpuscan_plan "skew heap signature" "$skew_signature"
@@ -252,6 +308,14 @@ require_gpuscan_plan "small heap signature" "$small_signature"
 compare_signature "uniform heap" "$uniform_signature"
 compare_signature "skew heap" "$skew_signature"
 compare_signature "small heap" "$small_signature"
+
+require_mixed_quals_plan "uniform heap" "$mixed_uniform_signature"
+require_mixed_quals_plan "skew heap" "$mixed_skew_signature"
+require_mixed_quals_plan "small heap" "$mixed_small_signature"
+
+compare_signature "mixed-quals uniform heap" "$mixed_uniform_signature" "$mixed_gpu_settings"
+compare_signature "mixed-quals skew heap" "$mixed_skew_signature" "$mixed_gpu_settings"
+compare_signature "mixed-quals small heap" "$mixed_small_signature" "$mixed_gpu_settings"
 
 "${psql_cmd[@]}" -f "$demo_dir/verify.sql"
 
@@ -267,11 +331,14 @@ for fallback_case in \
     "SELECT * FROM pgstrom_mvp_ao WHERE grp=42" \
     "SELECT * FROM pgstrom_mvp_aoco WHERE grp=42" \
     "SELECT * FROM pgstrom_mvp_partitioned WHERE grp=42" \
-    "SELECT * FROM pgstrom_mvp_heap WHERE payload ~ '^[0-9a-f]{8}'"
+    "SELECT * FROM pgstrom_mvp_heap WHERE payload ~ '^[0-9a-f]{8}'" \
+    "SELECT * FROM pgstrom_mvp_heap WHERE grp=42 AND payload ~ '^[0-9a-f]{8}'"
 do
     fallback_plan=$("${psql_cmd[@]}" -Atqc "
         SET optimizer=off;
         SET pg_strom.enabled=on;
+        SET pg_strom.enable_gpuscan=on;
+        SET pg_strom.cloudberry_enable_host_quals=off;
         SET enable_seqscan=off;
         EXPLAIN $fallback_case;")
     if grep -q 'GpuScan' <<<"$fallback_plan"; then
@@ -280,5 +347,14 @@ do
     fi
 done
 
+host_only_plan=$("${psql_cmd[@]}" -Atqc "
+    $mixed_gpu_settings
+    EXPLAIN SELECT * FROM pgstrom_mvp_heap
+    WHERE payload ~ '^[0-9a-f]{8}';")
+if grep -q 'GpuScan' <<<"$host_only_plan"; then
+    echo 'pure host-only quals unexpectedly produced a GpuScan with mixed quals enabled' >&2
+    exit 1
+fi
+
 echo "Multi-segment GpuScan plans and CPU/GPU signatures passed on $primary_segment_count primaries."
-echo "Each signature passed $repeat_count GPU iterations; unsupported cases retained native plans."
+echo "Each device-only and mixed-quals signature passed $repeat_count GPU iterations; unsupported cases retained native plans."
