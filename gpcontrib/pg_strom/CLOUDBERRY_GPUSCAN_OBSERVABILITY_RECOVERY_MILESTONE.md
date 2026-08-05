@@ -8,6 +8,12 @@
 > `4d12ef415759dc48cd4c1421565e9c694b7bd3f9`
 > GPU 验收日期：2026-08-04
 
+> **后续工程化收尾（2026-08-05）**：当前源码已为 `run_demo.sh` 增加可配置的
+> cold-start readiness 超时轮询和逐 content 诊断，并为 query-cancel runner
+> 的异常 trap 增加精确 backend cancel/terminate 清理。无 GPU 静态检查已经
+> 通过；这两条 runner 变更仍需在真实 GPU 环境复验，不改变本文 2026-08-04
+> 里程碑的既有验收结论。
+
 ## 1. 结论
 
 本阶段在单机双 Primary GpuScan 技术 MVP 的基础上，完成了一个
@@ -686,9 +692,9 @@ git diff --check
 建议先完成当前 runner 的工程化收尾，再扩大功能范围：
 
 1. 为 `run_demo.sh` 增加 GPU Service cold-start readiness timeout 和逐 content
-   超时诊断；
+   超时诊断（源码已完成，待 GPU 复验）；
 2. 为 cancel runner 的 trap 增加服务端 backend cancel/terminate 清理，保证
-   任何失败路径都不遗留查询；
+   任何失败路径都不遗留查询（源码已完成，待 GPU 复验）；
 3. 如果必须证明 active GPU command 被中途取消，增加单调 command-start
    事件或测试同步点，而不是依赖瞬时 active gauge；
 4. 增加数小时 cancel/HUP/KILL 循环，检查 backend、socket、pthread、CUDA

@@ -4,12 +4,17 @@ set -euo pipefail
 psql_bin=${PSQL:-psql}
 database=${PGDATABASE:-postgres}
 repeat_count=${PGSTROM_MVP_REPEAT:-3}
+ready_timeout=${PGSTROM_MVP_READY_TIMEOUT:-60}
 demo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 psql_cmd=("$psql_bin" -X -v ON_ERROR_STOP=1 -d "$database")
 
 if [[ ! $repeat_count =~ ^[1-9][0-9]*$ ]]; then
     echo "PGSTROM_MVP_REPEAT must be a positive integer: $repeat_count" >&2
+    exit 1
+fi
+if [[ ! $ready_timeout =~ ^[1-9][0-9]*$ ]]; then
+    echo "PGSTROM_MVP_READY_TIMEOUT must be a positive integer: $ready_timeout" >&2
     exit 1
 fi
 
@@ -50,17 +55,76 @@ if [[ $("${psql_cmd[@]}" -Atqc "SELECT to_regclass('pgstrom.gpu_service_status')
     echo "pgstrom.gpu_service_status is missing; install PG-Strom 6.1 and ALTER EXTENSION pg_strom UPDATE" >&2
     exit 1
 fi
-service_status=$("${psql_cmd[@]}" -AtF '|' -qc "
-    SELECT count(DISTINCT content_id) FILTER (WHERE content_id >= 0),
-           count(DISTINCT content_id) FILTER (WHERE content_id = -1),
-           bool_and(ready AND actual_workers = configured_workers),
-           count(*)
-    FROM pgstrom.gpu_service_status;")
-IFS='|' read -r status_primary_count status_qd_count status_ready status_rows <<<"$service_status"
+read_service_summary() {
+    "${psql_cmd[@]}" -AtF '|' -qc "
+        SELECT count(DISTINCT content_id) FILTER (WHERE content_id >= 0),
+               count(DISTINCT content_id) FILTER (WHERE content_id = -1),
+               coalesce(bool_and(ready AND
+                                 actual_workers = configured_workers), false),
+               count(*)
+        FROM pgstrom.gpu_service_status;"
+}
+
+print_service_diagnostics() {
+    "${psql_cmd[@]}" -P pager=off -c "
+        WITH expected(content_id) AS (
+            VALUES (-1)
+            UNION ALL
+            SELECT content
+            FROM gp_segment_configuration
+            WHERE role = 'p' AND preferred_role = 'p'
+              AND status = 'u' AND content >= 0
+        ), observed AS (
+            SELECT content_id,
+                   count(*) AS devices,
+                   bool_and(ready) AS ready,
+                   string_agg(service_pid::text, ',' ORDER BY gpu_id) AS service_pids,
+                   string_agg(service_generation::text, ',' ORDER BY gpu_id) AS generations,
+                   string_agg(actual_workers::text || '/' ||
+                              configured_workers::text, ',' ORDER BY gpu_id) AS workers,
+                   sum(active_clients) AS clients,
+                   sum(queued_commands) AS queued,
+                   sum(active_commands) AS active,
+                   string_agg(device_name, ',' ORDER BY gpu_id) AS device_names
+            FROM pgstrom.gpu_service_status
+            GROUP BY content_id
+        )
+        SELECT e.content_id,
+               coalesce(o.devices::text, '<missing>') AS devices,
+               coalesce(o.ready::text, '<missing>') AS ready,
+               coalesce(o.service_pids, '<missing>') AS service_pids,
+               coalesce(o.generations, '<missing>') AS generations,
+               coalesce(o.workers, '<missing>') AS workers,
+               coalesce(o.clients::text, '<missing>') AS clients,
+               coalesce(o.queued::text, '<missing>') AS queued,
+               coalesce(o.active::text, '<missing>') AS active,
+               coalesce(o.device_names, '<missing>') AS device_names
+        FROM expected e
+        LEFT JOIN observed o USING (content_id)
+        ORDER BY e.content_id;" || true
+}
+
+deadline=$((SECONDS + ready_timeout))
+service_status=
+status_primary_count=0
+status_qd_count=0
+status_ready=f
+status_rows=0
+while (( SECONDS < deadline )); do
+    service_status=$(read_service_summary || true)
+    IFS='|' read -r status_primary_count status_qd_count status_ready status_rows <<<"$service_status"
+    if [[ $status_primary_count == "$primary_segment_count" &&
+          $status_qd_count == 1 && $status_ready == t &&
+          $status_rows =~ ^[1-9][0-9]*$ ]]; then
+        break
+    fi
+    sleep 0.2
+done
 if [[ $status_primary_count != "$primary_segment_count" ||
       $status_qd_count != 1 || $status_ready != t ||
       ! $status_rows =~ ^[1-9][0-9]*$ ]]; then
-    echo "GPU Service status is incomplete or unready: $service_status" >&2
+    echo "GPU Service readiness timed out after ${ready_timeout}s: ${service_status:-<no status>}" >&2
+    print_service_diagnostics >&2
     exit 1
 fi
 echo "GPU Service status: primaries=$status_primary_count coordinator=$status_qd_count rows=$status_rows ready=$status_ready"

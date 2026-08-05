@@ -8,10 +8,63 @@ cancel_timeout=${PGSTROM_MVP_CANCEL_TIMEOUT:-30}
 demo_app="pgstrom_mvp_cancel_$$"
 output_file=$(mktemp /tmp/pgstrom-mvp-cancel.XXXXXX)
 target_client_pid=
+backend_pid=
 
 psql_cmd=("$psql_bin" -X -v ON_ERROR_STOP=1 -d "$database")
 
 cleanup() {
+    local cleanup_backend_pid=${backend_pid:-}
+    local cleanup_deadline
+    local matching_backend
+
+    if [[ ! ${target_client_pid:-} =~ ^[0-9]+$ &&
+          ! $cleanup_backend_pid =~ ^[0-9]+$ ]]; then
+        rm -f "$output_file"
+        return
+    fi
+    if [[ ! $cleanup_backend_pid =~ ^[0-9]+$ ]]; then
+        cleanup_backend_pid=$("${psql_cmd[@]}" -Atqc "
+            SELECT pid
+            FROM pg_stat_activity
+            WHERE application_name = '$demo_app'
+            ORDER BY backend_start DESC
+            LIMIT 1;" 2>/dev/null || true)
+    fi
+    if [[ $cleanup_backend_pid =~ ^[0-9]+$ ]]; then
+        matching_backend=$("${psql_cmd[@]}" -Atqc "
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_stat_activity
+                WHERE pid = $cleanup_backend_pid
+                  AND application_name = '$demo_app');" 2>/dev/null || true)
+        if [[ $matching_backend == t ]]; then
+            echo "query-cancel demo: cleaning up server backend $cleanup_backend_pid" >&2
+            "${psql_cmd[@]}" -Atqc "
+                SELECT pg_cancel_backend(pid)
+                FROM pg_stat_activity
+                WHERE pid = $cleanup_backend_pid
+                  AND application_name = '$demo_app';" >/dev/null 2>&1 || true
+            cleanup_deadline=$((SECONDS + 5))
+            while (( SECONDS < cleanup_deadline )); do
+                matching_backend=$("${psql_cmd[@]}" -Atqc "
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_stat_activity
+                        WHERE pid = $cleanup_backend_pid
+                          AND application_name = '$demo_app');" 2>/dev/null || true)
+                [[ $matching_backend != t ]] && break
+                sleep 0.1
+            done
+            if [[ $matching_backend == t ]]; then
+                echo "query-cancel demo: terminating server backend $cleanup_backend_pid after cancel timeout" >&2
+                "${psql_cmd[@]}" -Atqc "
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE pid = $cleanup_backend_pid
+                      AND application_name = '$demo_app';" >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
     if [[ ${target_client_pid:-} =~ ^[0-9]+$ ]] && kill -0 "$target_client_pid" 2>/dev/null; then
         kill "$target_client_pid" 2>/dev/null || true
         wait "$target_client_pid" 2>/dev/null || true
@@ -243,6 +296,7 @@ for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
         die "cycle $cycle: post-cancel signature mismatch: CPU=$cpu_signature GPU=$gpu_signature"
     fi
     echo "cycle $cycle/$cancel_cycles: backend $backend_pid cancelled, submitted=$submitted_delta terminal=$terminal_delta (completed=$completed_delta failed=$failed_delta cancelled=$cancelled_delta), sampled_busy=$observed_busy sampled_client=$observed_client, queues drained, signature recovered"
+    backend_pid=
 done
 
 echo "GpuScan query cancellation passed for $cancel_cycles cycles."

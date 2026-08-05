@@ -198,6 +198,7 @@ make -C src/backend/cdb cdbplan.o
 createdb pgstrom_mvp
 PGDATABASE=pgstrom_mvp \
 PGSTROM_MVP_REPEAT=3 \
+PGSTROM_MVP_READY_TIMEOUT=60 \
 ./gpcontrib/pg_strom/cloudberry/demo/run_demo.sh
 ```
 
@@ -236,7 +237,11 @@ then verifies that `optimizer=on`, AO, AOCO, partitioned tables, and a
 host-only regular-expression filter do not produce GpuScan.
 
 Each CPU signature is compared with three GPU executions by default.  Override
-the positive iteration count when a longer smoke run is useful:
+the positive iteration count when a longer smoke run is useful.  On cold
+start, the runner waits up to `PGSTROM_MVP_READY_TIMEOUT` seconds for the QD
+and every Primary GPU Service to report a complete worker pool.  A timeout
+prints one diagnostic row per expected content, including missing services,
+PID, generation, worker counts, clients, and queued/active commands:
 
 ```sh
 PGSTROM_MVP_REPEAT=10 PGDATABASE=pgstrom_mvp \
@@ -341,7 +346,10 @@ and need not increase for every `pg_cancel_backend()` call.  A cancellation can
 arrive just after the current GPU command has returned successfully.  The
 runner therefore requires every newly submitted command to reach one of the
 completed, failed, or cancelled terminal counters and requires all queues to
-drain.
+drain.  If the runner exits on an error while its target remains alive, the
+exit trap first cancels the exact PID/application-name pair.  It waits briefly
+and terminates only that same backend if cancellation did not make it exit,
+then cleans up the local `psql` process.
 
 Do not run concurrent acceptance traffic while QD and QEs share one GPU.  The
 configured pool limit applies independently to each GPU Service; it is not
