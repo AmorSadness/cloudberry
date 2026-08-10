@@ -51,19 +51,37 @@ gpu_settings="
     SET pg_strom.enable_partitionwise_gpupreagg=off;
     SET pg_strom.cloudberry_enable_host_quals=off;
     SET pg_strom.cpu_fallback=off;
-    -- Expose the legal GpuPreAgg path for correctness testing only.  These
-    -- CPU costs are not benchmark settings and do not establish a win.
+    -- Expose the legal GpuPreAgg path for correctness testing only.  Native
+    -- Cloudberry partial aggregation can otherwise win before GpuPreAgg is
+    -- considered, especially when Motion is expensive.  These settings are
+    -- not benchmark settings and do not establish a performance win.
+    SET gp_enable_multiphase_agg=off;
+    SET pg_strom.gpu_setup_cost=0;
+    SET pg_strom.gpu_tuple_cost=0;
+    SET pg_strom.gpu_operator_cost=0;
+    SET gp_motion_cost_per_row=1000000;
     SET cpu_tuple_cost=10;
     SET cpu_operator_cost=10;
     SET enable_seqscan=off;"
 
+# The deliberately tiny one-nonempty-QE relation contains only 16 rows and is
+# distributed by its GROUP BY key.  Its native local aggregate therefore has
+# no Redistribute cost and can dominate GpuPreAgg even with the general
+# acceptance costs above.  Penalize CPU work only for this plan/result check;
+# this is still a correctness test, not a benchmark configuration.
+small_gpu_settings="
+    SET cpu_tuple_cost=100000;
+    SET cpu_operator_cost=100000;"
+
 require_gpupreagg_plan() {
     local label=$1
     local query=$2
+    local extra_settings=${3:-}
     local plan
 
     plan=$("${psql_cmd[@]}" -Atqc "
         $gpu_settings
+        $extra_settings
         EXPLAIN (ANALYZE, VERBOSE, COSTS OFF) $query")
     printf '\n[%s GpuPreAgg plan]\n%s\n' "$label" "$plan"
     if ! grep -q 'Custom Scan (GpuPreAgg)' <<<"$plan"; then
@@ -104,6 +122,7 @@ require_native_aggregate_plan() {
 compare_result() {
     local label=$1
     local query=$2
+    local extra_settings=${3:-}
     local cpu
     local gpu
     local iteration
@@ -115,6 +134,7 @@ compare_result() {
     for ((iteration = 1; iteration <= repeat_count; iteration++)); do
         gpu=$("${psql_cmd[@]}" -AtF '|' -qc "
             $gpu_settings
+            $extra_settings
             $query")
         if [[ $cpu != "$gpu" ]]; then
             echo "$label CPU/GPU mismatch on iteration $iteration" >&2
@@ -163,14 +183,14 @@ require_gpupreagg_plan "uniform cross-Segment groups" "$uniform_query"
 require_gpupreagg_plan "global aggregate" "$global_query"
 require_gpupreagg_plan "exact float8 aggregate" "$float_query"
 require_gpupreagg_plan "single-Segment skew" "$skew_query"
-require_gpupreagg_plan "one nonempty QE" "$small_query"
+require_gpupreagg_plan "one nonempty QE" "$small_query" "$small_gpu_settings"
 require_gpupreagg_plan "all QEs empty" "$empty_query"
 
 compare_result "uniform cross-Segment groups" "$uniform_query"
 compare_result "global aggregate" "$global_query"
 compare_result "exact float8 aggregate" "$float_query"
 compare_result "single-Segment skew" "$skew_query"
-compare_result "one nonempty QE" "$small_query"
+compare_result "one nonempty QE" "$small_query" "$small_gpu_settings"
 compare_result "all QEs empty" "$empty_query"
 
 require_native_aggregate_plan "no device qual" \
