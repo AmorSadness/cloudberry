@@ -1117,16 +1117,22 @@ static HTAB	   *finalfunc_catalog_htable = NULL;
 static void
 aggfunc_catalog_htable_invalidator(Datum arg, int cacheid, uint32 hashvalue)
 {
-	hash_destroy(aggfunc_catalog_htable);
-	aggfunc_catalog_htable = NULL;
-	hash_destroy(finalfunc_catalog_htable);
-	finalfunc_catalog_htable = NULL;
+	if (aggfunc_catalog_htable)
+	{
+		hash_destroy(aggfunc_catalog_htable);
+		aggfunc_catalog_htable = NULL;
+	}
+	if (finalfunc_catalog_htable)
+	{
+		hash_destroy(finalfunc_catalog_htable);
+		finalfunc_catalog_htable = NULL;
+	}
 }
 
 static Oid
 __aggfunc_resolve_func_signature(const char *signature, bool with_filtered_clause)
 {
-	char	   *fn_name = alloca(strlen(signature));
+	char	   *fn_name = alloca(strlen(signature) + 1);
 	Oid			fn_namespace;
 	oidvector  *fn_argtypes;
 	int			fn_nargs = 0;
@@ -1492,6 +1498,7 @@ typedef struct
 	RelOptInfo	   *input_rel;
 	ParamPathInfo  *param_info;
 	double			num_groups;
+	double			final_num_groups;
 	bool			try_parallel;
 	bool			has_aggfuncs;
 	PathTarget	   *target_upper;
@@ -1509,6 +1516,134 @@ typedef struct
 	List		   *havingAggQuals;		/* only if GpuPreAgg + Agg */
 	List		   *havingProjQuals;	/* only if GpuAgg */
 } xpugroupby_build_path_context;
+
+#ifdef GP_VERSION_NUM
+/*
+ * cloudberry_gpupreagg_supported_type
+ *
+ * Keep the first Cloudberry milestone deliberately smaller than upstream's
+ * aggregate catalog.  More types can be enabled only after their partial
+ * state, Motion, and final aggregate semantics have GPU acceptance coverage.
+ */
+static bool
+cloudberry_gpupreagg_supported_type(Oid type_oid)
+{
+	switch (type_oid)
+	{
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+typedef struct
+{
+	bool	found_aggregate;
+	bool	unsupported;
+} cloudberry_gpupreagg_walker_context;
+
+static bool
+cloudberry_gpupreagg_walker(Node *node, void *__data)
+{
+	cloudberry_gpupreagg_walker_context *context = __data;
+
+	if (!node)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *aggref = (Aggref *)node;
+		const char *aggname;
+		Oid			argtype = InvalidOid;
+
+		context->found_aggregate = true;
+		if (aggref->agglevelsup != 0 ||
+			aggref->aggkind != AGGKIND_NORMAL ||
+			aggref->aggvariadic ||
+			aggref->aggdistinct != NIL ||
+			aggref->aggorder != NIL ||
+			aggref->aggfilter != NULL ||
+			get_func_namespace(aggref->aggfnoid) != PG_CATALOG_NAMESPACE)
+			goto unsupported;
+
+		aggname = get_func_name(aggref->aggfnoid);
+		if (!aggname ||
+			(strcmp(aggname, "count") != 0 &&
+			 strcmp(aggname, "sum") != 0 &&
+			 strcmp(aggname, "min") != 0 &&
+			 strcmp(aggname, "max") != 0))
+			goto unsupported;
+
+		if (aggref->aggargtypes == NIL)
+		{
+			if (strcmp(aggname, "count") != 0)
+				goto unsupported;
+		}
+		else
+		{
+			if (list_length(aggref->aggargtypes) != 1)
+				goto unsupported;
+			argtype = linitial_oid(aggref->aggargtypes);
+			if (!cloudberry_gpupreagg_supported_type(argtype))
+				goto unsupported;
+		}
+
+		if (!aggfunc_catalog_lookup_by_oid(aggref->aggfnoid))
+			goto unsupported;
+		return false;
+
+unsupported:
+		context->unsupported = true;
+		elog(DEBUG2, "Cloudberry GpuPreAgg MVP does not support aggregate: %s",
+			 nodeToString(aggref));
+		return true;
+	}
+	return expression_tree_walker(node,
+							  cloudberry_gpupreagg_walker,
+							  __data);
+}
+
+/*
+ * cloudberry_gpupreagg_query_supported
+ *
+ * GpuScan's path tracker supplies the remaining storage and qualifier
+ * guards.  In particular, it does not remember a path with host quals or
+ * without a device qual, so a fused GpuPreAgg cannot bypass those rules.
+ */
+static bool
+cloudberry_gpupreagg_query_supported(PlannerInfo *root,
+									 UpperRelationKind upper_stage,
+									 RelOptInfo *input_rel,
+									 GroupPathExtraData *extra)
+{
+	Query	   *parse = root->parse;
+	cloudberry_gpupreagg_walker_context context;
+
+	if (optimizer ||
+		upper_stage != UPPERREL_GROUP_AGG ||
+		!parse->hasAggs ||
+		parse->groupingSets != NIL ||
+		parse->distinctClause != NIL ||
+		parse->havingQual != NULL ||
+		extra == NULL ||
+		extra->patype != PARTITIONWISE_AGGREGATE_NONE ||
+		input_rel->reloptkind != RELOPT_BASEREL ||
+		input_rel->relid <= 0 ||
+		input_rel->cdbpolicy == NULL ||
+		!GpPolicyIsPartitioned(input_rel->cdbpolicy))
+		return false;
+
+	memset(&context, 0, sizeof(context));
+	(void) expression_tree_walker((Node *)parse->targetList,
+								  cloudberry_gpupreagg_walker,
+								  &context);
+	return context.found_aggregate && !context.unsupported;
+}
+#endif
 
 /*
  * make_expr_typecast - constructor of type cast
@@ -2090,6 +2225,28 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con, Path *part_path)
 {
 	Query	   *parse = con->root->parse;
 	Path	   *__path;
+	double		num_groups = con->final_num_groups;
+
+#ifdef GP_VERSION_NUM
+	/*
+	 * The GPU final buffer is local to each QE.  Even when GROUP BY is used,
+	 * the same group can exist on multiple Segments, so it must cross a real
+	 * Cloudberry Motion and be merged once by a CPU aggregate.  A PostgreSQL
+	 * Gather only combines workers inside one backend and is not sufficient.
+	 */
+	{
+		CdbPathLocus singleqe_locus;
+
+		CdbPathLocus_MakeSingleQE(&singleqe_locus, getgpsegmentCount());
+		part_path = cdbpath_create_motion_path(con->root,
+										  part_path,
+										  NIL,
+										  false,
+										  singleqe_locus);
+		if (!part_path)
+			return;
+	}
+#endif
 
 	if (parse->groupClause)
 	{
@@ -2106,7 +2263,7 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con, Path *part_path)
 										 parse->groupClause,
 										 con->havingAggQuals,
 										 &con->final_agg_clause_costs,
-										 con->num_groups);
+										 num_groups);
 		if (con->has_aggfuncs)
 			__path = pgstrom_create_dummy_path(con->root, __path);
 		add_path(con->group_rel, __path
@@ -2130,7 +2287,7 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con, Path *part_path)
 										 parse->distinctClause,
 										 con->havingAggQuals,
 										 &con->final_agg_clause_costs,
-										 con->num_groups);
+										 num_groups);
 		Assert(!con->has_aggfuncs);
 		add_path(con->group_rel, __path
 #ifdef GP_VERSION_NUM
@@ -2152,7 +2309,7 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con, Path *part_path)
 										 parse->groupClause,
 										 con->havingAggQuals,
 										 &con->final_agg_clause_costs,
-										 con->num_groups);
+										 num_groups);
 		if (con->has_aggfuncs)
 			__path = pgstrom_create_dummy_path(con->root, __path);
 		add_path(con->group_rel, __path
@@ -2237,8 +2394,28 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	cpath->path.rows             = con->num_groups;
 	cpath->path.startup_cost     = pp_info->startup_cost;
 	cpath->path.total_cost       = (pp_info->startup_cost +
-									pp_info->run_cost +
-									pp_info->final_cost);
+										pp_info->run_cost +
+										pp_info->final_cost);
+	cpath->path.memory           = 0;
+#ifdef GP_VERSION_NUM
+	/*
+	 * Partial rows stay on their source Segments, but the partial target may
+	 * no longer carry the base table distribution keys.  Strewn is therefore
+	 * the conservative and correct locus until a later Redistribute milestone.
+	 */
+	{
+		int		numsegments = planner_segment_count(con->input_rel->cdbpolicy);
+
+		if (numsegments < 1)
+			numsegments = 1;
+		CdbPathLocus_MakeStrewn(&cpath->path.locus, numsegments, 0);
+	}
+	cpath->path.parallel_workers = cpath->path.locus.parallel_workers;
+	cpath->path.motionHazard     = false;
+	cpath->path.barrierHazard    = false;
+	cpath->path.rescannable      = true;
+	cpath->path.sameslice_relids = con->input_rel->relids;
+#endif
 	cpath->path.pathkeys         = NIL;
 	cpath->flags                 = 0;	/* prevent Result pushdown before plan creation */
 	cpath->custom_paths          = con->inner_paths_list;
@@ -2482,6 +2659,16 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 	ListCell   *lc;
 	CustomPath *cpath;
 	double		num_groups = 1.0;
+	double		final_num_groups = 1.0;
+	bool		needs_cpu_final;
+
+#ifdef GP_VERSION_NUM
+	/* Defense in depth against future changes to the GpuScan path tracker. */
+	if (op_leaf->pp_info->scan_quals == NIL ||
+		op_leaf->pp_info->host_quals != NIL ||
+		op_leaf->pp_info->scan_relid <= 0)
+		return;
+#endif
 
 	/* estimate number of groups */
 	if (parse->groupClause)
@@ -2493,6 +2680,14 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 		num_groups = estimate_num_groups(root, groupExprs,
 										 op_leaf->leaf_nrows,
 										 NULL, NULL);
+#ifdef GP_VERSION_NUM
+		/* RelOptInfo rows are global; Path rows above are per QE. */
+		final_num_groups = estimate_num_groups(root, groupExprs,
+										   input_rel->rows,
+										   NULL, NULL);
+#else
+		final_num_groups = num_groups;
+#endif
 	}
 	else if (parse->distinctClause)
 	{
@@ -2503,6 +2698,7 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 		num_groups = estimate_num_groups(root, distinctExprs,
 										 op_leaf->leaf_nrows,
 										 NULL, NULL);
+		final_num_groups = num_groups;
 	}
 	/* setup inner_target_list */
 	foreach (lc, op_leaf->inner_paths_list)
@@ -2519,6 +2715,7 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 	con.input_rel      = input_rel;
 	con.param_info     = op_leaf->leaf_param;
 	con.num_groups     = num_groups;
+	con.final_num_groups = final_num_groups;
 	con.try_parallel   = be_parallel;
 	con.target_upper   = root->upper_targets[upper_stage];
 	con.target_partial = create_empty_pathtarget();
@@ -2544,9 +2741,14 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 	 * can ignore this overhead.
 	 * Elsewhere, no CPU-based Agg-node is needed.
 	 */
-	if (pgstrom_cpu_fallback_elevel < ERROR ||
-		parse->groupClause == NIL ||
-		(xpu_task_flags & DEVKIND__ANY) != DEVKIND__NVIDIA_GPU)
+	needs_cpu_final = (pgstrom_cpu_fallback_elevel < ERROR ||
+					   parse->groupClause == NIL ||
+					   (xpu_task_flags & DEVKIND__ANY) != DEVKIND__NVIDIA_GPU);
+#ifdef GP_VERSION_NUM
+	/* Gather-only MVP always needs one cross-Segment CPU final Agg. */
+	needs_cpu_final = true;
+#endif
+	if (needs_cpu_final)
 	{
 		Path   *__path = &cpath->path;
 
@@ -2715,6 +2917,7 @@ __try_add_xpupreagg_partition_path(PlannerInfo *root,
 		con.input_rel      = op_leaf->leaf_rel;
 		con.param_info     = op_leaf->leaf_param;
 		con.num_groups     = num_groups;
+		con.final_num_groups = num_groups;
 		con.try_parallel   = try_parallel_path;
 		con.target_upper   = root->upper_targets[upper_stage];
 		con.target_partial = create_empty_pathtarget();
@@ -2790,6 +2993,12 @@ __xpuPreAggAddCustomPathCommon(PlannerInfo *root,
 							   bool consider_partition)
 {
 	Query	   *parse = root->parse;
+	int			num_parallel_trials = 2;
+
+#ifdef GP_VERSION_NUM
+	/* The Gather-only MVP has Segment parallelism only, not QE-local workers. */
+	num_parallel_trials = 1;
+#endif
 
 	/* quick bailout if not supported */
 	if (parse->groupingSets != NIL)
@@ -2812,7 +3021,9 @@ __xpuPreAggAddCustomPathCommon(PlannerInfo *root,
 		return;
 	}
 
-	for (int try_parallel=0; try_parallel < 2; try_parallel++)
+	for (int try_parallel=0;
+		 try_parallel < num_parallel_trials;
+		 try_parallel++)
 	{
 		pgstromOuterPathLeafInfo *op_leaf;
 
@@ -3353,6 +3564,23 @@ XpuPreAggAddCustomPath(PlannerInfo *root,
 								extra);
 	if (!pgstrom_enabled())
 		return;
+#ifdef GP_VERSION_NUM
+	if (!pgstrom_enable_gpupreagg ||
+		!gpuserv_ready_accept() ||
+		!cloudberry_gpupreagg_query_supported(root,
+										 upper_stage,
+										 input_rel,
+										 (GroupPathExtraData *)extra))
+		return;
+	__xpuPreAggAddCustomPathCommon(root,
+								 upper_stage,
+								 input_rel,
+								 upper_rel,
+								 extra,
+								 TASK_KIND__GPUPREAGG,
+								 false);
+	return;
+#endif
 	if (upper_stage == UPPERREL_GROUP_AGG || upper_stage == UPPERREL_DISTINCT)
 	{
 		if (pgstrom_enable_gpupreagg && gpuserv_ready_accept())
@@ -3518,6 +3746,7 @@ tryAddSelectIntoDirectProjection(pgstromTaskState *pts,
 
 					Assert(var->vartype == exprType((Node *)__tle->expr) &&
 						   var->vartypmod == exprTypmod((Node *)__tle->expr));
+					(void)__tle;
 					if (var->varattno != tle->resno)
 						compatible = false;
 					select_into_proj = lappend_int(select_into_proj, code);
@@ -3542,6 +3771,7 @@ tryAddSelectIntoDirectProjection(pgstromTaskState *pts,
 													  var->varattno-1);
 						Assert(var->vartype == exprType((Node *)__tle->expr) &&
 							   var->vartypmod == exprTypmod((Node *)__tle->expr));
+						(void)__tle;
 						code = (code << 16) | var->varattno;
 						select_into_proj = lappend_int(select_into_proj, code);
 						compatible = false;
@@ -3610,7 +3840,11 @@ pgstrom_init_gpu_preagg(void)
 							 "Enables the use of GPU-PreAgg",
 							 NULL,
 							 &pgstrom_enable_gpupreagg,
-							 true,
+#ifdef GP_VERSION_NUM
+								 false,
+#else
+								 true,
+#endif
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
@@ -3619,7 +3853,11 @@ pgstrom_init_gpu_preagg(void)
 							 "Enable aggregate functions on numeric type",
 							 NULL,
 							 &pgstrom_enable_numeric_aggfuncs,
-							 true,
+#ifdef GP_VERSION_NUM
+								 false,
+#else
+								 true,
+#endif
 							 PGC_USERSET,
 							 GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
@@ -3628,7 +3866,11 @@ pgstrom_init_gpu_preagg(void)
 							 "Enabled Enables partition wise GPU-PreAgg",
 							 NULL,
 							 &pgstrom_enable_partitionwise_gpupreagg,
-							 true,
+#ifdef GP_VERSION_NUM
+								 false,
+#else
+								 true,
+#endif
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
@@ -3637,7 +3879,11 @@ pgstrom_init_gpu_preagg(void)
 							 "Enables to use GPU-Sort on top of GPU-Projection/PreAgg",
 							 NULL,
 							 &pgstrom_enable_gpusort,
-							 true,
+#ifdef GP_VERSION_NUM
+								 false,
+#else
+								 true,
+#endif
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);

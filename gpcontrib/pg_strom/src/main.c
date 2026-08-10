@@ -223,6 +223,14 @@ pgstrom_create_dummy_path(PlannerInfo *root, Path *subpath)
 	cpath->path.rows			= subpath->rows;
 	cpath->path.startup_cost	= subpath->startup_cost;
 	cpath->path.total_cost		= subpath->total_cost;
+#ifdef GP_VERSION_NUM
+	cpath->path.memory          = subpath->memory;
+	cpath->path.locus           = subpath->locus;
+	cpath->path.motionHazard    = subpath->motionHazard;
+	cpath->path.barrierHazard   = subpath->barrierHazard;
+	cpath->path.rescannable     = subpath->rescannable;
+	cpath->path.sameslice_relids = subpath->sameslice_relids;
+#endif
 
 	cpath->custom_paths			= list_make1(subpath);
 	cpath->methods				= &pgstrom_dummy_path_methods;
@@ -987,7 +995,9 @@ _PG_init(void)
 		pgstrom_init_gpu_scan();
 #ifndef GP_VERSION_NUM
 		pgstrom_init_gpu_join();
+#endif
 		pgstrom_init_gpu_preagg();
+#ifndef GP_VERSION_NUM
 		pgstrom_init_gpu_cache();
 		pgstrom_init_select_into();
 #endif

@@ -388,3 +388,34 @@ independent services: one for the QD and one for each of its two primaries.
 Enabling mirrors starts additional services even though mirrors do not normally
 execute the query.  The sample uses the minimum accepted 20% hard limit and a
 256MB allocation segment; idle services do not reserve 20% eagerly.
+
+## Gather-only GpuPreAgg MVP
+
+GpuPreAgg is registered as a default-off experimental path.  First run the
+regular demo so that its uniform, skewed, small, AO/AOCO, and partitioned test
+relations exist.  Then run the dedicated acceptance runner:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_GPUPREAGG_REPEAT=3 \
+./gpcontrib/pg_strom/cloudberry/demo/run_gpupreagg_mvp.sh
+```
+
+The runner requires at least two up preferred Primaries and verifies that
+`pg_strom.enable_gpupreagg`, numeric aggregation, partitionwise GpuPreAgg, and
+GpuSort are all off by default.  For supported queries it enables only the
+Gather-only MVP and requires the following logical placement:
+
+```text
+CPU Final Aggregate
+  -> Motion from every Primary
+       -> Custom Scan (GpuPreAgg)
+```
+
+It compares CPU and GPU results for groups spanning Segments, a global
+aggregate, single-Segment skew, one nonempty QE, and an entirely empty input.
+It also verifies safe fallback for no device qual, mixed host/device quals,
+numeric aggregation, aggregate `FILTER`, `HAVING`, AO/AOCO, partitioned tables,
+and ORCA.  Passing this runner proves the M1/M2 result and placement matrix; it
+does not by itself complete query-cancel or GPU Service failure recovery
+acceptance for GpuPreAgg.

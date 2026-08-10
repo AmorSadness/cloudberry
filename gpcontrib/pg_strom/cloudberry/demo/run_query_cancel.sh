@@ -99,6 +99,7 @@ gpu_settings="
     SET optimizer=off;
     SET pg_strom.enabled=on;
     SET pg_strom.enable_gpuscan=on;
+    SET pg_strom.enable_gpupreagg=off;
     SET pg_strom.cpu_fallback=off;
     SET enable_seqscan=off;"
 

@@ -12,7 +12,13 @@ pg_strom.gpu_mempool_max_ratio = 0.20
 pg_strom.cpu_fallback = 'off'
 pg_strom.enabled = on
 pg_strom.enable_gpuscan = on
+pg_strom.enable_gpupreagg = off
+pg_strom.enable_partitionwise_gpupreagg = off
+pg_strom.enable_numeric_aggfuncs = off
+pg_strom.enable_gpusort = off
 
-# The Cloudberry MVP does not register GpuJoin/GpuPreAgg/GpuSort/GpuCache,
-# BRIN acceleration, Arrow, SELECT-INTO-Direct, or DPU planner hooks.
-# GPU-Direct and SELECT-INTO-Direct are also hard-disabled by the build.
+# Gather-only GpuPreAgg is registered as a default-off experimental path.
+# The Cloudberry MVP does not register GpuJoin/GpuCache, BRIN acceleration,
+# Arrow, SELECT-INTO-Direct, or DPU planner hooks.  GPU-Sort, numeric and
+# partitionwise GpuPreAgg remain disabled.  GPU-Direct and SELECT-INTO-Direct
+# are also hard-disabled by the build.

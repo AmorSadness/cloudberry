@@ -33,6 +33,7 @@
 #include "catalog/binary_upgrade.h"
 #ifdef GP_VERSION_NUM
 #include "catalog/gp_distribution_policy.h"
+#include "cdb/cdbpath.h"
 #include "cdb/cdbpathlocus.h"
 #include "cdb/cdbvars.h"
 #endif

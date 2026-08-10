@@ -25,12 +25,14 @@ a build or runtime requirement for the non-GPU-Direct GpuScan MVP.
 
 ## Supported scope
 
-The Cloudberry build registers only GpuScan (plus its GPU Service), and only
-offers it for a non-partitioned, ordinarily distributed heap table.  AO,
-AOCO, partitioned tables, foreign/Arrow tables and coordinator-local or
-replicated tables retain native scan paths.  GpuJoin, GpuPreAgg, GpuSort,
-GpuCache, BRIN acceleration, SELECT-INTO-Direct and every DPU path are not
-registered.  GPU-Direct and SELECT-INTO-Direct cannot be enabled.
+The Cloudberry build registers GpuScan (plus its GPU Service) and a default-off
+experimental Gather-only GpuPreAgg path.  Both are restricted to a
+non-partitioned, ordinarily distributed heap table.  AO, AOCO, partitioned
+tables, foreign/Arrow tables and coordinator-local or replicated tables retain
+native paths.  GpuJoin, GpuCache, BRIN acceleration, SELECT-INTO-Direct and
+every DPU path are not registered.  GpuSort, numeric aggregation and
+partitionwise GpuPreAgg remain disabled.  GPU-Direct and SELECT-INTO-Direct
+cannot be enabled.
 
 The implementation assumes the standard planner (`optimizer=off`).  ORCA
 does not consume the standard planner hook and therefore cannot produce a
@@ -50,6 +52,15 @@ pure host-only query still retains the native scan path.  This source change
 has completed real multi-Segment GPU acceptance for plans, CPU/GPU signatures,
 query cancellation, SIGHUP, and SIGKILL/crash recovery; see
 `CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md`.
+
+The Gather-only GpuPreAgg MVP is also default-off.  When explicitly enabled,
+each QE fuses a device-only GpuScan with local partial aggregation, sends the
+partial rows through a real Cloudberry Motion, and uses one CPU final aggregate
+to merge groups across Segments.  Its first whitelist is count/sum/min/max on
+integer and floating-point inputs; mixed quals, numeric, FILTER, HAVING,
+DISTINCT aggregates, partitionwise aggregation and GPU-Sort retain native
+plans.  Source and acceptance assets are complete, but real GPU M1/M2/M3
+acceptance remains pending; see `CLOUDBERRY_GPUPREAGG_MVP_DESIGN.md`.
 
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.
