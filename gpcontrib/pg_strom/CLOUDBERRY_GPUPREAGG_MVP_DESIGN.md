@@ -4,8 +4,8 @@
 > 上游基线：PG-Strom v6.1，commit
 > `4d12ef415759dc48cd4c1421565e9c694b7bd3f9`  
 > 设计日期：2026-08-10  
-> 当前状态：Gather-only MVP 源码已实现，真实双 Primary GPU M1/M2 验收已通过；
-> M3 cancel、SIGHUP 与 SIGKILL 专用 runner 已实现，真实 GPU 故障验收待完成
+> 当前状态：Gather-only MVP 源码已实现，真实双 Primary GPU M1/M2 与 M3
+> cancel、SIGHUP、SIGKILL 验收及故障后的最终全量回归均已通过
 
 ## 1. 结论
 
@@ -415,6 +415,20 @@ CustomScan mutation。如果实现中发现 extension hook 时点无法合法构
 - 单 QE Service SIGHUP 时整条分布式聚合明确失败，不返回部分 aggregate；
 - SIGKILL/Segment crash recovery 后 Service 和结果签名恢复；
 - 故障前后 partial/final 结果没有重复或遗漏。
+
+真实双 Primary GPU 验收于 2026-08-10 完成：
+
+- query cancel 连续三轮通过；每轮精确取消目标 QD backend，所有新增 GPU
+  submission 均进入 completed/failed/cancelled 终态，client/queue/active 排空，
+  恢复后的 GpuPreAgg signature 与 CPU baseline 一致；
+- content 0 GPU Service SIGHUP 连续三轮通过；Service PID 每轮替换，generation
+  从 1 依次增长到 4，故障窗口内分布式聚合明确失败且没有部分结果，worker
+  pool 和 signature 均恢复；
+- content 0 GPU Service SIGKILL 连续三轮通过；每轮 Service PID 和 worker 启动
+  日志均更新，Segment crash recovery 重建 shared-memory epoch 后 generation 允许
+  重置，恢复后的 GpuPreAgg signature 与 CPU baseline 一致；
+- 故障验收完成后，既有多 Segment GpuScan 全量 runner 与 Gather-only GpuPreAgg
+  M1/M2 runner 均再次通过。
 
 ### M4：成本和性能探索
 
