@@ -419,3 +419,59 @@ numeric aggregation, aggregate `FILTER`, `HAVING`, AO/AOCO, partitioned tables,
 and ORCA.  Passing this runner proves the M1/M2 result and placement matrix; it
 does not by itself complete query-cancel or GPU Service failure recovery
 acceptance for GpuPreAgg.
+
+### GpuPreAgg cancellation and failure recovery
+
+The M3 runners reuse the established GpuScan cancellation and recovery
+framework but select a strict GpuPreAgg mode.  They first require a real
+`Custom Scan (GpuPreAgg)` below a multi-Primary Motion, use only the MVP
+`count`/`sum(int8)`/`min`/`max` aggregate whitelist, and apply the same
+correctness-only planner costs as the M1/M2 runner.
+
+Run three cancellation cycles on an otherwise idle acceptance cluster:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_GPUPREAGG_CANCEL_CYCLES=3 \
+PGSTROM_GPUPREAGG_CANCEL_TIMEOUT=30 \
+./gpcontrib/pg_strom/cloudberry/demo/run_gpupreagg_cancel.sh
+```
+
+The runner waits for a GPU Service submission before cancelling the exact QD
+backend.  It requires the client to report cancellation, every submitted
+command to reach a terminal counter, all client/queue/active gauges to drain,
+and a fresh GpuPreAgg result to match its CPU baseline.
+
+The controlled SIGHUP test needs explicit authorization and signals only the
+uniquely identified GPU Service child of the selected Segment postmaster:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_GPUPREAGG_ALLOW_SERVICE_RESTART=1 \
+PGSTROM_GPUPREAGG_SERVICE_SIGNAL=HUP \
+PGSTROM_GPUPREAGG_TARGET_CONTENT=0 \
+PGSTROM_GPUPREAGG_RECOVERY_CYCLES=3 \
+PGSTROM_GPUPREAGG_RECOVERY_TIMEOUT=30 \
+./gpcontrib/pg_strom/cloudberry/demo/run_gpupreagg_failure_recovery.sh
+```
+
+Run SIGKILL only on a disposable acceptance cluster.  It requires a second
+explicit authorization because it can trigger Segment crash recovery:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_GPUPREAGG_ALLOW_SERVICE_RESTART=1 \
+PGSTROM_GPUPREAGG_ALLOW_HARD_FAILURE=1 \
+PGSTROM_GPUPREAGG_SERVICE_SIGNAL=KILL \
+PGSTROM_GPUPREAGG_TARGET_CONTENT=0 \
+PGSTROM_GPUPREAGG_RECOVERY_CYCLES=3 \
+PGSTROM_GPUPREAGG_RECOVERY_TIMEOUT=60 \
+./gpcontrib/pg_strom/cloudberry/demo/run_gpupreagg_failure_recovery.sh
+```
+
+For both signals, the distributed query must fail without emitting the
+`UNEXPECTED_PARTIAL_RESULT` marker while the target service is unavailable.
+The runner then requires a replacement service and worker pool, SQL-visible
+readiness, a surviving Segment postmaster, and a recovered GpuPreAgg signature
+equal to the CPU baseline.  A generation reset after SIGKILL is accepted only
+when Segment crash recovery recreated the shared-memory epoch.

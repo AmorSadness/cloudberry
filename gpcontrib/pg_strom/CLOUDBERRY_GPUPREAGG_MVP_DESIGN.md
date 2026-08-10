@@ -4,8 +4,8 @@
 > 上游基线：PG-Strom v6.1，commit
 > `4d12ef415759dc48cd4c1421565e9c694b7bd3f9`  
 > 设计日期：2026-08-10  
-> 当前状态：Gather-only MVP 源码与验收 runner 已实现并通过无 GPU 静态及 host
-> 编译检查；真实 GPU M1/M2/M3 验收待完成
+> 当前状态：Gather-only MVP 源码已实现，真实双 Primary GPU M1/M2 验收已通过；
+> M3 cancel、SIGHUP 与 SIGKILL 专用 runner 已实现，真实 GPU 故障验收待完成
 
 ## 1. 结论
 

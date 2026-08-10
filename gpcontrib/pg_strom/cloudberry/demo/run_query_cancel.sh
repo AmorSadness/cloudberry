@@ -5,6 +5,7 @@ psql_bin=${PSQL:-psql}
 database=${PGDATABASE:-postgres}
 cancel_cycles=${PGSTROM_MVP_CANCEL_CYCLES:-3}
 cancel_timeout=${PGSTROM_MVP_CANCEL_TIMEOUT:-30}
+test_operator=${PGSTROM_MVP_TEST_OPERATOR:-gpuscan}
 demo_app="pgstrom_mvp_cancel_$$"
 output_file=$(mktemp /tmp/pgstrom-mvp-cancel.XXXXXX)
 target_client_pid=
@@ -87,6 +88,9 @@ done
 if (( cancel_cycles < 1 || cancel_timeout < 5 )); then
     die "cancel cycles must be positive and timeout must be at least 5 seconds"
 fi
+if [[ $test_operator != gpuscan && $test_operator != gpupreagg ]]; then
+    die "PGSTROM_MVP_TEST_OPERATOR must be gpuscan or gpupreagg: $test_operator"
+fi
 
 if [[ $("${psql_cmd[@]}" -Atqc "SELECT to_regclass('public.pgstrom_mvp_heap') IS NOT NULL;") != t ]]; then
     die "pgstrom_mvp_heap is missing; run run_demo.sh successfully before this test"
@@ -103,6 +107,31 @@ gpu_settings="
     SET pg_strom.cpu_fallback=off;
     SET enable_seqscan=off;"
 
+expected_custom_scan=GpuScan
+operator_label=GpuScan
+if [[ $test_operator == gpupreagg ]]; then
+    expected_custom_scan=GpuPreAgg
+    operator_label=GpuPreAgg
+    gpu_settings="
+        SET optimizer=off;
+        SET gp_enable_multiphase_agg=off;
+        SET pg_strom.enabled=on;
+        SET pg_strom.enable_gpuscan=on;
+        SET pg_strom.enable_gpupreagg=on;
+        SET pg_strom.enable_gpusort=off;
+        SET pg_strom.enable_numeric_aggfuncs=off;
+        SET pg_strom.enable_partitionwise_gpupreagg=off;
+        SET pg_strom.cloudberry_enable_host_quals=off;
+        SET pg_strom.cpu_fallback=off;
+        SET pg_strom.gpu_setup_cost=0;
+        SET pg_strom.gpu_tuple_cost=0;
+        SET pg_strom.gpu_operator_cost=0;
+        SET gp_motion_cost_per_row=1000000;
+        SET cpu_tuple_cost=10;
+        SET cpu_operator_cost=10;
+        SET enable_seqscan=off;"
+fi
+
 # Probe the statement executed by every loop iteration independently.  A
 # lateral SQL formulation is not suitable here because Cloudberry may insert
 # a required Materialize node below Motion even with enable_material=off.  It
@@ -115,7 +144,7 @@ cancel_scan_query="
       AND t.amount >= 250.00;"
 
 # A server-side loop keeps one identifiable coordinator backend alive while
-# executing a fresh distributed GpuScan statement on every iteration.  The
+# executing a fresh distributed GPU statement on every iteration.  The
 # loop is intentionally much longer than the cancellation timeout.  The
 # comment is used only to identify this backend in pg_stat_activity.
 cancel_query="
@@ -133,15 +162,43 @@ cancel_query="
     END
     \$pgstrom_cancel\$;"
 
+if [[ $test_operator == gpupreagg ]]; then
+    # Probe and execute the exact same constant statement.  Each PL/pgSQL
+    # loop iteration starts a fresh distributed execution, which keeps the
+    # target backend alive without relying on parameterized-path behavior.
+    cancel_scan_query="
+        SELECT count(*), count(id), sum(id), min(id), max(id)
+        FROM pgstrom_mvp_heap t
+        WHERE t.grp BETWEEN 101 AND 207 AND t.id > 0;"
+    cancel_query="
+        /* pgstrom_mvp_cancel_target */
+        DO \$pgstrom_cancel\$
+        BEGIN
+            FOR cancel_iteration IN 1..100000 LOOP
+                PERFORM count(*), count(id), sum(id), min(id), max(id)
+                FROM pgstrom_mvp_heap t
+                WHERE t.grp BETWEEN 101 AND 207 AND t.id > 0;
+            END LOOP;
+        END
+        \$pgstrom_cancel\$;"
+fi
+
 signature_query="
     SELECT count(*) || '|' || coalesce(sum(id)::text,'') || '|' ||
            coalesce(sum(amount)::text,'')
     FROM pgstrom_mvp_heap
     WHERE grp BETWEEN 101 AND 207 AND amount >= 500.00;"
 
+if [[ $test_operator == gpupreagg ]]; then
+    signature_query="
+        SELECT count(*), count(id), sum(id), min(id), max(id)
+        FROM pgstrom_mvp_heap
+        WHERE grp BETWEEN 101 AND 207 AND id > 0;"
+fi
+
 plan=$("${psql_cmd[@]}" -Atqc "$gpu_settings EXPLAIN (VERBOSE, COSTS OFF) $cancel_scan_query")
-if ! grep -q 'Custom Scan (GpuScan)' <<<"$plan"; then
-    die "cancel loop statement does not contain GpuScan: $plan"
+if ! grep -q "Custom Scan ($expected_custom_scan)" <<<"$plan"; then
+    die "cancel loop statement does not contain $expected_custom_scan: $plan"
 fi
 
 cpu_signature=$("${psql_cmd[@]}" -Atqc "
@@ -162,7 +219,7 @@ read_segment_counters() {
         FROM pgstrom.gpu_service_status_segments();"
 }
 
-echo "Query-cancel baseline signature: $cpu_signature"
+echo "$operator_label query-cancel baseline signature: $cpu_signature"
 
 for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
     counters=$(read_segment_counters)
@@ -300,4 +357,4 @@ for ((cycle = 1; cycle <= cancel_cycles; cycle++)); do
     backend_pid=
 done
 
-echo "GpuScan query cancellation passed for $cancel_cycles cycles."
+echo "$operator_label query cancellation passed for $cancel_cycles cycles."

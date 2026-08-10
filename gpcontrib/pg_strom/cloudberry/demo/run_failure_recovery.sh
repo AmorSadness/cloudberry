@@ -9,6 +9,7 @@ recovery_timeout=${PGSTROM_MVP_RECOVERY_TIMEOUT:-30}
 allow_restart=${PGSTROM_MVP_ALLOW_SERVICE_RESTART:-0}
 allow_hard_failure=${PGSTROM_MVP_ALLOW_HARD_FAILURE:-0}
 service_signal=${PGSTROM_MVP_SERVICE_SIGNAL:-HUP}
+test_operator=${PGSTROM_MVP_TEST_OPERATOR:-gpuscan}
 
 psql_cmd=("$psql_bin" -X -v ON_ERROR_STOP=1 -d "$database")
 
@@ -25,6 +26,9 @@ for numeric_setting in target_content recovery_cycles recovery_timeout; do
 done
 if (( recovery_cycles < 1 || recovery_timeout < 5 )); then
     die "recovery cycles must be positive and timeout must be at least 5 seconds"
+fi
+if [[ $test_operator != gpuscan && $test_operator != gpupreagg ]]; then
+    die "PGSTROM_MVP_TEST_OPERATOR must be gpuscan or gpupreagg: $test_operator"
 fi
 if [[ $allow_restart != 1 ]]; then
     die "set PGSTROM_MVP_ALLOW_SERVICE_RESTART=1 to authorize signaling the target GPU Service"
@@ -149,6 +153,32 @@ gpu_settings="
     SET statement_timeout='10s';
     SET enable_seqscan=off;"
 
+expected_custom_scan=GpuScan
+operator_label=GpuScan
+if [[ $test_operator == gpupreagg ]]; then
+    expected_custom_scan=GpuPreAgg
+    operator_label=GpuPreAgg
+    gpu_settings="
+        SET optimizer=off;
+        SET gp_enable_multiphase_agg=off;
+        SET pg_strom.enabled=on;
+        SET pg_strom.enable_gpuscan=on;
+        SET pg_strom.enable_gpupreagg=on;
+        SET pg_strom.enable_gpusort=off;
+        SET pg_strom.enable_numeric_aggfuncs=off;
+        SET pg_strom.enable_partitionwise_gpupreagg=off;
+        SET pg_strom.cloudberry_enable_host_quals=off;
+        SET pg_strom.cpu_fallback=off;
+        SET pg_strom.gpu_setup_cost=0;
+        SET pg_strom.gpu_tuple_cost=0;
+        SET pg_strom.gpu_operator_cost=0;
+        SET gp_motion_cost_per_row=1000000;
+        SET cpu_tuple_cost=10;
+        SET cpu_operator_cost=10;
+        SET statement_timeout='10s';
+        SET enable_seqscan=off;"
+fi
+
 signature_query="
     SELECT count(*) || '|' || coalesce(sum(id)::text,'') || '|' ||
            coalesce(sum(amount)::text,'') || '|' ||
@@ -162,6 +192,18 @@ failure_query="
     FROM pgstrom_mvp_heap
     WHERE grp BETWEEN 101 AND 207 AND amount >= 500.00;"
 
+if [[ $test_operator == gpupreagg ]]; then
+    signature_query="
+        SELECT count(*), count(id), sum(id), min(id), max(id)
+        FROM pgstrom_mvp_heap
+        WHERE grp BETWEEN 101 AND 207 AND id > 0;"
+    failure_query="
+        SELECT 'UNEXPECTED_PARTIAL_RESULT',
+               count(*), count(id), sum(id), min(id), max(id)
+        FROM pgstrom_mvp_heap
+        WHERE grp BETWEEN 101 AND 207 AND id > 0;"
+fi
+
 if [[ $("${psql_cmd[@]}" -Atqc "SELECT to_regclass('public.pgstrom_mvp_heap') IS NOT NULL;") != t ]]; then
     die "pgstrom_mvp_heap is missing; run run_demo.sh successfully before this test"
 fi
@@ -172,9 +214,9 @@ fi
 plan=$("${psql_cmd[@]}" -Atqc "
     $gpu_settings
     EXPLAIN (ANALYZE, VERBOSE, COSTS OFF) $signature_query")
-if ! grep -q 'Custom Scan (GpuScan)' <<<"$plan" ||
+if ! grep -q "Custom Scan ($expected_custom_scan)" <<<"$plan" ||
    ! grep -Eq "Motion .*\\(slice[1-9][0-9]*; segments: ${primary_segment_count}\\)" <<<"$plan"; then
-    die "baseline query is not a $primary_segment_count-primary GpuScan"
+    die "baseline query is not a $primary_segment_count-primary $expected_custom_scan"
 fi
 
 cpu_signature=$("${psql_cmd[@]}" -Atqc "
@@ -197,6 +239,7 @@ echo "Target postmaster: pid=$postmaster_pid datadir=$target_datadir"
 echo "Baseline signature: $gpu_signature"
 echo "Expected worker log pattern: $worker_pattern"
 echo "Fault signal: SIG$service_signal"
+echo "Operator under test: $operator_label"
 
 for ((cycle = 1; cycle <= recovery_cycles; cycle++)); do
     old_service_pid=$(find_gpu_service_pid || true)
@@ -258,6 +301,23 @@ for ((cycle = 1; cycle <= recovery_cycles; cycle++)); do
         die "cycle $cycle: service restarted but signature did not recover: expected=$cpu_signature actual=$recovered_signature"
     fi
 
+    idle_deadline=$((SECONDS + recovery_timeout))
+    services_idle=f
+    while (( SECONDS < idle_deadline )); do
+        services_idle=$("${psql_cmd[@]}" -Atqc "
+            SELECT coalesce(bool_and(ready AND
+                                     actual_workers = configured_workers AND
+                                     active_clients = 0 AND
+                                     queued_commands = 0 AND
+                                     active_commands = 0), false)
+            FROM pgstrom.gpu_service_status_segments();" 2>/dev/null || true)
+        [[ $services_idle == t ]] && break
+        sleep 0.1
+    done
+    if [[ $services_idle != t ]]; then
+        die "cycle $cycle: GPU Service clients or commands did not drain after recovery"
+    fi
+
     new_generation=$("${psql_cmd[@]}" -Atqc "
         SELECT min(service_generation)
         FROM pgstrom.gpu_service_status_segments()
@@ -298,4 +358,4 @@ for ((cycle = 1; cycle <= recovery_cycles; cycle++)); do
     echo "cycle $cycle/$recovery_cycles: pid $old_service_pid -> $new_service_pid, status generation $old_generation -> $new_generation$generation_note, worker logs $old_worker_logs -> $new_worker_logs, signature recovered"
 done
 
-echo "GPU Service SIG$service_signal failure propagation and recovery passed for $recovery_cycles cycles on content $target_content."
+echo "$operator_label GPU Service SIG$service_signal failure propagation and recovery passed for $recovery_cycles cycles on content $target_content."
