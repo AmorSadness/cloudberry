@@ -147,8 +147,17 @@ for ((i=1; i<=client_count; i++)); do
         fi
         successes=$((successes + 1))
     else
+        error_text=$(tr '\n' ' ' <"$run_dir/client.$i.err")
         failures=$((failures + 1))
-        echo "client $i was rejected or failed: $(tr '\n' ' ' <"$run_dir/client.$i.err")"
+        echo "client $i was rejected: $error_text"
+        if grep -q 'CUDA_ERROR_OUT_OF_MEMORY' "$run_dir/client.$i.err"; then
+            echo "client $i reached a real CUDA OOM instead of being stopped by shared-budget admission" >&2
+            exit 1
+        fi
+        if ! grep -q 'shared GPU budget admission rejected' "$run_dir/client.$i.err"; then
+            echo "client $i failed for a reason other than shared-budget admission" >&2
+            exit 1
+        fi
     fi
 done
 pids=()

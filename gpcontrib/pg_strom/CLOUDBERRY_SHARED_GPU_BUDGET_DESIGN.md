@@ -188,6 +188,11 @@ ALTER EXTENSION pg_strom UPDATE TO '6.2';
 6. 最终要求 queue/active/client 排空、reservation 回到基线，并执行 M1–M4a 与
    M3 全量回归。
 
+预算超时必须通过 XPU error 通道报告
+`shared GPU budget admission rejected`。该错误发生在 CUDA allocation 之前，不得
+伪装为 `CUDA_ERROR_OUT_OF_MEMORY`；并发 runner 一旦观察到真实 CUDA OOM 或其他
+非预算错误，必须判定验收失败。
+
 并发主路径 runner：
 
 ```sh

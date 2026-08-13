@@ -31,7 +31,7 @@
 typedef struct
 {
 	pid_t		owner_pid;
-	uint32_t	waiting;
+	uint32_t	waiters;
 	uint64_t	owner_start_time;
 	uint64_t	budget_bytes;
 	uint64_t	reserved_bytes;
@@ -202,6 +202,7 @@ typedef struct
 static __thread gpuContext		*GpuWorkerCurrentContext = NULL;
 static __thread bool			GpuWorkerCommandFailed = false;
 static __thread bool			GpuWorkerCommandCancelled = false;
+static __thread bool			GpuQueryBufferAllocBudgetRejected = false;
 #define MY_DINDEX_PER_THREAD	(GpuWorkerCurrentContext->cuda_dindex)
 #define MY_DEVICE_PER_THREAD	(GpuWorkerCurrentContext->cuda_device)
 #define MY_CONTEXT_PER_THREAD	(GpuWorkerCurrentContext->cuda_context)
@@ -1545,8 +1546,8 @@ gpuSharedBudgetSweep(gpuSharedBudgetState *state,
 			 observed_start_time != owner->owner_start_time))
 		{
 			reclaimed += owner->reserved_bytes;
-			if (owner->waiting && state->waiters > 0)
-				state->waiters--;
+			if (owner->waiters > 0)
+				state->waiters -= Min(state->waiters, owner->waiters);
 			memset(owner, 0, sizeof(*owner));
 			state->stale_reclaims++;
 			continue;
@@ -1718,7 +1719,8 @@ gpuSharedBudgetReserve(gpuContext *gcontext, size_t bytesize)
 			if (waited)
 			{
 				state->waiters--;
-				owner->waiting = 0;
+				Assert(owner->waiters > 0);
+				owner->waiters--;
 			}
 			gpuSharedBudgetPublish(gcontext, effective, reserved);
 			pthread_mutex_unlock(&state->mutex);
@@ -1734,7 +1736,8 @@ gpuSharedBudgetReserve(gpuContext *gcontext, size_t bytesize)
 			if (waited)
 			{
 				state->waiters--;
-				owner->waiting = 0;
+				Assert(owner->waiters > 0);
+				owner->waiters--;
 			}
 			gpuSharedBudgetPublish(gcontext, effective, reserved);
 			pthread_mutex_unlock(&state->mutex);
@@ -1744,7 +1747,7 @@ gpuSharedBudgetReserve(gpuContext *gcontext, size_t bytesize)
 		{
 			state->waiters++;
 			state->wait_events++;
-			owner->waiting = 1;
+			owner->waiters++;
 			waited = true;
 		}
 		pthread_mutex_unlock(&state->mutex);
@@ -1791,8 +1794,9 @@ gpuSharedBudgetDetach(gpuContext *gcontext)
 		if (budget->owner_slot >= 0 &&
 			state->owners[budget->owner_slot].owner_pid == MyProcPid)
 		{
-			if (state->owners[budget->owner_slot].waiting && state->waiters > 0)
-				state->waiters--;
+			if (state->owners[budget->owner_slot].waiters > 0)
+				state->waiters -= Min(state->waiters,
+								 state->owners[budget->owner_slot].waiters);
 			memset(&state->owners[budget->owner_slot], 0,
 				   sizeof(state->owners[budget->owner_slot]));
 		}
@@ -2090,10 +2094,12 @@ allocGpuQueryBuffer(gpuQueryBuffer *gq_buf,
 	CUdeviceptr	m_devptr;
 	CUresult	rc;
 
+	GpuQueryBufferAllocBudgetRejected = false;
 	if (!__enlargeGpuQueryBuffer(gq_buf))
 		return CUDA_ERROR_OUT_OF_MEMORY;
 	if (!gpuSharedBudgetReserve(GpuWorkerCurrentContext, bytesize))
 	{
+		GpuQueryBufferAllocBudgetRejected = true;
 		__gsInfo("shared GPU budget rejected query buffer (kind=%c, sz=%s)",
 				 gqbuf_kind, format_bytesz(bytesize));
 		return CUDA_ERROR_OUT_OF_MEMORY;
@@ -2117,6 +2123,14 @@ allocGpuQueryBuffer(gpuQueryBuffer *gq_buf,
 			 (void *)m_devptr, gqbuf_kind, format_bytesz(bytesize));
 
 	return CUDA_SUCCESS;
+}
+
+static const char *
+gpuQueryBufferAllocError(CUresult rc)
+{
+	if (GpuQueryBufferAllocBudgetRejected)
+		return "shared GPU budget admission rejected query buffer";
+	return cuStrError(rc);
 }
 
 static void
@@ -2349,7 +2363,7 @@ __setupGpuJoinPinnedInnerBufferPartitioned(gpuClient *gclient,
 		if (rc != CUDA_SUCCESS)
 		{
 			gpuClientELog(gclient, "failed on allocGpuQueryBuffer(sz=%lu): %s",
-						  kds_head->length, cuStrError(rc));
+						  kds_head->length, gpuQueryBufferAllocError(rc));
 			return false;
 		}
 		memcpy((void *)m_kds_in, kds_head, KDS_HEAD_LENGTH(kds_head));
@@ -2527,7 +2541,7 @@ __setupGpuJoinPinnedInnerBufferReconstruct(gpuClient *gclient,
 	if (rc != CUDA_SUCCESS)
 	{
 		gpuClientELog(gclient, "failed on allocGpuQueryBuffer(sz=%lu): %s",
-					  kds_head->length, cuStrError(rc));
+					  kds_head->length, gpuQueryBufferAllocError(rc));
 		return false;
 	}
 	memcpy((void *)m_kds_in, kds_head, KDS_HEAD_LENGTH(kds_head));
@@ -2862,7 +2876,7 @@ __setupGpuQueryJoinInnerBuffer(gpuClient *gclient,
 	if (rc != CUDA_SUCCESS)
 	{
 		gpuClientELog(gclient, "failed on cuMemAllocManaged: %s",
-					  cuStrError(rc));
+					  gpuQueryBufferAllocError(rc));
 		goto error;
 	}
 	memcpy(m_kmrels, h_kmrels, mmap_sz);
@@ -2995,8 +3009,13 @@ __setupGpuQueryFinalResultsBuffer(gpuClient *gclient,
 		if (rc != CUDA_SUCCESS)
 		{
 			gpuContextSwitchTo(__gcontext_prev);
-			gpuClientELog(gclient, "failed on cuMemAllocManaged(%zu): %s",
-						  kds_final_head->length, cuStrError(rc));
+			if (GpuQueryBufferAllocBudgetRejected)
+				gpuClientELog(gclient,
+							  "shared GPU budget admission rejected query buffer (kind=%c, bytes=%zu)",
+							  kind, kds_final_head->length);
+			else
+				gpuClientELog(gclient, "failed on cuMemAllocManaged(%zu): %s",
+							  kds_final_head->length, cuStrError(rc));
 			releaseGpuQueryBufferAll(gq_buf);
 			return false;
 		}
@@ -3043,7 +3062,7 @@ __expandGpuQueryGroupByBuffer(gpuClient *gclient,
 		{
 			pthreadRWLockUnlock(&gq_buf->m_kds_rwlock);
 			gpuClientELog(gclient,
-						  "shared GPU budget rejected GpuPreAgg expansion (%lu bytes)",
+						  "shared GPU budget admission rejected GpuPreAgg expansion (bytes=%lu)",
 						  length);
 			return false;
 		}
@@ -3148,7 +3167,7 @@ __expandGpuQueryScanJoinBuffer(gpuClient *gclient,
 		if (rc != CUDA_SUCCESS)
 		{
 			gpuClientELog(gclient, "failed on allocGpuQueryBuffer: %s",
-						  cuStrError(rc));
+						  gpuQueryBufferAllocError(rc));
 			goto out;
 		}
 		/* assign a new empty KDS */
@@ -5309,7 +5328,7 @@ gpuservMergeGpuJoinFinalBufferOne(gpuClient *gclient,
 	if (rc != CUDA_SUCCESS)
 	{
 		gpuClientELog(gclient, "failed on allocGpuQueryBuffer(%s): %s",
-					  format_bytesz(length), cuStrError(rc));
+					  format_bytesz(length), gpuQueryBufferAllocError(rc));
 		return NULL;
 	}
 	kds_final = (kern_data_store *)m_devptr;
@@ -5538,7 +5557,7 @@ gpuservMergeGpuJoinFinalBufferMulti(gpuClient *gclient,
 		if (rc != CUDA_SUCCESS)
 		{
 			gpuClientELog(gclient, "failed on allocGpuQueryBuffer(%s): %s",
-						  format_bytesz(kds_final_length), cuStrError(rc));
+						  format_bytesz(kds_final_length), gpuQueryBufferAllocError(rc));
 			return false;
 		}
 		__kds = (kern_data_store *)m_devptr;

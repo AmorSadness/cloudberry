@@ -511,7 +511,9 @@ PGSTROM_SHARED_BUDGET_CLIENTS=3 \
 The runner requires a real GpuPreAgg plan, continuously checks
 `shared_reserved_bytes <= shared_budget_bytes`, compares every successful
 query with the CPU baseline, and correlates failed clients with the rejection
-counter.  To make rejection a mandatory acceptance result, use
+counter.  Expected failures must explicitly report shared-budget admission
+rejection; a real `CUDA_ERROR_OUT_OF_MEMORY` makes the runner fail.  To make
+rejection a mandatory acceptance result, use
 `PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION=1`; increase the client count if the
 queries do not overlap long enough.  Status can be inspected directly with:
 
