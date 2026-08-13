@@ -1686,18 +1686,27 @@ cloudberry_gpupreagg_query_supported(PlannerInfo *root,
 	Query	   *parse = root->parse;
 	cloudberry_gpupreagg_walker_context context;
 
-	if (optimizer ||
-		upper_stage != UPPERREL_GROUP_AGG ||
-		!parse->hasAggs ||
-		parse->groupingSets != NIL ||
-		parse->distinctClause != NIL ||
-		extra == NULL ||
-		extra->patype != PARTITIONWISE_AGGREGATE_NONE ||
-		input_rel->reloptkind != RELOPT_BASEREL ||
-		input_rel->relid <= 0 ||
+	if (optimizer || upper_stage != UPPERREL_GROUP_AGG || !parse->hasAggs ||
+		parse->groupingSets != NIL || parse->distinctClause != NIL ||
+		extra == NULL || extra->patype != PARTITIONWISE_AGGREGATE_NONE ||
+		input_rel->reloptkind != RELOPT_BASEREL || input_rel->relid <= 0 ||
 		input_rel->cdbpolicy == NULL ||
 		!GpPolicyIsPartitioned(input_rel->cdbpolicy))
+	{
+		if (parse->havingQual != NULL)
+			elog(DEBUG1,
+				 "Cloudberry GpuPreAgg HAVING rejected by query guard "
+				 "(optimizer=%d stage=%d hasAggs=%d groupingSets=%d distinct=%d "
+				 "extra=%d patype=%d reloptkind=%d relid=%u policy=%d partitioned=%d)",
+				 optimizer, upper_stage, parse->hasAggs,
+				 parse->groupingSets != NIL, parse->distinctClause != NIL,
+				 extra != NULL, extra ? extra->patype : -1,
+				 input_rel->reloptkind, input_rel->relid,
+				 input_rel->cdbpolicy != NULL,
+				 input_rel->cdbpolicy != NULL &&
+				 GpPolicyIsPartitioned(input_rel->cdbpolicy));
 		return false;
+	}
 
 	memset(&context, 0, sizeof(context));
 	(void) expression_tree_walker((Node *)parse->targetList,
@@ -1707,7 +1716,18 @@ cloudberry_gpupreagg_query_supported(PlannerInfo *root,
 		(void) expression_tree_walker((Node *)parse->havingQual,
 									  cloudberry_gpupreagg_walker,
 									  &context);
-	return context.found_aggregate && !context.unsupported;
+	if (!context.found_aggregate || context.unsupported)
+	{
+		if (parse->havingQual != NULL)
+			elog(DEBUG1,
+				 "Cloudberry GpuPreAgg HAVING rejected by aggregate whitelist "
+				 "(found=%d unsupported=%d)",
+				 context.found_aggregate, context.unsupported);
+		return false;
+	}
+	if (parse->havingQual != NULL)
+		elog(DEBUG1, "Cloudberry GpuPreAgg HAVING passed query eligibility");
+	return true;
 }
 #endif
 
@@ -2961,11 +2981,29 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 	con.inner_target_list = inner_target_list;
 	/* construction of the target-list for each level */
 	if (!xpugroupby_build_path_target(&con))
+	{
+#ifdef GP_VERSION_NUM
+		if (parse->havingQual != NULL)
+			elog(DEBUG1, "Cloudberry GpuPreAgg HAVING target rewrite rejected");
+#endif
 		return;
+	}
 	/* build GpuPreAgg path */
 	cpath = __buildXpuPreAggCustomPath(&con);
 	if (!cpath)
+	{
+#ifdef GP_VERSION_NUM
+		if (parse->havingQual != NULL)
+			elog(DEBUG1, "Cloudberry GpuPreAgg HAVING path construction rejected");
+#endif
 		return;
+	}
+#ifdef GP_VERSION_NUM
+	if (parse->havingQual != NULL)
+		elog(DEBUG1,
+			 "Cloudberry GpuPreAgg HAVING path constructed (collocated=%d local_groups=%.0f)",
+			 con.groupby_collocated, con.num_groups);
+#endif
 
 	/* Agg(CPU) [+ Gather] + GpuPreAgg,
 	 * If CPU fallback may happen, because a part of results are kept in
