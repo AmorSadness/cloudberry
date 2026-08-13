@@ -48,6 +48,7 @@ feature_settings="
  SET pg_strom.cpu_fallback=off;
  SET enable_seqscan=off;
  SET enable_hashagg=off;
+ SET enable_sort=off;
  SET gp_enable_multiphase_agg=off;
  SET pg_strom.gpu_setup_cost=0;
  SET pg_strom.gpu_tuple_cost=0;
@@ -59,8 +60,8 @@ feature_settings="
 # Keep one normal-cost observation for planner diagnostics.  HAVING support is
 # a correctness/placement milestone; it does not require every legal shape to
 # beat native HashAggregate, especially for colocated groups with no Motion to
-# eliminate.  The correctness settings disable the native HashAggregate
-# candidate; PG-Strom's explicitly constructed CPU final HashAggregate remains
+# eliminate.  The correctness settings disable native HashAggregate and Sort
+# candidates; PG-Strom's explicitly constructed CPU final HashAggregate remains
 # part of the GpuPreAgg path and is the node whose HAVING semantics are tested.
 normal_settings="
  SET optimizer=off;

@@ -94,8 +94,9 @@ HAVING 增加的 final aggregate 工作可能使原生 HashAggregate 在普通�
 尤其是共置 GROUP BY 没有 Motion 可消除时。本里程碑验证合法路径、执行位置和结果
 语义，不承诺所有 HAVING 形状自动选 GPU。因此所有正向语义用例使用与历史 MVP
 一致、明确标注的 correctness-only 成本；runner 另行打印普通成本计划选择作为诊断，
-但不把它作为完成门槛。correctness-only 会关闭原生 HashAggregate 候选；PG-Strom
-显式创建的 CPU final HashAggregate 仍保留，用于验证 HAVING Filter 的真实执行语义。
+但不把它作为完成门槛。correctness-only 会关闭原生 HashAggregate 和 Sort 候选；
+PG-Strom 显式创建的 CPU final HashAggregate 仍保留，用于验证 HAVING Filter 的
+真实执行语义。
 
 执行命令：
 

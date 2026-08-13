@@ -524,8 +524,8 @@ Positive HAVING cases use explicitly labeled correctness-only costs to expose
 the legal path; this milestone validates replacement, placement and semantics,
 not automatic selection for every HAVING shape.  The runner also prints the
 ordinary-cost colocated choice as a non-failing diagnostic.  The correctness
-settings disable the native HashAggregate candidate while retaining the CPU
-final HashAggregate explicitly attached to GpuPreAgg.  FILTER, DISTINCT and
+settings disable native HashAggregate and Sort candidates while retaining the
+CPU final HashAggregate explicitly attached to GpuPreAgg.  FILTER, DISTINCT and
 numeric HAVING aggregates must retain native plans.  See
 `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`.
 
