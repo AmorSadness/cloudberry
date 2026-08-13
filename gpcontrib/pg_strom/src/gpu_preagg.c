@@ -72,6 +72,63 @@ pgstrom_is_gpupreagg_state(const PlanState *ps)
 }
 
 /*
+ * estimateGpuPreAggFinalBufferSize
+ *
+ * Keep planner accounting and the executor's initial KDS allocation on the
+ * same formula.  A grouped GpuPreAgg buffer contains a hash-slot array, a
+ * row-index/lock area, and room for twice the estimated number of tuples so
+ * that the GPU can build and merge partial states.  The one-GiB minimum and
+ * the four-MiB no-group buffer are existing executor allocation rules.
+ *
+ * SIZE_MAX means that the estimate cannot be represented by the KDS format or
+ * by size_t.  In particular, kern_data_store.hash_nslots is only 32 bits.
+ */
+size_t
+estimateGpuPreAggFinalBufferSize(size_t head_sz,
+								 int nattrs,
+								 int tuple_width,
+								 double final_nrows,
+								 bool hash_format)
+{
+	uint64		nitems;
+	uint64		nslots;
+	size_t		unitsz;
+	size_t		slot_bytes;
+	size_t		tuple_bytes;
+	size_t		length;
+
+	Assert(head_sz > 0);
+	Assert(nattrs >= 0);
+	Assert(tuple_width >= 0);
+	if (!hash_format)
+		return (4UL << 20);
+	if (!isfinite(final_nrows) || final_nrows < 0.0 ||
+		final_nrows > (double)UINT_MAX)
+		return SIZE_MAX;
+
+	nitems = (uint64)ceil(Max(final_nrows, 1.0));
+	nslots = KDS_GET_HASHSLOT_WIDTH(nitems);
+	if (nslots > UINT_MAX)
+		return SIZE_MAX;
+	unitsz = (MAXALIGN(offsetof(kern_hashitem, t.t_bits) +
+						 BITMAPLEN(nattrs)) +
+			  MAXALIGN((size_t)tuple_width + ROWID_SIZE));
+	if (pg_mul_size_overflow(sizeof(uint64), (size_t)nslots,
+						  &slot_bytes) ||
+		pg_mul_size_overflow(unitsz, (size_t)nslots, &tuple_bytes) ||
+		pg_mul_size_overflow(tuple_bytes, 2, &tuple_bytes) ||
+		pg_mul_size_overflow(slot_bytes, 3, &slot_bytes) ||
+		pg_add_size_overflow(head_sz, slot_bytes, &length) ||
+		pg_add_size_overflow(length, tuple_bytes, &length))
+		return SIZE_MAX;
+	if (length < (1UL << 30))
+		return (1UL << 30);
+	if (length > SIZE_MAX - 1023)
+		return SIZE_MAX;
+	return TYPEALIGN(1024, length);
+}
+
+/*
  * List of supported aggregate functions
  */
 typedef struct
@@ -2333,9 +2390,14 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	double		input_nrows = PP_INFO_NUM_ROWS(pp_info);
 	double		num_group_keys;
 	double		xpu_ratio;
+	double		dma_width_factor;
 	Cost		xpu_operator_cost;
 	Cost		xpu_tuple_cost;
 	const CustomPathMethods *xpu_cpath_methods;
+#ifdef GP_VERSION_NUM
+	size_t		final_buffer_per_device;
+	EstimatedBytes final_buffer_per_qe;
+#endif
 
 	/*
 	 * Parameters related to devices
@@ -2364,7 +2426,7 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	else
 		pp_info->xpu_task_flags |= (DEVTASK__PREAGG | DEVTASK__PINNED_ROW_RESULTS);
 	pp_info->sibling_param_id = con->sibling_param_id;
-	/* TODO: more precise cost factors */
+	/* Result cardinality here is the number of partial rows produced per QE. */
 	pp_info->final_nrows = con->num_groups;
 
 	/* No tuples shall be generated until child JOIN/SCAN path completion */
@@ -2379,10 +2441,51 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	/* Cost estimation for aggregate function */
 	pp_info->startup_cost += (target_partial->cost.per_tuple * input_nrows +
 							  target_partial->cost.startup) * xpu_ratio;
-	/* Cost for DMA receive (xPU --> Host) */
+	/*
+	 * Cost for partial-state materialization and DMA receive (xPU --> Host).
+	 * Motion and CPU final aggregation are costed by the standard Cloudberry
+	 * paths built in try_add_final_groupby_paths(), so do not duplicate them.
+	 */
+	dma_width_factor = Max((double)target_partial->width / 64.0, 1.0);
 	pp_info->run_cost = (con->target_partial->cost.per_tuple +
-						 xpu_tuple_cost) * con->num_groups / pp_info->parallel_divisor;
+						 xpu_tuple_cost * dma_width_factor) *
+						con->num_groups / pp_info->parallel_divisor;
 	pp_info->final_cost = 0.0;
+
+#ifdef GP_VERSION_NUM
+	{
+		size_t		head_sz;
+		bool		hash_format = (parse->groupClause != NIL ||
+								   parse->distinctClause != NIL);
+		size_t		device_memory = GetGpuMinimalDeviceMemorySize();
+
+		head_sz = MAXALIGN(offsetof(kern_data_store, colmeta) +
+						   sizeof(kern_colmeta) *
+						   list_length(target_partial->exprs));
+		final_buffer_per_device = estimateGpuPreAggFinalBufferSize(
+										 head_sz,
+										 list_length(target_partial->exprs),
+										 target_partial->width,
+										 con->num_groups,
+										 hash_format);
+		if (final_buffer_per_device == SIZE_MAX ||
+			device_memory == 0 || final_buffer_per_device > device_memory)
+		{
+			elog(DEBUG1,
+				 "Cloudberry GpuPreAgg disabled by final-buffer estimate "
+				 "(local groups: %.0f, width: %d, buffer: %s, device: %s)",
+				 con->num_groups,
+				 target_partial->width,
+				 final_buffer_per_device == SIZE_MAX
+				 ? "unrepresentable"
+				 : format_bytesz(final_buffer_per_device),
+				 format_bytesz(device_memory));
+			return NULL;
+		}
+		final_buffer_per_qe = (EstimatedBytes)final_buffer_per_device *
+							  Max(numGpuDevAttrs, 1);
+	}
+#endif
 
 	cpath->path.pathtype         = T_CustomScan;
 	cpath->path.parent           = con->input_rel;
@@ -2396,7 +2499,12 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	cpath->path.total_cost       = (pp_info->startup_cost +
 										pp_info->run_cost +
 										pp_info->final_cost);
-	cpath->path.memory           = 0;
+	cpath->path.memory           =
+#ifdef GP_VERSION_NUM
+		final_buffer_per_qe;
+#else
+		0;
+#endif
 #ifdef GP_VERSION_NUM
 	/*
 	 * Partial rows stay on their source Segments, but the partial target may
@@ -2677,15 +2785,39 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 
 		groupExprs = get_sortgrouplist_exprs(parse->groupClause,
 											 gp_extra->targetList);
-		num_groups = estimate_num_groups(root, groupExprs,
-										 op_leaf->leaf_nrows,
-										 NULL, NULL);
 #ifdef GP_VERSION_NUM
-		/* RelOptInfo rows are global; Path rows above are per QE. */
+		CdbPathLocus input_locus;
+		List   *group_tles = NIL;
+
+		/*
+		 * RelOptInfo statistics and NDV are global.  Estimate global groups
+		 * once, then derive the expected groups present on each QE from the
+		 * input locus and the already per-QE GpuScan rows.
+		 */
 		final_num_groups = estimate_num_groups(root, groupExprs,
 										   input_rel->rows,
 										   NULL, NULL);
+		input_locus = cdbpathlocus_from_baserel(root,
+										 input_rel,
+										 op_leaf->pp_info->parallel_nworkers);
+		get_sortgroupclauses_tles(parse->groupClause,
+								  gp_extra->targetList,
+								  &group_tles, NULL, NULL);
+		if (cdbpathlocus_collocates_tlist(root, input_locus, group_tles))
+		{
+			double		numsegments = CdbPathLocus_NumSegments(input_locus);
+
+			num_groups = clamp_row_est(Min(op_leaf->leaf_nrows,
+											  final_num_groups / numsegments));
+		}
+		else
+			num_groups = estimate_num_groups_on_segment(final_num_groups,
+												 op_leaf->leaf_nrows,
+												 input_locus);
 #else
+		num_groups = estimate_num_groups(root, groupExprs,
+										 op_leaf->leaf_nrows,
+										 NULL, NULL);
 		final_num_groups = num_groups;
 #endif
 	}
@@ -2730,6 +2862,8 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 		return;
 	/* build GpuPreAgg path */
 	cpath = __buildXpuPreAggCustomPath(&con);
+	if (!cpath)
+		return;
 
 	/* Agg(CPU) [+ Gather] + GpuPreAgg,
 	 * If CPU fallback may happen, because a part of results are kept in

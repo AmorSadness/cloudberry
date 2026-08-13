@@ -59,8 +59,19 @@ partial rows through a real Cloudberry Motion, and uses one CPU final aggregate
 to merge groups across Segments.  Its first whitelist is count/sum/min/max on
 integer and floating-point inputs; mixed quals, numeric, FILTER, HAVING,
 DISTINCT aggregates, partitionwise aggregation and GPU-Sort retain native
-plans.  Source and acceptance assets are complete, but real GPU M1/M2/M3
-acceptance remains pending; see `CLOUDBERRY_GPUPREAGG_MVP_DESIGN.md`.
+plans.  Source and acceptance assets are complete.  Real dual-Primary GPU
+M1/M2/M3 acceptance and the post-failure full regression completed on
+2026-08-10; see `CLOUDBERRY_GPUPREAGG_MVP_DESIGN.md`.
+
+The M4a planner now estimates global groups once and derives expected local
+groups per QE from the input locus.  Local groups drive partial-row/DMA cost
+and a shared planner/executor final-buffer sizing formula; the resulting
+per-QE GPU memory estimate is carried in `Path.memory`, oversized buffers fall
+back before path creation, and `EXPLAIN` reports estimated versus actual
+final-buffer use.  Cloudberry's native Motion and CPU aggregate paths continue
+to own their respective costs.  These estimates are structural safeguards,
+not benchmark-calibrated performance claims, especially while all demo
+postmasters share one GPU.
 
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.

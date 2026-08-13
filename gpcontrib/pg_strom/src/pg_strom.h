@@ -32,6 +32,7 @@
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
 #ifdef GP_VERSION_NUM
+#include "cdb/cdbgroup.h"
 #include "catalog/gp_distribution_policy.h"
 #include "cdb/cdbpath.h"
 #include "cdb/cdbpathlocus.h"
@@ -961,6 +962,11 @@ extern bool		pgstrom_enable_gpusort;
 extern bool		pgstrom_is_gpupreagg_path(const Path *path);
 extern bool		pgstrom_is_gpupreagg_plan(const Plan *plan);
 extern bool		pgstrom_is_gpupreagg_state(const PlanState *ps);
+extern size_t	estimateGpuPreAggFinalBufferSize(size_t head_sz,
+											 int nattrs,
+											 int tuple_width,
+											 double final_nrows,
+											 bool hash_format);
 extern void		xpupreagg_add_custompath(PlannerInfo *root,
 										 RelOptInfo *input_rel,
 										 RelOptInfo *group_rel,

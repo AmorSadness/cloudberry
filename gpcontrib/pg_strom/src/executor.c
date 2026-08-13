@@ -821,21 +821,18 @@ pgstromBuildSessionInfo(pgstromTaskState *pts,
 			}
 			else if ((pts->xpu_task_flags & DEVTASK__PINNED_HASH_RESULTS) != 0)
 			{
-				uint64_t	nslots = KDS_GET_HASHSLOT_WIDTH(pp_info->final_nrows);
-				size_t		length;
-				size_t		unitsz;
+				uint64_t	nslots;
+				size_t		length = estimateGpuPreAggFinalBufferSize(
+											 head_sz,
+											 kds_dst_tdesc->natts,
+											 pts->css.ss.ps.plan->plan_width,
+											 pp_info->final_nrows,
+											 true);
 
-				unitsz = (MAXALIGN(offsetof(kern_hashitem, t.t_bits) +
-								   BITMAPLEN(kds_dst_tdesc->natts)) +
-						  MAXALIGN(pts->css.ss.ps.plan->plan_width + ROWID_SIZE));
-				length = (head_sz +
-						  sizeof(uint64_t) * nslots +
-						  sizeof(uint64_t) * 2 * nslots +
-						  unitsz * 2 * nslots);
-				if (length < (1UL<<30))
-					length = (1UL<<30);		/* 1G at least */
-				else
-					length = TYPEALIGN(1024, length);
+				if (length == SIZE_MAX)
+					elog(ERROR, "GpuPreAgg final-buffer estimate is too large");
+				nslots = KDS_GET_HASHSLOT_WIDTH((uint64)ceil(Max(pp_info->final_nrows,
+																 1.0)));
 
 				kds_temp->length = length;
 				kds_temp->format = KDS_FORMAT_HASH;
@@ -2944,6 +2941,10 @@ pgstromExplainTaskState(CustomScanState *node,
 	if ((pp_info->xpu_task_flags & DEVTASK__PREAGG) != 0)
 	{
 		ListCell   *lc1, *lc2;
+		size_t		head_sz;
+		size_t		buffer_sz;
+		bool		hash_format = ((pp_info->xpu_task_flags &
+									 DEVTASK__PINNED_HASH_RESULTS) != 0);
 
 		resetStringInfo(&buf);
 		forboth (lc1, pp_info->groupby_actions,
@@ -2963,6 +2964,32 @@ pgstromExplainTaskState(CustomScanState *node,
 		snprintf(label, sizeof(label),
 				 "%s Group Key", xpu_label);
 		ExplainPropertyText(label, buf.data, es);
+
+		head_sz = MAXALIGN(offsetof(kern_data_store, colmeta) +
+						   sizeof(kern_colmeta) *
+						   list_length(cscan->custom_scan_tlist));
+		buffer_sz = estimateGpuPreAggFinalBufferSize(
+										 head_sz,
+										 list_length(cscan->custom_scan_tlist),
+										 cscan->scan.plan.plan_width,
+										 pp_info->final_nrows,
+										 hash_format);
+		resetStringInfo(&buf);
+		appendStringInfo(&buf, "local groups: %.0f, per-device final buffer: %s",
+						 pp_info->final_nrows,
+						 buffer_sz == SIZE_MAX
+						 ? "unrepresentable"
+						 : format_bytesz(buffer_sz));
+		if (numGpuDevAttrs > 1 && buffer_sz != SIZE_MAX)
+			appendStringInfo(&buf, ", per-QE total: %s on %d devices",
+							 format_bytesz(buffer_sz * numGpuDevAttrs),
+							 numGpuDevAttrs);
+		if (es->analyze && ps_state)
+			appendStringInfo(&buf, ", actual nitems: %lu, usage: %s, total: %s",
+							 pg_atomic_read_u64(&ps_state->final_nitems),
+							 format_bytesz(pg_atomic_read_u64(&ps_state->final_usage)),
+							 format_bytesz(pg_atomic_read_u64(&ps_state->final_total)));
+		ExplainPropertyText("GpuPreAgg Sizing", buf.data, es);
 	}
 
 	/*

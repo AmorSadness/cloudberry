@@ -5,7 +5,8 @@
 > `4d12ef415759dc48cd4c1421565e9c694b7bd3f9`  
 > 设计日期：2026-08-10  
 > 当前状态：Gather-only MVP 源码已实现，真实双 Primary GPU M1/M2 与 M3
-> cancel、SIGHUP、SIGKILL 验收及故障后的最终全量回归均已通过
+> cancel、SIGHUP、SIGKILL 验收及故障后的最终全量回归均已通过；M4a 结构化
+> 成本与内存估算源码已实现，当前无 GPU 环境，待真实 GPU 回归
 
 ## 1. 结论
 
@@ -331,6 +332,26 @@ Cloudberry `RelOptInfo` 的基础统计是全局值，Path rows 和运行成本�
 - startup cost：每个 QE 独立承担，不除以 Segment 数；
 - final-buffer 内存：按每 QE local groups 和 partial width 估算。
 
+M4a 的实现口径如下：
+
+- 先使用全局 `RelOptInfo.rows` 估算 global groups，再通过输入 locus、Segment 数
+  和已经按 QE 缩放的输入 rows 调用 `estimate_num_groups_on_segment()`，得到每 QE
+  local groups；若 GROUP BY keys 覆盖 hashed distribution keys，则按 Segment 数
+  分摊 global groups 并受每 QE input rows 上限约束；不再对全局 NDV 简单重复
+  执行一次 `estimate_num_groups()`；
+- GPU grouping/aggregate startup work 以每 QE input rows 计费，partial-state
+  materialization 和 DMA 以 local groups 计费；DMA 另按 partial tuple width 的
+  64-byte 单位作保守缩放。该宽度因子用于避免宽 partial state 与窄 state 同价，
+  仍需真实 benchmark 校准；
+- planner 与 executor 共用 `estimateGpuPreAggFinalBufferSize()`。GROUP BY hash
+  buffer 按 KDS header、hash slots、row-index/lock 区和 tuple area 估算，并保持
+  executor 既有的每设备最小 1GiB 分配；无 GROUP BY 保持每设备 4MiB；
+- `Path.memory` 记录所有可见 GPU 的每 QE final-buffer 总估算值。若单设备估算
+  无法由 KDS 32-bit slot 字段表示、发生 `size_t` 溢出，或超过最小可见设备的
+  物理显存，则不生成 GpuPreAgg path，安全回退原生聚合；
+- `EXPLAIN` 的 `GpuPreAgg Sizing` 显示 local groups 和每设备 buffer 估算；
+  `EXPLAIN ANALYZE` 还显示实际 final nitems、usage 和 total，供 GPU 回归校准。
+
 ### 8.2 Motion 与 CPU final 成本
 
 - Motion 输入 rows：各 QE partial rows 的全局合计；
@@ -340,6 +361,12 @@ Cloudberry `RelOptInfo` 的基础统计是全局值，Path rows 和运行成本�
 - final projection 和 HAVING：首版只有 projection，没有 HAVING；
 - Gather-only 的 bottleneck 成本必须保留，不能为了强制暴露 GpuPreAgg 而伪造
   低成本。
+
+M4a 不在扩展内重复计算上述两层成本：`cdbpath_create_motion_path()` 根据
+GpuPreAgg 每 QE partial rows、Segment 数和 partial target 建立 Gather Motion
+成本，随后 `create_agg_path()` 根据 Motion 的全局输出 rows 和 global groups
+计算 CPU final aggregate。这样避免扩展收费一次、Cloudberry 标准 Path 再收费
+一次。
 
 正确性验收可临时通过 planner GUC 或成本参数暴露合法 path，但文档和 runner
 必须明确这不证明 planner 会在默认成本下选择 GpuPreAgg，也不证明性能收益。
@@ -430,7 +457,17 @@ CustomScan mutation。如果实现中发现 extension hook 时点无法合法构
 - 故障验收完成后，既有多 Segment GpuScan 全量 runner 与 Gather-only GpuPreAgg
   M1/M2 runner 均再次通过。
 
-### M4：成本和性能探索
+### M4a：结构化成本与内存估算
+
+- 全局 groups 与每 QE local groups 使用 Cloudberry locus 语义分层估算；
+- partial 运算、宽度相关 DMA、Motion 和 CPU final 的成本责任清晰且不重复；
+- planner/executor 使用相同 final-buffer 公式，`Path.memory` 不再为零；
+- 无法表示或超过单设备物理显存的估算安全回退；
+- `EXPLAIN (ANALYZE)` 暴露估算和实际 final-buffer 指标；
+- 源码与静态验收已完成；因当前开发环境没有 GPU/CUDA Toolkit，真实 GPU
+  计划、结果与估算校准回归待执行。
+
+### M4b：成本校准和性能探索
 
 - 不再依赖强制 planner GUC 时，典型低基数组可以按成本选择 GpuPreAgg；
 - 比较明细 Motion rows 与 partial Motion rows；
@@ -521,5 +558,6 @@ GROUP BY grp;
 > ORCA、AO/AOCO、分区、mixed quals、HAVING、DISTINCT aggregate、numeric、
 > GpuSort、Redistribute final aggregation、多主机或性能承诺。
 
-在真实 GPU 完成上述出口之前，只能描述为“设计/实现中”，不能描述为已经支持
-Cloudberry GpuPreAgg。
+上述出口已于 2026-08-10 完成真实双 Primary GPU 验收及故障后全量
+回归。当前应使用上述对外描述，并继续保留“实验特性、默认关闭、
+无性能结论”以及其他明确的能力边界。

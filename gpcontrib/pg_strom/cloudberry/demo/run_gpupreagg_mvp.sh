@@ -96,6 +96,10 @@ require_gpupreagg_plan() {
         echo "$label does not show a CPU final aggregate above Motion" >&2
         exit 1
     fi
+    if ! grep -Eq 'GpuPreAgg Sizing.*local groups: [0-9]+.*per-device final buffer:' <<<"$plan"; then
+        echo "$label does not expose the M4a local-group/final-buffer estimate" >&2
+        exit 1
+    fi
     if grep -q 'GPU-Sort' <<<"$plan"; then
         echo "$label unexpectedly enabled GPU-Sort" >&2
         exit 1
