@@ -493,6 +493,11 @@ M4b 在单机共享 GPU 拓扑下由 P0 资源门前置。主机级预算、并�
 reclaim 及故障后 M1–M4a 全量回归；单机同用户/同 PID namespace 的资源门已通过，
 但不代表多主机协调或资源组公平性。
 
+扩展 6.3 进一步补齐静态 Service 配额和/安全余量诊断、planner-derived request
+追踪、GpuScan+GpuScan、GpuScan+GpuPreAgg 以及受控 allocation-failure rollback
+runner。该扩展矩阵代码和静态检查完成，真实 GPU 结果需单独记录后才并入上述
+P0a/P0b/P0c 完成结论。
+
 - 不再依赖强制 planner GUC 时，典型低基数组可以按成本选择 GpuPreAgg；
 - 比较明细 Motion rows 与 partial Motion rows；
 - 记录高基数组、倾斜和 GPU final-buffer 内存压力；

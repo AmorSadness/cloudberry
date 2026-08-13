@@ -8,6 +8,7 @@ max_worker_processes = 16
 # admission limit across all postmasters rather than a per-service allowance.
 # A request waits at most five seconds before failing explicitly.
 pg_strom.shared_gpu_budget_ratio = 0.20
+pg_strom.shared_gpu_safety_margin_ratio = 0.20
 pg_strom.shared_gpu_budget_timeout = '5s'
 pg_strom.gpu_mempool_segment_sz = '256MB'
 pg_strom.gpu_mempool_max_ratio = 0.20

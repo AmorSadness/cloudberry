@@ -2,9 +2,13 @@
 
 ## 1. 状态与完成定义
 
-实现状态：**已完成代码、静态检查和真实单机共享 GPU 验收**。验收于
+核心资源门状态：**已完成代码、静态检查和真实单机共享 GPU 验收**。验收于
 2026-08-13 在 1 coordinator + 2 Primary、三个 postmaster 共享一块 Tesla T4
 的环境完成。
+
+按 P0a/P0b/P0c 扩展清单补充的静态诊断、GpuScan 组合矩阵和受控 allocation
+failure 已完成代码与静态检查；新增 GPU 矩阵需要在安装 6.3 后执行，结果未记录
+前不把这些新增用例写成已完成的真实 GPU 验收。
 
 本 P0 面向当前可用拓扑：一个 coordinator 与多个 Primary Segment 位于同一
 主机，各 postmaster 启动独立 GPU Service，并共享同一块物理 GPU。它不依赖、
@@ -57,6 +61,18 @@ CUDA module/driver 内部开销及 GpuCache 的独立常驻 allocation 尚未统
 因此默认预算最多为物理显存的 80%，保留至少 20% 给驱动、context、kernel 和
 未纳入账目的开销。本 P0 是 PG-Strom Service allocation 的主机级硬门，不是
 Cloudberry resource group 的用户级公平调度器。
+
+### 3.1 P0a/P0b/P0c 对照
+
+- **P0a 静态主机预算**：账本统计同 GPU UUID 的 live Service；分别显示单
+  Service 配额、配额理论和、物理容量、安全余量、安全容量与超配状态。实际 gate
+  不超过 `physical - safety_margin`，理论配额和超限时 GPU Service 写 warning；
+- **P0b admission/backpressure**：M4a estimate 构造 session final-buffer，Service
+  按相同字节数申请额度；SQL 的 `last_request_bytes/max_request_bytes` 可核对申请，
+  不足时有界等待后安全失败，cancel/error/断连/SIGKILL 均释放或回收；
+- **P0c 并发验收**：既有多 GpuPreAgg、cancel、SIGKILL 用例之外，6.3 runner
+  新增 GpuScan+GpuScan、GpuScan+GpuPreAgg，以及 reservation 后、CUDA 前的受控
+  allocation failure，要求无泄漏、无部分结果且后续查询恢复。
 
 ## 4. 跨 postmaster 共享账本
 
@@ -119,12 +135,13 @@ buffer 在 query cleanup 路径释放。
 
 ## 6. 配置
 
-新增两个 SIGHUP 级 GUC；修改配置并 reload 后，GPU Service 按现有 SIGHUP 重启
+以下 SIGHUP 级 GUC 修改并 reload 后，GPU Service 按现有 SIGHUP 重启
 流程应用新值：
 
 | GUC | 默认值 | 范围 | 含义 |
 |---|---:|---:|---|
 | `pg_strom.shared_gpu_budget_ratio` | `0.80` | `0.10..0.95` | 每块物理 GPU 可供受控 PG-Strom allocation 使用的比例 |
+| `pg_strom.shared_gpu_safety_margin_ratio` | `0.20` | `0.05..0.80` | 为 CUDA context、module/fatbin、GpuCache 和未跟踪占用保留的主机比例 |
 | `pg_strom.shared_gpu_budget_timeout` | `5s` | `0..600s` | admission 最大等待时间；`0` 为立即拒绝 |
 
 单机多 Segment demo 使用更保守的 `0.20`，以便在共享 GPU 上验证 admission。
@@ -150,7 +167,7 @@ bounded wait 位于每客户端独立 monitor thread，不阻塞 GPU Service 主
 
 ## 8. SQL 可观测性与扩展升级
 
-扩展版本从 6.1 升为 6.2，`pgstrom.gpu_service_status` 新增：
+6.2 引入动态账本字段；6.3 继续增加静态预算和请求追踪字段：
 
 | 列 | 含义 |
 |---|---|
@@ -161,6 +178,13 @@ bounded wait 位于每客户端独立 monitor thread，不阻塞 GPU Service 主
 | `budget_rejections` | 等待超时或立即拒绝累计数 |
 | `budget_waits` | 至少等待过一次的 admission 累计数 |
 | `stale_reclaims` | 回收死亡 Service slot 的累计次数 |
+| `device_total_bytes` | 物理设备容量 |
+| `host_service_count` | 同用户、同 GPU UUID 的存活 Service 数 |
+| `service_budget_bytes` | 本 Service 发布的配置配额 |
+| `host_configured_budget_sum` | 所有 live Service 配额的理论和 |
+| `safety_margin_bytes` / `host_safe_capacity_bytes` | 静态安全余量及扣除后的容量 |
+| `budget_overcommitted` | 理论配额和是否超过安全容量 |
+| `last_request_bytes` / `max_request_bytes` | 本 Service 最近/最大 admission 请求 |
 
 同一物理 GPU 的 host-wide 数值会出现在多个 Segment 行中，这是有意的：每行仍以
 `content_id/postmaster_pid/service_pid` 标识本地 Service，而 host-wide 列应相同。
@@ -171,7 +195,7 @@ SQL C 函数直接锁定并读取 POSIX 账本，而不是只返回各 postmaste
 升级命令：
 
 ```sql
-ALTER EXTENSION pg_strom UPDATE TO '6.2';
+ALTER EXTENSION pg_strom UPDATE TO '6.3';
 ```
 
 ## 9. 验收计划
@@ -181,7 +205,7 @@ ALTER EXTENSION pg_strom UPDATE TO '6.2';
 - 共享键包含 euid 与 GPU UUID，mutex 为 process-shared robust；
 - pool allocation、query buffer 与 GpuPreAgg expansion 三条路径均先 reserve；
 - CUDA allocation/copy 失败路径回滚，新旧 buffer 替换后账目为新长度；
-- 扩展 6.1→6.2 SQL 与 C tuple descriptor 列数、顺序一致。
+- 扩展 6.1→6.2→6.3 SQL 与 C tuple descriptor 列数、顺序一致。
 
 真实 GPU 门：
 
@@ -206,6 +230,18 @@ PGSTROM_SHARED_BUDGET_CLIENTS=3 \
 PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION=1 \
 ./gpcontrib/pg_strom/cloudberry/demo/run_shared_gpu_budget.sh
 ```
+
+扩展 P0a/P0c 矩阵：
+
+```sh
+PGDATABASE=pgstrom_mvp \
+./gpcontrib/pg_strom/cloudberry/demo/run_shared_gpu_concurrency_matrix.sh
+```
+
+该 runner 要求静态预算不超配，分别并发执行 GpuScan+GpuScan 和
+GpuScan+GpuPreAgg，然后由仅限 superuser 的 6.3 SQL hook 在预算预留成功后注入
+一次 query-buffer allocation failure。注入不会调用 CUDA，不会主动耗尽整卡，
+但覆盖与真实 allocation failure 相同的 reservation rollback 和查询错误清理路径。
 
 ### 9.1 真实 GPU 验收记录
 
@@ -241,6 +277,7 @@ PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION=1 \
 - POSIX shared-memory 对象的协议升级需要运维确认旧 Service 已退出后清理旧对象；
 - 多主机模式天然按 GPU UUID/主机内核 shared memory 分开，仍需独立验收。
 
-P0 资源门已经完成真实并发、cancel、SIGKILL 和最终回归验收。后续优先级可转向
-M4b 成本校准和性能探索；多主机、资源组公平性、GpuCache 统一计费和跨 PID
-namespace 协调仍需分别设计与验收。
+P0 核心资源门已经完成真实多 GpuPreAgg、cancel、SIGKILL 和最终回归验收；6.3
+补齐 P0a 静态诊断和 P0c 组合/故障注入资产。新增矩阵在 GPU 环境通过后，才可将
+扩展清单的 P0a/P0b/P0c 全部标为真实 GPU 验收完成。多主机、资源组公平性、
+GpuCache 统一计费和跨 PID namespace 协调仍需分别设计与验收。

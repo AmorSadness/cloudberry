@@ -491,12 +491,14 @@ when Segment crash recovery recreated the shared-memory epoch.
 
 PG-Strom 6.2 adds one host-wide allocation budget per OS user and physical GPU
 UUID.  The demo configuration sets the total budget to 20% and a five-second
-admission timeout.  Install the new library/configuration on the coordinator
+admission timeout.  PG-Strom 6.3 adds static host-budget diagnostics, an
+explicit 20% safety margin, request tracking, and the combined concurrency
+matrix.  Install the new library/configuration on the coordinator
 and all Segment instances, restart or reload as required, then upgrade the
 extension metadata:
 
 ```sql
-ALTER EXTENSION pg_strom UPDATE TO '6.2';
+ALTER EXTENSION pg_strom UPDATE TO '6.3';
 ```
 
 Run the non-destructive concurrent admission check on an otherwise idle demo
@@ -538,3 +540,18 @@ and reservation returned to the 512MiB idle pool baseline.  The final M1--M4a
 matrix also passed and left the same baseline.  This completes P0 for the
 tested single-host topology; see `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md` for
 the remaining multi-host, fairness, accounting, and PID-namespace limits.
+
+After installing 6.3, run the remaining P0a/P0c matrix:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+./gpcontrib/pg_strom/cloudberry/demo/run_shared_gpu_concurrency_matrix.sh
+```
+
+It rejects a statically overcommitted configuration, verifies
+GpuScan+GpuScan and GpuScan+GpuPreAgg result pairs, and uses a superuser-only
+fault hook to fail a query-buffer allocation after reservation but before
+CUDA.  The injected query must return no partial result, reservations must
+return exactly to baseline, and a subsequent GpuPreAgg must match CPU.  The
+hook avoids deliberately exhausting the physical GPU while covering the same
+budget rollback and query cleanup path.

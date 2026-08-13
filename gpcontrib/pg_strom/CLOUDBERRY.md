@@ -86,8 +86,10 @@ The shared-GPU P0 implements host-wide GPU allocation admission for the actual
 single-host topology.  Independent coordinator/Segment GPU Services share
 a per-UID/per-GPU-UUID budget ledger; memory-pool segments, direct query
 buffers, and GpuPreAgg expansion peaks reserve before CUDA allocation and
-release on all normal cleanup paths.  Extension 6.2 exposes host/local
-reservation and admission counters in `pgstrom.gpu_service_status`.
+release on all normal cleanup paths.  Extension 6.3 exposes dynamic accounting,
+live Service count, per-Service/theoretical host quotas, explicit safety margin,
+overcommit state, and last/max admission requests in
+`pgstrom.gpu_service_status`.
 
 Real single-host shared-GPU acceptance completed on 2026-08-13.  A 24-client
 GpuPreAgg run produced successful CPU-matching queries plus explicit
@@ -98,6 +100,11 @@ reclamation advanced from zero to three, and reservations returned to the
 full.  This establishes allocation isolation for the tested single-host
 topology, not multi-host coordination, resource-group fairness, or a
 performance claim; see `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`.
+
+The 6.3 acceptance matrix also covers GpuScan+GpuScan,
+GpuScan+GpuPreAgg, and a superuser-only post-reservation allocation-failure
+injection.  These additions are code/static-check complete and require a fresh
+GPU run before the expanded P0a/P0b/P0c checklist is marked fully accepted.
 
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.
