@@ -7820,24 +7820,35 @@ PG_FUNCTION_INFO_V1(pgstrom_shared_gpu_budget_inject_oom);
 PUBLIC_FUNCTION(Datum)
 pgstrom_shared_gpu_budget_inject_oom(PG_FUNCTION_ARGS)
 {
-	int32		dindex = PG_GETARG_INT32(0);
-	int32		count = PG_GETARG_INT32(1);
+	FuncCallContext *fncxt;
 
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("superuser is required to inject a GPU allocation failure")));
-	if (!gpuserv_shared_state || dindex < 0 || dindex >= numGpuDevAttrs)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid GPU device index: %d", dindex)));
-	if (count < 0 || count > 1000)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("injected failure count must be between 0 and 1000")));
-	pg_atomic_write_u32(&gpuserv_shared_state->device_stats[dindex].test_inject_oom,
-						count);
-	PG_RETURN_VOID();
+	if (SRF_IS_FIRSTCALL())
+	{
+		int32		dindex = PG_GETARG_INT32(0);
+		int32		count = PG_GETARG_INT32(1);
+
+		fncxt = SRF_FIRSTCALL_INIT();
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("superuser is required to inject a GPU allocation failure")));
+		if (!gpuserv_shared_state || dindex < 0 || dindex >= numGpuDevAttrs)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid GPU device index: %d", dindex)));
+		if (count < 0 || count > 1000)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("injected failure count must be between 0 and 1000")));
+		pg_atomic_write_u32(&gpuserv_shared_state->device_stats[dindex].test_inject_oom,
+							count);
+		fncxt->user_fctx = (void *)(intptr_t)dindex;
+	}
+	fncxt = SRF_PERCALL_SETUP();
+	if (fncxt->call_cntr == 0)
+		SRF_RETURN_NEXT(fncxt,
+					Int32GetDatum((int32)(intptr_t)fncxt->user_fctx));
+	SRF_RETURN_DONE(fncxt);
 }
 
 /*

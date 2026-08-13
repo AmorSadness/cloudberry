@@ -50,17 +50,10 @@ SELECT * FROM pgstrom.gpu_service_status_local()
 UNION ALL
 SELECT * FROM pgstrom.gpu_service_status_segments();
 
-CREATE FUNCTION pgstrom.shared_gpu_budget_inject_oom_local(gpu_id int, count int)
-RETURNS void
-AS 'MODULE_PATHNAME', 'pgstrom_shared_gpu_budget_inject_oom'
-LANGUAGE C VOLATILE STRICT EXECUTE ON COORDINATOR;
-
 CREATE FUNCTION pgstrom.shared_gpu_budget_inject_oom_segments(gpu_id int, count int)
-RETURNS void
+RETURNS SETOF integer
 AS 'MODULE_PATHNAME', 'pgstrom_shared_gpu_budget_inject_oom'
 LANGUAGE C VOLATILE STRICT EXECUTE ON ALL SEGMENTS;
 
-REVOKE ALL ON FUNCTION pgstrom.shared_gpu_budget_inject_oom_local(int, int)
-FROM PUBLIC;
 REVOKE ALL ON FUNCTION pgstrom.shared_gpu_budget_inject_oom_segments(int, int)
 FROM PUBLIC;
