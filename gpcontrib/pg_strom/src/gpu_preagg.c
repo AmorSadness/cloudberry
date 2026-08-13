@@ -2788,6 +2788,8 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 #ifdef GP_VERSION_NUM
 		CdbPathLocus input_locus;
 		List   *group_tles = NIL;
+		List   *group_sortops = NIL;
+		List   *group_eqops = NIL;
 
 		/*
 		 * RelOptInfo statistics and NDV are global.  Estimate global groups
@@ -2802,7 +2804,9 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 										 op_leaf->pp_info->parallel_nworkers);
 		get_sortgroupclauses_tles(parse->groupClause,
 								  gp_extra->targetList,
-								  &group_tles, NULL, NULL);
+								  &group_tles,
+								  &group_sortops,
+								  &group_eqops);
 		if (cdbpathlocus_collocates_tlist(root, input_locus, group_tles))
 		{
 			double		numsegments = CdbPathLocus_NumSegments(input_locus);
