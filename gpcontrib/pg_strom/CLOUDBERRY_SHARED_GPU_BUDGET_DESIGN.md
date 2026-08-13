@@ -2,13 +2,15 @@
 
 ## 1. 状态与完成定义
 
-实现状态：**代码完成，静态验收待完成，真实 GPU 并发验收 pending**。
+实现状态：**已完成代码、静态检查和真实单机共享 GPU 验收**。验收于
+2026-08-13 在 1 coordinator + 2 Primary、三个 postmaster 共享一块 Tesla T4
+的环境完成。
 
 本 P0 面向当前可用拓扑：一个 coordinator 与多个 Primary Segment 位于同一
 主机，各 postmaster 启动独立 GPU Service，并共享同一块物理 GPU。它不依赖、
 也不证明多主机或每主机独立 GPU 的行为。
 
-只有同时满足以下条件，文档状态才可改为“真实 GPU 验收通过”：
+完成定义及本次验收结论如下：
 
 1. 两个以上 Segment 并发执行 GpuPreAgg 时，所有 GPU Service 看到相同的主机级
    `shared_budget_bytes`，且 `shared_reserved_bytes` 不超过该值；
@@ -18,6 +20,9 @@
 4. GPU Service 被 SIGKILL 后，其他 Service 能回收死进程账目并继续 admission，
    `stale_reclaims` 增长；
 5. M1–M4a、cancel 与 failure-recovery runner 最终回归通过。
+
+上述五项均已满足；本结论仅覆盖同一主机、同一 OS 用户、同一 PID namespace
+内的共享 GPU，不外推到多主机、容器跨 PID namespace、资源组公平性或性能收益。
 
 ## 2. 问题
 
@@ -202,6 +207,27 @@ PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION=1 \
 ./gpcontrib/pg_strom/cloudberry/demo/run_shared_gpu_budget.sh
 ```
 
+### 9.1 真实 GPU 验收记录
+
+验收配置为 `shared_gpu_budget_ratio=0.20`、timeout `5s`。Tesla T4 物理显存
+15360MiB，对外状态显示主机预算 2984MiB；idle 常驻 reservation 为 512MiB，
+两个 Segment 各 256MiB，coordinator 为 0。
+
+- 24 客户端并发 GpuPreAgg：3 个查询成功且与 CPU baseline 一致，21 个查询在
+  CUDA allocation 前收到明确的 `shared GPU budget admission rejected`；该轮
+  观察到 46 次 wait、27 次 rejection，没有真实 `CUDA_ERROR_OUT_OF_MEMORY`，
+  runner 输出 `shared GPU budget concurrent acceptance passed`；
+- query cancel 连续三轮通过；每轮精确取消目标 backend，所有 submission 进入
+  terminal 状态，client/queue/active 排空，恢复后的 signature 与 baseline 一致；
+- content 0 GPU Service SIGKILL 连续三轮通过；故障窗口内分布式查询明确失败且
+  没有部分结果，每轮 Service PID/worker 恢复，signature 一致；共享账本的
+  `stale_reclaims` 从 0 增长到 3；
+- 故障后所有 Service `ready=true`，`active_clients/queued_commands/active_commands`
+  全部为 0，reservation 回到 512MiB 常驻基线；
+- 最终 M1–M4a runner 的六类正向查询各连续三轮匹配 CPU baseline，负向矩阵均
+  保持原生计划，输出 `Cloudberry Gather-only GpuPreAgg MVP acceptance passed`；
+  回归结束后资源再次回到相同基线。
+
 验收时还应同步采集 `nvidia-smi`，证明 SQL 账本上限与设备实际占用趋势一致；
 由于 CUDA context 与 driver 开销不在账本内，两者不要求逐字节相等。
 
@@ -215,5 +241,6 @@ PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION=1 \
 - POSIX shared-memory 对象的协议升级需要运维确认旧 Service 已退出后清理旧对象；
 - 多主机模式天然按 GPU UUID/主机内核 shared memory 分开，仍需独立验收。
 
-后续优先级是：先完成本 P0 的真实并发、cancel、SIGKILL 验收，再进行 M4b 成本
-校准和性能探索；在资源门未验证前，不以扩大算子覆盖面替代并发安全验收。
+P0 资源门已经完成真实并发、cancel、SIGKILL 和最终回归验收。后续优先级可转向
+M4b 成本校准和性能探索；多主机、资源组公平性、GpuCache 统一计费和跨 PID
+namespace 协调仍需分别设计与验收。

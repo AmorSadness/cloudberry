@@ -526,6 +526,15 @@ ORDER BY content_id, gpu_id;
 ```
 
 Passing this runner proves bounded concurrent admission and result integrity.
-The P0 completion definition additionally requires the existing GpuPreAgg
-cancel and SIGKILL runners while watching the reservation and stale-reclaim
-counters; see `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`.
+The complete P0 additionally uses the existing GpuPreAgg cancel and SIGKILL
+runners while watching reservation and stale-reclaim counters.
+
+Real acceptance completed on 2026-08-13 with one coordinator and two Primaries
+sharing a Tesla T4.  With a 20% host budget, 24 concurrent clients produced
+three CPU-matching successes and 21 explicit pre-allocation budget rejections,
+with no real CUDA OOM.  Three cancel cycles and three SIGKILL/recovery cycles
+passed; `stale_reclaims` advanced from 0 to 3, all activity gauges drained,
+and reservation returned to the 512MiB idle pool baseline.  The final M1--M4a
+matrix also passed and left the same baseline.  This completes P0 for the
+tested single-host topology; see `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md` for
+the remaining multi-host, fairness, accounting, and PID-namespace limits.

@@ -82,14 +82,22 @@ single-host topology; cardinality/cost calibration, high-cardinality pressure,
 multi-host execution, concurrency isolation, and performance claims remain
 outside M4a.
 
-The next P0 implements host-wide GPU allocation admission for the actual
-single-host topology.  Independent coordinator/Segment GPU Services now share
+The shared-GPU P0 implements host-wide GPU allocation admission for the actual
+single-host topology.  Independent coordinator/Segment GPU Services share
 a per-UID/per-GPU-UUID budget ledger; memory-pool segments, direct query
 buffers, and GpuPreAgg expansion peaks reserve before CUDA allocation and
 release on all normal cleanup paths.  Extension 6.2 exposes host/local
-reservation and admission counters in `pgstrom.gpu_service_status`.  The code
-and design are complete, but real concurrent GPU, cancel, and SIGKILL recovery
-acceptance is still pending; see `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`.
+reservation and admission counters in `pgstrom.gpu_service_status`.
+
+Real single-host shared-GPU acceptance completed on 2026-08-13.  A 24-client
+GpuPreAgg run produced successful CPU-matching queries plus explicit
+pre-allocation budget rejections without a real CUDA OOM; three query-cancel
+cycles and three GPU-Service SIGKILL/recovery cycles passed, stale owner
+reclamation advanced from zero to three, and reservations returned to the
+512MiB idle pool baseline.  The post-failure M1--M4a matrix then passed in
+full.  This establishes allocation isolation for the tested single-host
+topology, not multi-host coordination, resource-group fairness, or a
+performance claim; see `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`.
 
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.

@@ -166,7 +166,7 @@ pg_strom.enable_gpusort = off
 - GPU-only final aggregate；
 - Redistribute Motion + parallel final aggregate；
 - GpuJoin、GpuCache、GPU-Direct、SELECT-INTO-Direct 和 DPU；
-- 多主机、Mirror/FTS、并发资源隔离和性能承诺。
+- 多主机、Mirror/FTS、资源组/用户级公平调度和性能承诺。
 
 `HAVING` 在首个代码里程碑也保持关闭。等 Gather-only partial/final 结果稳定后，
 再单独验证 HAVING 表达式替换、NULL 三值逻辑和 Motion 后执行位置。
@@ -480,16 +480,18 @@ CustomScan mutation。如果实现中发现 extension hook 时点无法合法构
   ORCA 等负向边界继续使用原生计划；
 - runner 最终输出 `Cloudberry Gather-only GpuPreAgg MVP acceptance passed`。
 
-本次验收确认 M4a 的结构化行数/成本口径、planner/executor sizing 公式、计划
+本次 M4a 验收确认结构化行数/成本口径、planner/executor sizing 公式、计划
 放置和结果正确性在上述拓扑下成立。local-group 估算仍是保守估算，成本常量与
-估算精度校准、高基数压力和性能结论继续属于 M4b；本次结果也不外推到多主机、
-独立 GPU 或并发资源隔离。
+估算精度校准、高基数压力和性能结论继续属于 M4b；M4a 结果本身不外推到多主机、
+独立 GPU 或并发隔离，后续 P0 已另行完成单机共享 GPU 资源门验收。
 
 ### M4b：成本校准和性能探索
 
 M4b 在单机共享 GPU 拓扑下由 P0 资源门前置。主机级预算、并发 admission 与
-异常回收的实现见 `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`；当前代码完成但真实
-GPU 并发验收 pending，因此尚不能据此宣称并发资源隔离已经验收。
+异常回收的实现见 `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`。P0 已于 2026-08-13
+完成 24 客户端并发 admission、三轮 cancel、三轮 GPU Service SIGKILL/stale
+reclaim 及故障后 M1–M4a 全量回归；单机同用户/同 PID namespace 的资源门已通过，
+但不代表多主机协调或资源组公平性。
 
 - 不再依赖强制 planner GUC 时，典型低基数组可以按成本选择 GpuPreAgg；
 - 比较明细 Motion rows 与 partial Motion rows；
