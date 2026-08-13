@@ -503,6 +503,28 @@ GpuPreAgg`.  CPU/GPU digests, QE actual instrumentation, M4b/MVP, shared-budget
 concurrency, cancel, SIGHUP and SIGKILL recovery all passed, and final Service
 gauges drained to the idle reservation baseline.
 
+### GpuPreAgg HAVING
+
+M5b evaluates HAVING only on the CPU final aggregate after GPU partial
+aggregation.  It supports grouping keys and the current count/sum/min/max
+integer/float whitelist, including aggregates used only by HAVING.  Colocated
+groups use per-QE local final plus HAVING; non-colocated and global aggregates
+apply HAVING after Gather-final.  NULL and UNKNOWN use native CPU semantics.
+
+Rerun `setup.sql` to add the M5b `nullable_metric` column, then run:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_GPUPREAGG_HAVING_REPEAT=3 \
+./gpcontrib/pg_strom/cloudberry/demo/run_gpupreagg_having.sh \
+  | tee /tmp/pgstrom-having.log
+```
+
+The grouped cases use ordinary planner costs.  The explicitly labeled
+empty-input case uses correctness-only costs so the legal GPU path remains
+observable.  FILTER, DISTINCT and numeric HAVING aggregates must retain native
+plans.  See `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`.
+
 ### GpuPreAgg cancellation and failure recovery
 
 The M3 runners reuse the established GpuScan cancellation and recovery

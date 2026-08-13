@@ -513,7 +513,8 @@ M4b 已于 2026-08-13 完成代码、静态检查和真实 GPU 验收。16MiB gr
   `CLOUDBERRY_GPUPREAGG_M5A_DESIGN.md`；
 - Redistribute Motion by GROUP BY keys + parallel final aggregate只能在当前单机
   共享 GPU 环境形成计划和正确性结论，不形成多 GPU 扩展性结论；
-- HAVING；
+- HAVING 已进入 M5b 实现与验收阶段，见
+  `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`；
 - numeric 和更多 aggregates/types；
 - mixed host/device quals 在 pre-aggregation 之前执行；
 - GpuSort/Top-N/window rank；

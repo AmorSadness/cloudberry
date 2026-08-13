@@ -33,7 +33,8 @@ CREATE TABLE pgstrom_mvp_colocated
     id bigint,
     dist_key integer,
     grp integer,
-    metric integer
+    metric integer,
+    nullable_metric integer
 )
 DISTRIBUTED BY (dist_key);
 
@@ -41,7 +42,11 @@ INSERT INTO pgstrom_mvp_colocated
 SELECT g,
        (g % 4096)::integer,
        (g % 1000)::integer,
-       ((g % 2001) - 1000)::integer
+       ((g % 2001) - 1000)::integer,
+       CASE WHEN g % 1000 = 0 OR g % 13 = 0
+            THEN NULL
+            ELSE ((g % 101) - 50)::integer
+       END
 FROM generate_series(1, 2000000) AS g;
 
 ANALYZE pgstrom_mvp_colocated;

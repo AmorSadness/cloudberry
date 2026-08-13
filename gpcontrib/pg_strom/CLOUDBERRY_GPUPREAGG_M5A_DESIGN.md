@@ -76,8 +76,11 @@ M4b 的“partial rows 达到输入 50% 则拒绝”规则是针对无法有效�
 6. partial target 投影后仍能表达完整 Hashed locus。
 
 以下形状必须保留 Gather-final 或原生计划：无 GROUP BY、GROUP BY 不覆盖完整分布
-键、HashedOJ/Strewn locus、DISTINCT、mixed host/device quals、HAVING、numeric、
+键、HashedOJ/Strewn locus、DISTINCT、mixed host/device quals、numeric、
 AO/AOCO、分区表和 ORCA。
+
+HAVING 在 M5a 完成时仍是保留边界，后续由 M5b 在 CPU final aggregate 上受控开放；
+见 `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`。
 
 ## 5. 验收
 

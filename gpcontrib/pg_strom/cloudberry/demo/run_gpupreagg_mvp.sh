@@ -208,9 +208,10 @@ require_native_aggregate_plan "numeric aggregate" \
 require_native_aggregate_plan "aggregate FILTER" \
     "SELECT grp, count(*) FILTER (WHERE id > 10)
      FROM pgstrom_mvp_heap WHERE id > 0 GROUP BY grp;"
-require_native_aggregate_plan "HAVING" \
+require_native_aggregate_plan "unsupported aggregate FILTER in HAVING" \
     "SELECT grp, count(*) FROM pgstrom_mvp_heap
-     WHERE id > 0 GROUP BY grp HAVING count(*) > 0;"
+     WHERE id > 0 GROUP BY grp
+     HAVING count(*) FILTER (WHERE id > 10) > 0;"
 require_native_aggregate_plan "AO heap" \
     "SELECT grp, count(*) FROM pgstrom_mvp_ao WHERE id > 0 GROUP BY grp;"
 require_native_aggregate_plan "AOCO heap" \

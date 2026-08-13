@@ -1691,7 +1691,6 @@ cloudberry_gpupreagg_query_supported(PlannerInfo *root,
 		!parse->hasAggs ||
 		parse->groupingSets != NIL ||
 		parse->distinctClause != NIL ||
-		parse->havingQual != NULL ||
 		extra == NULL ||
 		extra->patype != PARTITIONWISE_AGGREGATE_NONE ||
 		input_rel->reloptkind != RELOPT_BASEREL ||
@@ -1704,6 +1703,10 @@ cloudberry_gpupreagg_query_supported(PlannerInfo *root,
 	(void) expression_tree_walker((Node *)parse->targetList,
 								  cloudberry_gpupreagg_walker,
 								  &context);
+	if (!context.unsupported && parse->havingQual != NULL)
+		(void) expression_tree_walker((Node *)parse->havingQual,
+									  cloudberry_gpupreagg_walker,
+									  &context);
 	return context.found_aggregate && !context.unsupported;
 }
 #endif
@@ -2243,11 +2246,22 @@ xpugroupby_build_path_target(xpugroupby_build_path_context *con)
 		Assert(IsA(parse->havingQual, List));
 		con->havingAggQuals = (List *)
 			replace_expression_by_agg_altfuncs(parse->havingQual, con);
+#ifdef GP_VERSION_NUM
+		/*
+		 * Cloudberry always executes a CPU final aggregate after GpuPreAgg.
+		 * HAVING therefore belongs exclusively to that Agg node, after either
+		 * the colocated local final or the non-colocated Gather-final.  Do not
+		 * build or attach the upstream GPU-final projection qualifier.
+		 */
+		con->havingProjQuals = NIL;
+		if (con->havingAggQuals == NIL || !con->device_executable)
+#else
 		con->havingProjQuals = (List *)
 			replace_expression_by_proj_altfuncs(parse->havingQual, con);
 		if (con->havingAggQuals == NIL ||
 			con->havingProjQuals == NIL ||
 			!con->device_executable)
+#endif
 		{
 			elog(DEBUG2, "unable to replace HAVING to alternative aggregation: %s",
 				 nodeToString(parse->havingQual));

@@ -60,7 +60,7 @@ and executes one CPU final aggregate per QE without a pre-final Gather Motion.
 Other GROUP BY shapes and global aggregates send partial rows through a real
 Cloudberry Motion and use one CPU final aggregate to merge groups across
 Segments.  Its first whitelist is count/sum/min/max on
-integer and floating-point inputs; mixed quals, numeric, FILTER, HAVING,
+integer and floating-point inputs; mixed quals, numeric, aggregate FILTER,
 DISTINCT aggregates, partitionwise aggregation and GPU-Sort retain native
 plans.  Source and acceptance assets are complete.  Real dual-Primary GPU
 M1/M2/M3 acceptance and the post-failure full regression completed on
@@ -135,6 +135,15 @@ shared-GPU topology.  Colocated plans placed one CPU local final directly above
 GpuPreAgg on each QE, non-colocated plans retained Gather-final, both result
 digests matched CPU, and the full concurrency/cancel/failure regression drained
 to its idle resource baseline.  See `CLOUDBERRY_GPUPREAGG_M5A_DESIGN.md`.
+
+M5b adds CPU-final HAVING support for grouping keys and the existing
+count/sum/min/max integer/float aggregate whitelist.  HAVING aggregate
+expressions are rewritten to consume GPU partial states and are evaluated only
+by the CPU final Agg, after a colocated local final or a non-colocated/global
+Gather-final.  NULL and UNKNOWN therefore retain native PostgreSQL semantics;
+FILTER, DISTINCT, numeric and unreplaceable HAVING aggregates safely retain
+native plans.  Source, static and acceptance assets are complete; real GPU
+acceptance is pending.  See `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`.
 
 ## Development topology constraint
 
