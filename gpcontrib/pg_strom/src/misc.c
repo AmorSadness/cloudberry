@@ -128,6 +128,9 @@ form_pgstrom_plan_info(CustomScan *cscan, pgstromPlanInfo *pp_info)
 	privs = lappend(privs, __makeFloat(pp_info->run_cost));
 	privs = lappend(privs, __makeFloat(pp_info->final_cost));
 	privs = lappend(privs, __makeFloat(pp_info->final_nrows));
+	privs = lappend(privs, __makeFloat(pp_info->gpupreagg_setup_cost));
+	privs = lappend(privs, __makeFloat(pp_info->gpupreagg_dma_cost));
+	privs = lappend(privs, __makeFloat(pp_info->gpupreagg_partial_cost));
 	/* bin-index support */
 	privs = lappend(privs, makeInteger(pp_info->brin_index_oid));
 	privs = lappend(privs, pp_info->brin_index_conds);
@@ -249,6 +252,9 @@ deform_pgstrom_plan_info(CustomScan *cscan)
 	pp_data.run_cost     = floatVal(list_nth(privs, pindex++));
 	pp_data.final_cost   = floatVal(list_nth(privs, pindex++));
 	pp_data.final_nrows  = floatVal(list_nth(privs, pindex++));
+	pp_data.gpupreagg_setup_cost = floatVal(list_nth(privs, pindex++));
+	pp_data.gpupreagg_dma_cost = floatVal(list_nth(privs, pindex++));
+	pp_data.gpupreagg_partial_cost = floatVal(list_nth(privs, pindex++));
 	/* brin-index support */
 	pp_data.brin_index_oid = intVal(list_nth(privs, pindex++));
 	pp_data.brin_index_conds = list_nth(privs, pindex++);

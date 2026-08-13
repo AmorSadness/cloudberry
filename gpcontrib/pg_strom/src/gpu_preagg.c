@@ -77,8 +77,10 @@ pgstrom_is_gpupreagg_state(const PlanState *ps)
  * Keep planner accounting and the executor's initial KDS allocation on the
  * same formula.  A grouped GpuPreAgg buffer contains a hash-slot array, a
  * row-index/lock area, and room for twice the estimated number of tuples so
- * that the GPU can build and merge partial states.  The one-GiB minimum and
- * the four-MiB no-group buffer are existing executor allocation rules.
+ * that the GPU can build and merge partial states.  M4b replaces the old
+ * one-GiB grouped minimum with a 16-MiB allocation quantum.  The estimate is
+ * still conservative, but low-cardinality queries no longer reserve fixed
+ * one-GiB buffers on every Segment.  No-group aggregation retains four MiB.
  *
  * SIZE_MAX means that the estimate cannot be represented by the KDS format or
  * by size_t.  In particular, kern_data_store.hash_nslots is only 32 bits.
@@ -121,11 +123,11 @@ estimateGpuPreAggFinalBufferSize(size_t head_sz,
 		pg_add_size_overflow(head_sz, slot_bytes, &length) ||
 		pg_add_size_overflow(length, tuple_bytes, &length))
 		return SIZE_MAX;
-	if (length < (1UL << 30))
-		return (1UL << 30);
-	if (length > SIZE_MAX - 1023)
+	if (length < (16UL << 20))
+		return (16UL << 20);
+	if (length > SIZE_MAX - ((2UL << 20) - 1))
 		return SIZE_MAX;
-	return TYPEALIGN(1024, length);
+	return TYPEALIGN(2UL << 20, length);
 }
 
 /*
@@ -2278,7 +2280,8 @@ xpugroupby_build_path_target(xpugroupby_build_path_context *con)
  * try_add_final_groupby_paths
  */
 static void
-try_add_final_groupby_paths(xpugroupby_build_path_context *con, Path *part_path)
+try_add_final_groupby_paths(xpugroupby_build_path_context *con,
+							Path *part_path)
 {
 	Query	   *parse = con->root->parse;
 	Path	   *__path;
@@ -2390,7 +2393,11 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	double		input_nrows = PP_INFO_NUM_ROWS(pp_info);
 	double		num_group_keys;
 	double		xpu_ratio;
-	double		dma_width_factor;
+	double		dma_input_width_factor;
+	double		dma_output_width_factor;
+	Cost		partial_cost;
+	Cost		dma_input_cost;
+	Cost		dma_output_cost;
 	Cost		xpu_operator_cost;
 	Cost		xpu_tuple_cost;
 	const CustomPathMethods *xpu_cpath_methods;
@@ -2429,28 +2436,64 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	/* Result cardinality here is the number of partial rows produced per QE. */
 	pp_info->final_nrows = con->num_groups;
 
+#ifdef GP_VERSION_NUM
+	/*
+	 * A local partial aggregate that preserves at least half of its input rows
+	 * cannot materially reduce Motion, yet it still needs a pinned hash buffer,
+	 * GPU setup and a QD final aggregate.  Treat this as an unsuitable M4b shape
+	 * instead of allowing cheap device operators to hide the memory/Motion cost.
+	 */
+	if ((parse->groupClause || parse->distinctClause) &&
+		con->num_groups >= 0.5 * input_nrows)
+	{
+		elog(DEBUG1,
+			 "Cloudberry GpuPreAgg rejected by partial-row reduction "
+			 "(local groups: %.0f, input rows: %.0f)",
+			 con->num_groups, input_nrows);
+		return NULL;
+	}
+#endif
+
 	/* No tuples shall be generated until child JOIN/SCAN path completion */
 	pp_info->startup_cost = (pp_info->startup_cost +
 							 pp_info->inner_cost +
 							 pp_info->run_cost);
 	/* Cost estimation for grouping */
 	num_group_keys = list_length(parse->groupClause);
-	pp_info->startup_cost += (xpu_operator_cost *
-							  num_group_keys *
-							  input_nrows);
+	partial_cost = (xpu_operator_cost *
+					num_group_keys *
+					input_nrows);
 	/* Cost estimation for aggregate function */
-	pp_info->startup_cost += (target_partial->cost.per_tuple * input_nrows +
-							  target_partial->cost.startup) * xpu_ratio;
+	partial_cost += (target_partial->cost.per_tuple * input_nrows +
+					 target_partial->cost.startup) * xpu_ratio;
 	/*
-	 * Cost for partial-state materialization and DMA receive (xPU --> Host).
+	 * A fused GpuScan/GpuPreAgg does not return detail rows to the host.  Its
+	 * inherited GpuScan final_cost is intentionally discarded above.  Charge
+	 * input DMA by KiB (the calibrated transfer quantum) and partial-state
+	 * return by 64-byte cache lines.  Both use the existing gpu_tuple_cost, so
+	 * an installation can calibrate one measured transfer coefficient without
+	 * acceptance-only planner overrides.
+	 *
 	 * Motion and CPU final aggregation are costed by the standard Cloudberry
 	 * paths built in try_add_final_groupby_paths(), so do not duplicate them.
 	 */
-	dma_width_factor = Max((double)target_partial->width / 64.0, 1.0);
-	pp_info->run_cost = (con->target_partial->cost.per_tuple +
-						 xpu_tuple_cost * dma_width_factor) *
-						con->num_groups / pp_info->parallel_divisor;
+	dma_input_width_factor = Max((double)con->input_rel->reltarget->width /
+								  1024.0, 1.0 / 16.0);
+	dma_output_width_factor = Max((double)target_partial->width / 64.0, 1.0);
+	dma_input_cost = xpu_tuple_cost * dma_input_width_factor *
+					 input_nrows / pp_info->parallel_divisor;
+	dma_output_cost = xpu_tuple_cost * dma_output_width_factor *
+					  con->num_groups / pp_info->parallel_divisor;
+	pp_info->startup_cost += partial_cost + dma_input_cost;
+	pp_info->run_cost = (con->target_partial->cost.per_tuple *
+						 con->num_groups / pp_info->parallel_divisor) +
+						dma_output_cost;
 	pp_info->final_cost = 0.0;
+	pp_info->gpupreagg_setup_cost =
+		(xpu_cpath_methods == &gpupreagg_path_methods
+		 ? pgstrom_gpu_setup_cost : 0.0);
+	pp_info->gpupreagg_dma_cost = dma_input_cost + dma_output_cost;
+	pp_info->gpupreagg_partial_cost = partial_cost;
 
 #ifdef GP_VERSION_NUM
 	{

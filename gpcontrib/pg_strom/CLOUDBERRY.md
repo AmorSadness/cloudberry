@@ -104,11 +104,21 @@ performance claim; see `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`.
 The 6.3 acceptance matrix also covers GpuScan+GpuScan,
 GpuScan+GpuPreAgg, and a superuser-only post-reservation allocation-failure
 injection.  Real GPU acceptance completed on 2026-08-13: both concurrency
-pairs matched CPU and drained resources, the planner-derived 1GiB GpuPreAgg
+pairs matched CPU and drained resources, the then-current planner-derived 1GiB GpuPreAgg
 request was visible in admission status, and the injected failure produced no
 leak or partial result before a successful recovery query.  Together with the
 earlier multi-GpuPreAgg, cancel and SIGKILL runs, the expanded P0a/P0b/P0c
 checklist is fully accepted for the tested single-host topology.
+
+M4b now replaces the fixed 1GiB grouped final-buffer floor with a 16MiB
+minimum, 2MiB alignment, and geometric expansion.  `EXPLAIN ANALYZE` reports
+group and byte estimate/actual ratios, while `GpuPreAgg Cost` separates GPU
+setup, host-device DMA, partial aggregation, QE-to-QD Motion, and CPU final
+aggregation without duplicating native Motion/Agg costing.  The new normal-
+planner acceptance runner leaves multiphase aggregation, scan choice, and all
+GPU/CPU/Motion cost parameters unforced.  Source and static acceptance are
+complete; real-GPU M4b acceptance is pending.  See
+`CLOUDBERRY_GPUPREAGG_M4B_DESIGN.md`.
 
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.

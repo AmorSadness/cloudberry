@@ -20,7 +20,7 @@ trap cleanup EXIT INT TERM
 scan_settings="
  SET optimizer=off; SET pg_strom.enabled=on;
  SET pg_strom.enable_gpuscan=on; SET pg_strom.enable_gpupreagg=off;
- SET pg_strom.cpu_fallback=off; SET enable_seqscan=off;"
+ SET pg_strom.cpu_fallback=off;"
 preagg_settings="
  SET optimizer=off; SET pg_strom.enabled=on;
  SET pg_strom.enable_gpuscan=on; SET pg_strom.enable_gpupreagg=on;
@@ -28,10 +28,7 @@ preagg_settings="
  SET pg_strom.enable_numeric_aggfuncs=off;
  SET pg_strom.enable_partitionwise_gpupreagg=off;
  SET pg_strom.cloudberry_enable_host_quals=off;
- SET pg_strom.cpu_fallback=off; SET gp_enable_multiphase_agg=off;
- SET pg_strom.gpu_setup_cost=0; SET pg_strom.gpu_tuple_cost=0;
- SET pg_strom.gpu_operator_cost=0; SET gp_motion_cost_per_row=1000000;
- SET cpu_tuple_cost=10; SET cpu_operator_cost=10; SET enable_seqscan=off;"
+ SET pg_strom.cpu_fallback=off;"
 scan_query="
  SELECT count(*) || '|' || coalesce(sum(id)::text,'') || '|' ||
         md5(string_agg(id::text || ':' || payload, ',' ORDER BY id))
@@ -121,13 +118,14 @@ run_pair gpuscan_gpuscan "$scan_settings" "$scan_query" "$scan_cpu" \
 run_pair gpuscan_gpupreagg "$scan_settings" "$scan_query" "$scan_cpu" \
                            "$preagg_settings" "$preagg_query" "$preagg_cpu"
 request_traced=$("${psql_cmd[@]}" -Atqc "
-  SELECT bool_and(max_request_bytes >= 1073741824)
+  SELECT bool_and(last_request_bytes >= 16777216 AND
+                  last_request_bytes < 1073741824)
   FROM pgstrom.gpu_service_status WHERE content_id >= 0;")
 [[ $request_traced == t ]] || {
-    echo "P0b did not expose the 1GiB planner-derived GpuPreAgg request" >&2
+    echo "P0b did not expose an adaptive sub-1GiB GpuPreAgg request" >&2
     exit 1
 }
-echo "planner-derived 1GiB GpuPreAgg request is visible in admission status"
+echo "planner-derived adaptive GpuPreAgg request is visible in admission status"
 
 # Arm one post-reservation failure on every Segment.  A distributed query may
 # stop after the first QE error, so cleanup always disarms unused injections.

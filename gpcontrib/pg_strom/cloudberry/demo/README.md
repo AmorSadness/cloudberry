@@ -431,6 +431,38 @@ and ORCA.  Passing this runner proves the M1/M2 result and placement matrix; it
 does not by itself complete query-cancel or GPU Service failure recovery
 acceptance for GpuPreAgg.
 
+### GpuPreAgg M4b normal-cost calibration
+
+After installing the M4b sources, run the normal-planner matrix without the
+correctness-only costs used by the older M1--M4a runner:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_GPUPREAGG_M4B_REPEAT=3 \
+./gpcontrib/pg_strom/cloudberry/demo/run_gpupreagg_m4b.sh \
+  | tee /tmp/pgstrom-m4b.log
+```
+
+The runner requires multiphase aggregation and sequential scans to remain
+enabled and rejects zero GPU/CPU or acceptance-only extreme costs.  The normal
+Cloudberry Motion value `0` remains valid because it means `2 * cpu_tuple_cost`.
+It
+checks stable automatic selection over low, medium, and high cardinalities,
+uniform and single-Segment-skew distributions, plus near-detail shapes that
+should remain native.  Analyzed GPU plans expose the five M4b cost components,
+plus QE-returned `GpuPreAgg Actual` group/byte deviations, and a low-cardinality final buffer clearly
+below 1GiB.  It also compares actual detail-row and partial-row Motion counts.
+The medium/high NDV keys are physical analyzed columns; rerun `setup.sql` once
+after installing M4b so an existing demo database receives them.
+See `CLOUDBERRY_GPUPREAGG_M4B_DESIGN.md`.  Until this runner and the shared-GPU
+matrix pass on a real GPU, M4b is implemented but not GPU-accepted.
+
+For the admission-capacity regression, also run 24 clients with
+`PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION=0`.  A low-cardinality request is now
+about 16MiB rather than 1GiB, so absence of rejection is an expected capacity
+improvement; the controlled allocation-failure matrix still proves rejection
+rollback and recovery.
+
 ### GpuPreAgg cancellation and failure recovery
 
 The M3 runners reuse the established GpuScan cancellation and recovery
@@ -557,9 +589,10 @@ hook avoids deliberately exhausting the physical GPU while covering the same
 budget rollback and query cleanup path.
 
 This 6.3 matrix completed real GPU acceptance on 2026-08-13.  Both GpuScan
-pairings matched CPU and drained resources, the planner-derived 1GiB request
-was visible, and the injected allocation failure returned no partial result,
+pairings matched CPU and drained resources, the then-current planner-derived
+1GiB request was visible, and the injected allocation failure returned no partial result,
 leaked no reservation, and was followed by a successful GpuPreAgg.  The runner
 ended with `Cloudberry shared-GPU P0a/P0c concurrency matrix passed`.  Combined
 with the earlier multi-GpuPreAgg, cancel, and SIGKILL/stale-reclaim results,
-P0a, P0b, and P0c are complete for the documented single-host topology.
+P0a, P0b, and P0c are complete for the documented single-host topology.  M4b
+changes this matrix to require a new adaptive request below 1GiB.

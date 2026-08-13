@@ -1592,6 +1592,56 @@ pgstromCreateTaskState(CustomScan *cscan,
 	return (Node *)pts;
 }
 
+#ifdef GP_VERSION_NUM
+/*
+ * Cloudberry calls ExplainCustomScan on the QD copy of a distributed node,
+ * so executor-private QE counters are not available there.  INSTRUMENT_CDB's
+ * extra-text callback is collected on each QE and transports the winning
+ * worker's actual GpuPreAgg sizing counters back to the QD.
+ */
+static void
+pgstromCdbExplainTaskActual(PlanState *pstate, StringInfo buf)
+{
+	pgstromTaskState *pts = (pgstromTaskState *)pstate;
+	pgstromPlanInfo *pp_info = pts->pp_info;
+	CustomScan *cscan = (CustomScan *)pstate->plan;
+	pgstromSharedState *ps_state = pts->ps_state;
+	bool		hash_format;
+	size_t		head_sz;
+	size_t		buffer_sz;
+	uint64		actual_nitems;
+	uint64		actual_usage;
+
+	if (!ps_state ||
+		(pp_info->xpu_task_flags & DEVTASK__PREAGG) == 0)
+		return;
+	hash_format = ((pp_info->xpu_task_flags &
+						DEVTASK__PINNED_HASH_RESULTS) != 0);
+	head_sz = MAXALIGN(offsetof(kern_data_store, colmeta) +
+					   sizeof(kern_colmeta) *
+					   list_length(cscan->custom_scan_tlist));
+	buffer_sz = estimateGpuPreAggFinalBufferSize(
+								 head_sz,
+								 list_length(cscan->custom_scan_tlist),
+								 cscan->scan.plan.plan_width,
+								 pp_info->final_nrows,
+								 hash_format);
+	actual_nitems = pg_atomic_read_u64(&ps_state->final_nitems);
+	actual_usage = pg_atomic_read_u64(&ps_state->final_usage);
+	appendStringInfo(buf,
+					 "GpuPreAgg Actual: nitems: %lu, usage: %s, total: %s",
+					 actual_nitems,
+					 format_bytesz(actual_usage),
+					 format_bytesz(pg_atomic_read_u64(&ps_state->final_total)));
+	if (pp_info->final_nrows > 0.0)
+		appendStringInfo(buf, ", groups actual/estimate: %.2fx",
+						 (double)actual_nitems / pp_info->final_nrows);
+	if (buffer_sz != SIZE_MAX && buffer_sz > 0)
+		appendStringInfo(buf, ", usage/estimate: %.2f%%",
+						 100.0 * (double)actual_usage / (double)buffer_sz);
+}
+#endif
+
 /*
  * pgstromExecInitTaskState
  */
@@ -1605,6 +1655,12 @@ pgstromExecInitTaskState(CustomScanState *node, EState *estate, int eflags)
 	TupleDesc	tupdesc_src = RelationGetDescr(rel);
 	int			depth_index = 0;
 	ListCell   *lc;
+
+#ifdef GP_VERSION_NUM
+	if (estate->es_instrument &&
+		(estate->es_instrument & INSTRUMENT_CDB))
+		node->ss.ps.cdbexplainfun = pgstromCdbExplainTaskActual;
+#endif
 
 	/* sanity checks */
 	Assert(rel != NULL &&
@@ -2985,11 +3041,34 @@ pgstromExplainTaskState(CustomScanState *node,
 							 format_bytesz(buffer_sz * numGpuDevAttrs),
 							 numGpuDevAttrs);
 		if (es->analyze && ps_state)
+		{
+			uint64		actual_nitems =
+				pg_atomic_read_u64(&ps_state->final_nitems);
+			uint64		actual_usage =
+				pg_atomic_read_u64(&ps_state->final_usage);
+
 			appendStringInfo(&buf, ", actual nitems: %lu, usage: %s, total: %s",
-							 pg_atomic_read_u64(&ps_state->final_nitems),
-							 format_bytesz(pg_atomic_read_u64(&ps_state->final_usage)),
+							 actual_nitems,
+							 format_bytesz(actual_usage),
 							 format_bytesz(pg_atomic_read_u64(&ps_state->final_total)));
+			if (pp_info->final_nrows > 0.0)
+				appendStringInfo(&buf, ", groups actual/estimate: %.2fx",
+							 (double)actual_nitems / pp_info->final_nrows);
+			if (buffer_sz != SIZE_MAX && buffer_sz > 0)
+				appendStringInfo(&buf, ", usage/estimate: %.2f%%",
+							 100.0 * (double)actual_usage / (double)buffer_sz);
+		}
 		ExplainPropertyText("GpuPreAgg Sizing", buf.data, es);
+
+		resetStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "GPU setup: %.2f, host-device DMA: %.2f, "
+						 "partial aggregate: %.2f; QE-QD Motion: native Path, "
+						 "CPU final aggregate: native Path",
+						 pp_info->gpupreagg_setup_cost,
+						 pp_info->gpupreagg_dma_cost,
+						 pp_info->gpupreagg_partial_cost);
+		ExplainPropertyText("GpuPreAgg Cost", buf.data, es);
 	}
 
 	/*

@@ -6,6 +6,8 @@ CREATE TABLE pgstrom_mvp_heap
 (
     id bigint,
     grp integer,
+    grp_medium integer,
+    grp_high integer,
     amount numeric(18,2),
     payload text
 )
@@ -14,6 +16,8 @@ DISTRIBUTED BY (id);
 INSERT INTO pgstrom_mvp_heap
 SELECT g,
        (g % 1000)::integer,
+       (g % 16384)::integer,
+       (g % 131072)::integer,
        ((g % 100000) / 100.0)::numeric(18,2),
        md5(g::text)
 FROM generate_series(1, 2000000) AS g;
@@ -29,6 +33,8 @@ CREATE TABLE pgstrom_mvp_skew
     id bigint,
     dist_key integer,
     metric integer,
+    grp_medium integer,
+    grp_high integer,
     amount numeric(18,2),
     nullable_metric integer,
     payload text
@@ -39,6 +45,8 @@ INSERT INTO pgstrom_mvp_skew
 SELECT g,
        1,
        ((g % 2001) - 1000)::integer,
+       (g % 8192)::integer,
+       (g % 65536)::integer,
        (((g % 200000) - 100000) / 100.0)::numeric(18,2),
        CASE WHEN g % 13 = 0 THEN NULL ELSE ((g % 101) - 50)::integer END,
        CASE WHEN g % 17 = 0 THEN NULL ELSE md5(g::text) END

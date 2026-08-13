@@ -76,15 +76,7 @@ gpu_settings="
     SET pg_strom.enable_numeric_aggfuncs=off;
     SET pg_strom.enable_partitionwise_gpupreagg=off;
     SET pg_strom.cloudberry_enable_host_quals=off;
-    SET pg_strom.cpu_fallback=off;
-    SET gp_enable_multiphase_agg=off;
-    SET pg_strom.gpu_setup_cost=0;
-    SET pg_strom.gpu_tuple_cost=0;
-    SET pg_strom.gpu_operator_cost=0;
-    SET gp_motion_cost_per_row=1000000;
-    SET cpu_tuple_cost=10;
-    SET cpu_operator_cost=10;
-    SET enable_seqscan=off;"
+    SET pg_strom.cpu_fallback=off;"
 test_query="
     SELECT grp, count(*), sum(id), min(id), max(id)
     FROM pgstrom_mvp_heap

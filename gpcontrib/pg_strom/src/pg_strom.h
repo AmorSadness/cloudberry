@@ -300,6 +300,10 @@ typedef struct
 	Cost		run_cost;			/* run cost */
 	Cost		final_cost;			/* cost for sendback and host-side tasks */
 	double		final_nrows;		/* copy of result_rel->rows */
+	/* Cloudberry GpuPreAgg M4b cost decomposition (zero for other nodes). */
+	Cost		gpupreagg_setup_cost;
+	Cost		gpupreagg_dma_cost;
+	Cost		gpupreagg_partial_cost;
 	/* BRIN-index support */
 	Oid			brin_index_oid;		/* OID of BRIN-index, if any */
 	List	   *brin_index_conds;	/* BRIN-index key conditions */

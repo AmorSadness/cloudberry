@@ -495,14 +495,15 @@ reclaim 及故障后 M1–M4a 全量回归；单机同用户/同 PID namespace �
 
 扩展 6.3 进一步补齐静态 Service 配额和/安全余量诊断、planner-derived request
 追踪、GpuScan+GpuScan、GpuScan+GpuPreAgg 以及受控 allocation-failure rollback
-runner。真实 GPU 矩阵已于 2026-08-13 通过：两种组合结果匹配且资源排空，1GiB
-request 可观察，注入失败无泄漏/无部分结果且后续查询恢复。因此 P0a/P0b/P0c
+runner。真实 GPU 矩阵已于 2026-08-13 通过：两种组合结果匹配且资源排空，历史
+1GiB request 可观察，注入失败无泄漏/无部分结果且后续查询恢复。因此 P0a/P0b/P0c
 在当前单机共享 GPU 边界内均完成验收。
 
-- 不再依赖强制 planner GUC 时，典型低基数组可以按成本选择 GpuPreAgg；
-- 比较明细 Motion rows 与 partial Motion rows；
-- 记录高基数组、倾斜和 GPU final-buffer 内存压力；
-- 仅在可重复 benchmark 后形成性能结论。
+M4b 已完成代码和静态验收，真实 GPU 验收待执行。实现包括 16MiB grouped buffer
+下限、2MiB 对齐、自适应几何扩容、五段成本分解、estimate/actual 偏差指标以及
+不写入强制成本参数的 normal-planner runner。低/中/高基数、均匀/倾斜、明细与
+partial Motion、适合/不适合 GpuPreAgg 的选择边界均纳入矩阵。完整设计和完成定义
+见 `CLOUDBERRY_GPUPREAGG_M4B_DESIGN.md`；在 GPU 日志通过前不宣称 M4b 验收完成。
 
 ### 后续非本 MVP 阶段
 

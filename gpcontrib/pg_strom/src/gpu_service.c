@@ -3167,7 +3167,17 @@ __expandGpuQueryGroupByBuffer(gpuClient *gclient,
 
 		gettimeofday(&tv1, NULL);
 		assert(kds_old->length == kds_length_last);
-		length = kds_old->length + Max(kds_old->length, 1UL<<30);
+		/* M4b grows adaptive buffers geometrically, with a 16MiB floor. */
+		sz = Max(kds_old->length, 16UL<<20);
+		if (kds_old->length > SIZE_MAX - sz)
+		{
+			pthreadRWLockUnlock(&gq_buf->m_kds_rwlock);
+			gpuClientELog(gclient,
+						  "GpuPreAgg expansion size overflow (bytes=%lu)",
+						  kds_old->length);
+			return false;
+		}
+		length = kds_old->length + sz;
 		/* Reserve the full replacement while the old buffer is still live.
 		 * This accounts for the real expansion peak, not only the final delta. */
 		if (!gpuSharedBudgetReserve(GpuWorkerCurrentContext, length))
