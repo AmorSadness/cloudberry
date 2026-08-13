@@ -311,6 +311,9 @@ require_text 'M5a colocated local-final acceptance passed' "$gpupreagg_m5a_runne
 require_text '单机 1 QD.*2 Primary' "$gpupreagg_m5a_design"
 require_text '不能形成多主机、多 GPU 线性扩展' "$gpupreagg_m5a_design"
 require_text 'cdbpathlocus_pull_above_projection' "$gpupreagg_m5a_design"
+require_text '真实 GPU 验收全部通过' "$gpupreagg_m5a_design"
+require_text '共置 GROUP BY local-final' "$gpupreagg_m5a_design"
+require_text '标记为完成' "$gpupreagg_m5a_design"
 if grep -Eq 'gp_enable_multiphase_agg=off|gpu_setup_cost=0|gpu_tuple_cost=0|gpu_operator_cost=0|gp_motion_cost_per_row=1000000|cpu_tuple_cost=10|cpu_operator_cost=10|enable_seqscan=off' \
     "$gpupreagg_m4b_runner" "$budget_runner" "$budget_matrix_runner"; then
     echo 'M4b acceptance runners must not contain correctness-only planner forcing' >&2

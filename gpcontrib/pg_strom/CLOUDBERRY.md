@@ -126,11 +126,15 @@ Motion rows fell from 2,000,000 to 2,000, all 24 concurrent clients succeeded,
 and the combined concurrency/failure rollback matrix drained cleanly.  See
 `CLOUDBERRY_GPUPREAGG_M4B_DESIGN.md`.
 
-M5a source and acceptance assets implement the colocated GROUP BY local-final
-path.  The planner preserves a projected Hashed locus only when the full
-distribution key survives the partial target, skips the SingleQE Motion in
-that case, and retains Gather-final for every unproven shape.  See
-`CLOUDBERRY_GPUPREAGG_M5A_DESIGN.md`.
+M5a implements the colocated GROUP BY local-final path.  The planner preserves
+a projected Hashed locus only when the full distribution key survives the
+partial target, skips the SingleQE Motion in that case, and retains
+Gather-final for every unproven shape.  Source, static, normal-planner and real
+GPU acceptance completed on 2026-08-13 in the single-host 1 QD + 2 Primary
+shared-GPU topology.  Colocated plans placed one CPU local final directly above
+GpuPreAgg on each QE, non-colocated plans retained Gather-final, both result
+digests matched CPU, and the full concurrency/cancel/failure regression drained
+to its idle resource baseline.  See `CLOUDBERRY_GPUPREAGG_M5A_DESIGN.md`.
 
 ## Development topology constraint
 

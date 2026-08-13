@@ -1,8 +1,8 @@
 # Cloudberry GpuPreAgg M5a 共置 GROUP BY local-final 设计
 
-状态（2026-08-13）：源码、静态检查和验收 runner 已实现；真实 GPU 验收需要在既有
-单机 1 QD + 至少 2 Primary、所有 GPU Service 共享同一块 GPU 的环境执行。完成
-真实验收前只称“实现完成”，不称“GPU 验收完成”。
+状态（2026-08-13）：源码、静态检查、验收 runner，以及单机 1 QD + 2 Primary、
+所有 GPU Service 共享同一块 GPU 的真实 GPU 验收全部通过。M5a 在本文限定拓扑内
+完成；不外推为多主机、多 GPU 扩展性或独立 GPU 性能结论。
 
 ## 1. 环境约束和结论边界
 
@@ -105,5 +105,22 @@ PGSTROM_GPUPREAGG_M5A_REPEAT=3 \
 Cloudberry GpuPreAgg M5a colocated local-final acceptance passed
 ```
 
-真实 GPU 通过后还应复用 GpuPreAgg cancel、SIGHUP/SIGKILL 和共享预算矩阵完成
-故障后回归，且不得把单机共享 GPU 数据外推为多机性能结论。
+## 6. 真实 GPU 验收记录
+
+2026-08-13 在单机 1 QD + 2 Primary、三个 GPU Service 共享同一块 GPU 的环境完成
+M5a 及既有回归验收：
+
+- 共置 `GROUP BY dist_key` 在普通 planner 成本下稳定选择 GpuPreAgg；
+- 计划为顶层结果收集 `Gather Motion 2:1`，其下是每 QE `HashAggregate` 直接连接
+  `Custom Scan (GpuPreAgg)`，CPU local final 与 GpuPreAgg 之间没有 pre-final Motion；
+- 非共置 `GROUP BY grp` 稳定保留 `HashAggregate -> Gather Motion 2:1 -> GpuPreAgg`；
+- 共置和非共置查询的 CPU/GPU 结果 digest 全部一致；
+- `EXPLAIN ANALYZE` 返回 QE 的 GpuPreAgg actual groups/bytes 统计；
+- M4b、历史 GpuPreAgg MVP、共享 GPU 并发/分配失败、cancel、SIGHUP 和 SIGKILL
+  故障恢复回归全部通过；
+- 最终 GPU Service 状态使用 `ready` 和 `active_clients` 实际列名检查，所有 Service
+  ready，queued/active/client gauges 排空，reservation 回到测试前 idle baseline。
+
+上述证据满足本文 M5a 完成条件，因此共置 GROUP BY local-final 在记录的单机共享
+GPU 拓扑内标记为完成。资源 baseline 可以包含 GPU memory pool 常驻额度，不要求
+reservation 绝对为零，但必须不超过共享预算且在测试后回到测试前水平。

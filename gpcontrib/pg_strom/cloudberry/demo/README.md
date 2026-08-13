@@ -495,6 +495,14 @@ available acceptance topology remains one host with all Segment GPU Services
 sharing one physical GPU; this runner does not establish multi-host or
 multi-GPU scaling.
 
+Real GPU acceptance completed on 2026-08-13 in the single-host 1 QD + 2
+Primary shared-GPU topology.  The colocated plan used a top result-collection
+Motion with per-QE `HashAggregate -> GpuPreAgg` below it and no pre-final
+Motion; the non-colocated plan retained `HashAggregate -> Gather Motion ->
+GpuPreAgg`.  CPU/GPU digests, QE actual instrumentation, M4b/MVP, shared-budget
+concurrency, cancel, SIGHUP and SIGKILL recovery all passed, and final Service
+gauges drained to the idle reservation baseline.
+
 ### GpuPreAgg cancellation and failure recovery
 
 The M3 runners reuse the established GpuScan cancellation and recovery

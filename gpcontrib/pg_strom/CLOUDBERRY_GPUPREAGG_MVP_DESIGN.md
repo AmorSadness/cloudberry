@@ -509,7 +509,7 @@ M4b 已于 2026-08-13 完成代码、静态检查和真实 GPU 验收。16MiB gr
 ### 后续非本 MVP 阶段
 
 - 已证明 group keys 覆盖 distribution keys 时的无 pre-final Motion/local final
-  优化已进入 M5a 实现与验收阶段，见
+  优化已于 2026-08-13 完成 M5a 真实单机共享 GPU 验收，见
   `CLOUDBERRY_GPUPREAGG_M5A_DESIGN.md`；
 - Redistribute Motion by GROUP BY keys + parallel final aggregate只能在当前单机
   共享 GPU 环境形成计划和正确性结论，不形成多 GPU 扩展性结论；
