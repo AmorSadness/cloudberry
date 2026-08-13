@@ -82,6 +82,15 @@ single-host topology; cardinality/cost calibration, high-cardinality pressure,
 multi-host execution, concurrency isolation, and performance claims remain
 outside M4a.
 
+The next P0 implements host-wide GPU allocation admission for the actual
+single-host topology.  Independent coordinator/Segment GPU Services now share
+a per-UID/per-GPU-UUID budget ledger; memory-pool segments, direct query
+buffers, and GpuPreAgg expansion peaks reserve before CUDA allocation and
+release on all normal cleanup paths.  Extension 6.2 exposes host/local
+reservation and admission counters in `pgstrom.gpu_service_status`.  The code
+and design are complete, but real concurrent GPU, cancel, and SIGKILL recovery
+acceptance is still pending; see `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`.
+
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.
 `custom_private` remains opaque extension data.

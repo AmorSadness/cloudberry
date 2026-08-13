@@ -13,6 +13,52 @@
 #include "pgstrom_device_config.h"
 #include "cuda_common.h"
 #include <cudaProfiler.h>
+#include <sys/file.h>
+
+/*
+ * Host-wide query-buffer admission control
+ *
+ * A Cloudberry primary has its own postmaster and GPU-Service.  PostgreSQL
+ * shared memory therefore cannot coordinate multiple primaries which share a
+ * physical GPU.  Keep a small, per-UID/per-GPU-UUID POSIX shared-memory ledger
+ * instead.  The ledger contains only accounting data; CUDA allocations remain
+ * owned by the individual GPU-Service processes.
+ */
+#define GPU_SHARED_BUDGET_MAGIC       0x47534247U /* "GSBG" */
+#define GPU_SHARED_BUDGET_VERSION     1U
+#define GPU_SHARED_BUDGET_NSLOTS      128
+
+typedef struct
+{
+	pid_t		owner_pid;
+	uint32_t	waiting;
+	uint64_t	owner_start_time;
+	uint64_t	budget_bytes;
+	uint64_t	reserved_bytes;
+} gpuSharedBudgetOwner;
+
+typedef struct
+{
+	uint32_t	magic;
+	uint32_t	version;
+	pthread_mutex_t mutex;
+	uint64_t	device_bytes;
+	uint64_t	admissions;
+	uint64_t	rejections;
+	uint64_t	wait_events;
+	uint64_t	stale_reclaims;
+	uint32_t	waiters;
+	uint32_t	padding;
+	gpuSharedBudgetOwner owners[GPU_SHARED_BUDGET_NSLOTS];
+} gpuSharedBudgetState;
+
+typedef struct
+{
+	int			fd;
+	int			owner_slot;
+	char		name[128];
+	gpuSharedBudgetState *state;
+} gpuSharedBudget;
 /*
  * gpuContext / gpuMemory
  */
@@ -37,6 +83,7 @@ struct gpuContext
 	CUdevice		cuda_device;
 	CUmemLocation	cuda_mlocation;
 	CUcontext		cuda_context;
+	gpuSharedBudget shared_budget;
 	CUmodule		cuda_module;
 	HTAB		   *cuda_type_htab;
 	HTAB		   *cuda_func_htab;
@@ -118,6 +165,13 @@ typedef struct
 	pg_atomic_uint64 completed_commands;
 	pg_atomic_uint64 failed_commands;
 	pg_atomic_uint64 cancelled_commands;
+	pg_atomic_uint64 shared_budget_bytes;
+	pg_atomic_uint64 shared_reserved_bytes;
+	pg_atomic_uint64 local_reserved_bytes;
+	pg_atomic_uint64 budget_admissions;
+	pg_atomic_uint64 budget_rejections;
+	pg_atomic_uint64 budget_waits;
+	pg_atomic_uint64 stale_reclaims;
 } gpuServDeviceStats;
 
 typedef struct
@@ -169,8 +223,13 @@ static shmem_startup_hook_type shmem_startup_next = NULL;
 static gpuServSharedState *gpuserv_shared_state = NULL;
 static int			__pgstrom_max_async_tasks_dummy;
 static int			__pgstrom_cuda_stack_limit_kb;
+static double		pgstrom_shared_gpu_budget_ratio;
+static int			pgstrom_shared_gpu_budget_timeout_ms;
 static char		   *pgstrom_cuda_toolkit_basedir = CUDA_TOOLKIT_BASEDIR; /* GUC */
 static const char  *pgstrom_fatbin_image_filename = "/dev/null";
+
+static bool gpuSharedBudgetReserve(gpuContext *gcontext, size_t bytesize);
+static void gpuSharedBudgetRelease(gpuContext *gcontext, size_t bytesize);
 
 static inline size_t
 gpuServSharedStateSize(void)
@@ -1122,6 +1181,13 @@ __gpuMemAllocNewSegment(gpuMemoryPool *pool, size_t segment_sz)
 
 	if (!mseg || !chunk)
 		goto error_0;
+	if (!gpuSharedBudgetReserve(pool->gcontext, segment_sz))
+	{
+		__gsInfoCxt(pool->gcontext,
+				   "shared GPU budget rejected memory-pool segment (sz=%s)",
+				   format_bytesz(segment_sz));
+		goto error_0;
+	}
 	mseg->pool = pool;
 	mseg->segment_sz = segment_sz;
 	mseg->active_sz = 0;
@@ -1177,6 +1243,7 @@ error_1:
 		cuMemFree(mseg->devptr);
 	if (gcontext_saved)
 		gpuContextSwitchTo(gcontext_saved);
+	gpuSharedBudgetRelease(pool->gcontext, segment_sz);
 error_0:
 	if (mseg)
 		free(mseg);
@@ -1354,6 +1421,7 @@ __gpuMemoryPoolMaintenanceTask(gpuContext *gcontext, gpuMemoryPool *pool)
 			rc = cuMemFree(mseg->devptr);
 			if (rc != CUDA_SUCCESS)
 				__FATAL("failed on cuMemFree: %s", cuStrError(rc));
+			gpuSharedBudgetRelease(gcontext, mseg->segment_sz);
 			/* detach segment */
 			dlist_delete(&mseg->chain);
 			while (!dlist_is_empty(&mseg->addr_chunks))
@@ -1399,6 +1467,413 @@ gpuMemoryPoolInit(gpuContext *gcontext,
 	pool->hard_limit = pgstrom_gpu_mempool_max_ratio * (double)dev_total_memsz;
 	pool->keep_limit = pgstrom_gpu_mempool_min_ratio * (double)dev_total_memsz;
 	dlist_init(&pool->segment_list);
+}
+
+static int
+gpuSharedBudgetLock(gpuSharedBudgetState *state)
+{
+	int		err = pthread_mutex_lock(&state->mutex);
+
+#ifdef __linux__
+	if (err == EOWNERDEAD)
+	{
+		pthread_mutex_consistent(&state->mutex);
+		return 0;
+	}
+#endif
+	return err;
+}
+
+/* Linux /proc field 22 is the process start time in clock ticks.  Pairing it
+ * with PID prevents a stale reservation from surviving rapid PID reuse. */
+static uint64_t
+gpuSharedBudgetProcessStartTime(pid_t pid)
+{
+#ifdef __linux__
+	char	path[64];
+	char	buffer[1024];
+	char   *pos;
+	char   *saveptr = NULL;
+	FILE   *filp;
+	int		field = 3;
+
+	snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+	filp = fopen(path, "r");
+	if (!filp)
+		return 0;
+	if (!fgets(buffer, sizeof(buffer), filp))
+	{
+		fclose(filp);
+		return 0;
+	}
+	fclose(filp);
+	pos = strrchr(buffer, ')');
+	if (!pos || pos[1] != ' ')
+		return 0;
+	for (pos = strtok_r(pos + 2, " ", &saveptr);
+		 pos != NULL;
+		 pos = strtok_r(NULL, " ", &saveptr), field++)
+	{
+		if (field == 22)
+			return strtoull(pos, NULL, 10);
+	}
+#endif
+	return 0;
+}
+
+/* Caller holds state->mutex.  Return the effective (most conservative)
+ * budget and reclaim services which died without running normal cleanup. */
+static uint64_t
+gpuSharedBudgetSweep(gpuSharedBudgetState *state,
+					 uint64_t *p_reserved,
+					 uint64_t *p_reclaimed)
+{
+	uint64_t	budget = UINT64_MAX;
+	uint64_t	reserved = 0;
+	uint64_t	reclaimed = 0;
+
+	for (int i=0; i < GPU_SHARED_BUDGET_NSLOTS; i++)
+	{
+		gpuSharedBudgetOwner *owner = &state->owners[i];
+		uint64_t	observed_start_time;
+
+		if (owner->owner_pid == 0)
+			continue;
+		observed_start_time = gpuSharedBudgetProcessStartTime(owner->owner_pid);
+		if ((kill(owner->owner_pid, 0) != 0 && errno == ESRCH) ||
+			(owner->owner_start_time != 0 && observed_start_time != 0 &&
+			 observed_start_time != owner->owner_start_time))
+		{
+			reclaimed += owner->reserved_bytes;
+			if (owner->waiting && state->waiters > 0)
+				state->waiters--;
+			memset(owner, 0, sizeof(*owner));
+			state->stale_reclaims++;
+			continue;
+		}
+		budget = Min(budget, owner->budget_bytes);
+		reserved += owner->reserved_bytes;
+	}
+	if (budget == UINT64_MAX)
+		budget = 0;
+	*p_reserved = reserved;
+	*p_reclaimed = reclaimed;
+	return budget;
+}
+
+static void
+gpuSharedBudgetPublish(gpuContext *gcontext,
+					   uint64_t budget, uint64_t reserved)
+{
+	gpuServDeviceStats *dstats = gpuServGetDeviceStats(gcontext);
+	gpuSharedBudgetState *state = gcontext->shared_budget.state;
+	gpuSharedBudgetOwner *owner = NULL;
+
+	if (state && gcontext->shared_budget.owner_slot >= 0)
+		owner = &state->owners[gcontext->shared_budget.owner_slot];
+	pg_atomic_write_u64(&dstats->shared_budget_bytes, budget);
+	pg_atomic_write_u64(&dstats->shared_reserved_bytes, reserved);
+	pg_atomic_write_u64(&dstats->local_reserved_bytes,
+						owner ? owner->reserved_bytes : 0);
+	if (state)
+	{
+		pg_atomic_write_u64(&dstats->budget_admissions, state->admissions);
+		pg_atomic_write_u64(&dstats->budget_rejections, state->rejections);
+		pg_atomic_write_u64(&dstats->budget_waits, state->wait_events);
+		pg_atomic_write_u64(&dstats->stale_reclaims, state->stale_reclaims);
+	}
+}
+
+static void
+gpuSharedBudgetAttach(gpuContext *gcontext)
+{
+	GpuDevAttributes *dattrs = &gpuDevAttrs[gcontext->cuda_dindex];
+	gpuSharedBudget *budget = &gcontext->shared_budget;
+	gpuSharedBudgetState *state;
+	pthread_mutexattr_t mattr;
+	struct stat	st;
+	bool		needs_init = false;
+	uint64_t	reserved, reclaimed, effective;
+	char		uuid[80];
+	int		j = 0;
+
+	budget->fd = -1;
+	budget->owner_slot = -1;
+	for (int i=0; dattrs->DEV_UUID[i] != '\0' && j < sizeof(uuid)-1; i++)
+	{
+		unsigned char c = dattrs->DEV_UUID[i];
+		if (isalnum(c))
+			uuid[j++] = tolower(c);
+	}
+	uuid[j] = '\0';
+	snprintf(budget->name, sizeof(budget->name),
+			 "/pgstrom-gpu-budget-%u-%s", (unsigned)geteuid(), uuid);
+	budget->fd = shm_open(budget->name, O_RDWR | O_CREAT, 0600);
+	if (budget->fd < 0)
+		elog(ERROR, "could not open shared GPU budget %s: %m", budget->name);
+	if (flock(budget->fd, LOCK_EX) != 0)
+		elog(ERROR, "could not lock shared GPU budget %s: %m", budget->name);
+	if (fstat(budget->fd, &st) != 0)
+		elog(ERROR, "could not stat shared GPU budget %s: %m", budget->name);
+	if (st.st_size == 0)
+	{
+		if (ftruncate(budget->fd, sizeof(gpuSharedBudgetState)) != 0)
+			elog(ERROR, "could not size shared GPU budget %s: %m", budget->name);
+		needs_init = true;
+	}
+	else if (st.st_size != sizeof(gpuSharedBudgetState))
+		elog(ERROR, "incompatible shared GPU budget %s (size %lld, expected %zu)",
+			 budget->name, (long long)st.st_size, sizeof(gpuSharedBudgetState));
+	state = mmap(NULL, sizeof(*state), PROT_READ | PROT_WRITE,
+				 MAP_SHARED, budget->fd, 0);
+	if (state == MAP_FAILED)
+		elog(ERROR, "could not map shared GPU budget %s: %m", budget->name);
+	budget->state = state;
+	if (!needs_init && state->magic == 0 && state->version == 0)
+		needs_init = true;
+	if (needs_init)
+	{
+		memset(state, 0, sizeof(*state));
+		if (pthread_mutexattr_init(&mattr) != 0 ||
+			pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED) != 0)
+			elog(ERROR, "could not initialize process-shared GPU budget mutex");
+#ifdef __linux__
+		if (pthread_mutexattr_setrobust(&mattr, PTHREAD_MUTEX_ROBUST) != 0)
+			elog(ERROR, "could not initialize robust GPU budget mutex");
+#endif
+		if (pthread_mutex_init(&state->mutex, &mattr) != 0)
+			elog(ERROR, "could not initialize shared GPU budget mutex");
+		pthread_mutexattr_destroy(&mattr);
+		state->device_bytes = dattrs->DEV_TOTAL_MEMSZ;
+		state->version = GPU_SHARED_BUDGET_VERSION;
+		state->magic = GPU_SHARED_BUDGET_MAGIC;
+	}
+	else if (state->magic != GPU_SHARED_BUDGET_MAGIC ||
+			 state->version != GPU_SHARED_BUDGET_VERSION ||
+			 state->device_bytes != dattrs->DEV_TOTAL_MEMSZ)
+		elog(ERROR, "incompatible shared GPU budget header %s", budget->name);
+	flock(budget->fd, LOCK_UN);
+
+	if (gpuSharedBudgetLock(state) != 0)
+		elog(ERROR, "could not lock shared GPU budget %s", budget->name);
+	effective = gpuSharedBudgetSweep(state, &reserved, &reclaimed);
+	for (int i=0; i < GPU_SHARED_BUDGET_NSLOTS; i++)
+	{
+		if (state->owners[i].owner_pid == 0)
+		{
+			state->owners[i].owner_pid = MyProcPid;
+			state->owners[i].owner_start_time =
+				gpuSharedBudgetProcessStartTime(MyProcPid);
+			state->owners[i].budget_bytes =
+				(uint64_t)((double)dattrs->DEV_TOTAL_MEMSZ *
+						   pgstrom_shared_gpu_budget_ratio);
+			budget->owner_slot = i;
+			break;
+		}
+	}
+	if (budget->owner_slot < 0)
+	{
+		pthread_mutex_unlock(&state->mutex);
+		elog(ERROR, "too many GPU-Service owners for shared GPU budget %s",
+			 budget->name);
+	}
+	effective = (effective == 0
+				 ? state->owners[budget->owner_slot].budget_bytes
+				 : Min(effective, state->owners[budget->owner_slot].budget_bytes));
+	gpuSharedBudgetPublish(gcontext, effective, reserved);
+	pthread_mutex_unlock(&state->mutex);
+}
+
+static bool
+gpuSharedBudgetReserve(gpuContext *gcontext, size_t bytesize)
+{
+	gpuSharedBudget *budget = &gcontext->shared_budget;
+	gpuSharedBudgetState *state = budget->state;
+	struct timespec ts0, ts;
+	bool		waited = false;
+
+	if (state == NULL || budget->owner_slot < 0)
+		return false;
+	clock_gettime(CLOCK_MONOTONIC, &ts0);
+	for (;;)
+	{
+		gpuSharedBudgetOwner *owner;
+		uint64_t effective, reserved, reclaimed;
+		int64_t elapsed_ms;
+
+		if (gpuSharedBudgetLock(state) != 0)
+			return false;
+		effective = gpuSharedBudgetSweep(state, &reserved, &reclaimed);
+		owner = &state->owners[budget->owner_slot];
+		if (owner->owner_pid != MyProcPid)
+		{
+			pthread_mutex_unlock(&state->mutex);
+			return false;
+		}
+		if (bytesize <= effective && reserved <= effective - bytesize)
+		{
+			owner->reserved_bytes += bytesize;
+			reserved += bytesize;
+			state->admissions++;
+			if (waited)
+			{
+				state->waiters--;
+				owner->waiting = 0;
+			}
+			gpuSharedBudgetPublish(gcontext, effective, reserved);
+			pthread_mutex_unlock(&state->mutex);
+			return true;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		elapsed_ms = ((ts.tv_sec - ts0.tv_sec) * 1000L +
+					  (ts.tv_nsec - ts0.tv_nsec) / 1000000L);
+		if (pgstrom_shared_gpu_budget_timeout_ms == 0 ||
+			elapsed_ms >= pgstrom_shared_gpu_budget_timeout_ms)
+		{
+			state->rejections++;
+			if (waited)
+			{
+				state->waiters--;
+				owner->waiting = 0;
+			}
+			gpuSharedBudgetPublish(gcontext, effective, reserved);
+			pthread_mutex_unlock(&state->mutex);
+			return false;
+		}
+		if (!waited)
+		{
+			state->waiters++;
+			state->wait_events++;
+			owner->waiting = 1;
+			waited = true;
+		}
+		pthread_mutex_unlock(&state->mutex);
+		pg_usleep(10000L);
+	}
+}
+
+static void
+gpuSharedBudgetRelease(gpuContext *gcontext, size_t bytesize)
+{
+	gpuSharedBudget *budget = &gcontext->shared_budget;
+	gpuSharedBudgetState *state = budget->state;
+	gpuSharedBudgetOwner *owner;
+	uint64_t effective, reserved, reclaimed;
+
+	if (!state || budget->owner_slot < 0 || gpuSharedBudgetLock(state) != 0)
+		return;
+	effective = gpuSharedBudgetSweep(state, &reserved, &reclaimed);
+	owner = &state->owners[budget->owner_slot];
+	if (owner->owner_pid == MyProcPid)
+	{
+		if (bytesize > owner->reserved_bytes)
+			owner->reserved_bytes = 0;
+		else
+			owner->reserved_bytes -= bytesize;
+		reserved = 0;
+		effective = gpuSharedBudgetSweep(state, &reserved, &reclaimed);
+	}
+	gpuSharedBudgetPublish(gcontext, effective, reserved);
+	pthread_mutex_unlock(&state->mutex);
+}
+
+static void
+gpuSharedBudgetDetach(gpuContext *gcontext)
+{
+	gpuSharedBudget *budget = &gcontext->shared_budget;
+	gpuSharedBudgetState *state = budget->state;
+	uint64_t effective, reserved, reclaimed;
+
+	if (!state)
+		return;
+	if (gpuSharedBudgetLock(state) == 0)
+	{
+		if (budget->owner_slot >= 0 &&
+			state->owners[budget->owner_slot].owner_pid == MyProcPid)
+		{
+			if (state->owners[budget->owner_slot].waiting && state->waiters > 0)
+				state->waiters--;
+			memset(&state->owners[budget->owner_slot], 0,
+				   sizeof(state->owners[budget->owner_slot]));
+		}
+		effective = gpuSharedBudgetSweep(state, &reserved, &reclaimed);
+		gpuSharedBudgetPublish(gcontext, effective, reserved);
+		pthread_mutex_unlock(&state->mutex);
+	}
+	/* Client monitor threads are detached and may still be unwinding while the
+	 * main service thread shuts down.  Keep the mapping valid until process
+	 * exit; the kernel closes it and the fd.  Clearing the owner is sufficient
+	 * to make the reservation immediately unavailable to new work. */
+	budget->owner_slot = -1;
+}
+
+/* Read the ledger directly from SQL backends so host-wide columns are current
+ * even when another postmaster performed the latest reserve/release. */
+static bool
+gpuSharedBudgetReadStatus(int dindex, pid_t service_pid,
+					  uint64_t *p_budget, uint64_t *p_reserved,
+					  uint64_t *p_local, uint64_t *p_admissions,
+					  uint64_t *p_rejections, uint64_t *p_waits,
+					  uint64_t *p_reclaims)
+{
+	gpuSharedBudgetState *state;
+	struct stat	st;
+	char		name[128];
+	char		uuid[80];
+	uint64_t	reclaimed;
+	int		fd;
+	int		j = 0;
+
+	for (int i=0; gpuDevAttrs[dindex].DEV_UUID[i] != '\0' &&
+				  j < sizeof(uuid)-1; i++)
+	{
+		unsigned char c = gpuDevAttrs[dindex].DEV_UUID[i];
+		if (isalnum(c))
+			uuid[j++] = tolower(c);
+	}
+	uuid[j] = '\0';
+	snprintf(name, sizeof(name), "/pgstrom-gpu-budget-%u-%s",
+			 (unsigned)geteuid(), uuid);
+	fd = shm_open(name, O_RDWR, 0600);
+	if (fd < 0)
+		return false;
+	if (fstat(fd, &st) != 0 || st.st_size != sizeof(*state))
+	{
+		close(fd);
+		return false;
+	}
+	state = mmap(NULL, sizeof(*state), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (state == MAP_FAILED)
+	{
+		close(fd);
+		return false;
+	}
+	if (state->magic != GPU_SHARED_BUDGET_MAGIC ||
+		state->version != GPU_SHARED_BUDGET_VERSION ||
+		gpuSharedBudgetLock(state) != 0)
+	{
+		munmap(state, sizeof(*state));
+		close(fd);
+		return false;
+	}
+	*p_budget = gpuSharedBudgetSweep(state, p_reserved, &reclaimed);
+	*p_local = 0;
+	for (int i=0; i < GPU_SHARED_BUDGET_NSLOTS; i++)
+	{
+		if (state->owners[i].owner_pid == service_pid)
+		{
+			*p_local = state->owners[i].reserved_bytes;
+			break;
+		}
+	}
+	*p_admissions = state->admissions;
+	*p_rejections = state->rejections;
+	*p_waits = state->wait_events;
+	*p_reclaims = state->stale_reclaims;
+	pthread_mutex_unlock(&state->mutex);
+	munmap(state, sizeof(*state));
+	close(fd);
+	return true;
 }
 
 /*
@@ -1541,6 +2016,7 @@ struct gpuQueryBuffer
 	CUdeviceptr	   *gpumem_devptrs;
 	size_t		   *gpumem_lengths;
 	char		   *gpumem_kinds;
+	int			   *gpumem_dindexes;
 	struct {
 		CUdeviceptr	m_kds_final;		/* final buffer (device) */
 		size_t		m_kds_final_length;	/* length of final buffer */
@@ -1595,6 +2071,11 @@ __enlargeGpuQueryBuffer(gpuQueryBuffer *gq_buf)
 		if (!__temp)
 			return false;
 		gq_buf->gpumem_kinds = __temp;
+
+		__temp = realloc(gq_buf->gpumem_dindexes, sizeof(int) * __nrooms);
+		if (!__temp)
+			return false;
+		gq_buf->gpumem_dindexes = __temp;
 		gq_buf->gpumem_nrooms  = __nrooms;
     }
 	return true;
@@ -1611,14 +2092,24 @@ allocGpuQueryBuffer(gpuQueryBuffer *gq_buf,
 
 	if (!__enlargeGpuQueryBuffer(gq_buf))
 		return CUDA_ERROR_OUT_OF_MEMORY;
+	if (!gpuSharedBudgetReserve(GpuWorkerCurrentContext, bytesize))
+	{
+		__gsInfo("shared GPU budget rejected query buffer (kind=%c, sz=%s)",
+				 gqbuf_kind, format_bytesz(bytesize));
+		return CUDA_ERROR_OUT_OF_MEMORY;
+	}
 	/* allocation */
 	rc = cuMemAllocManaged(&m_devptr, bytesize,
 						   CU_MEM_ATTACH_GLOBAL);
 	if (rc != CUDA_SUCCESS)
+	{
+		gpuSharedBudgetRelease(GpuWorkerCurrentContext, bytesize);
 		return rc;
+	}
 	gq_buf->gpumem_devptrs[gq_buf->gpumem_nitems] = m_devptr;
 	gq_buf->gpumem_lengths[gq_buf->gpumem_nitems] = bytesize;
 	gq_buf->gpumem_kinds[gq_buf->gpumem_nitems] = gqbuf_kind;
+	gq_buf->gpumem_dindexes[gq_buf->gpumem_nitems] = MY_DINDEX_PER_THREAD;
 	gq_buf->gpumem_nitems++;
 	*p_devptr = m_devptr;
 
@@ -1639,6 +2130,9 @@ __releaseGpuQueryBufferOne(gpuQueryBuffer *gq_buf, int index)
 	rc = cuMemFree(m_devptr);
 	if (rc != CUDA_SUCCESS)
 		__FATAL("failed on cuMemFree(%p): %s", (void *)m_devptr, cuStrError(rc));
+	gpuSharedBudgetRelease(&gpuserv_gpucontext_array[
+							gq_buf->gpumem_dindexes[index]],
+					   gq_buf->gpumem_lengths[index]);
 	__gsInfo("Query buffer release one at %p (kind=%c, sz=%s)",
 			 (void *)m_devptr,
 			 gq_buf->gpumem_kinds[index],
@@ -1646,6 +2140,7 @@ __releaseGpuQueryBufferOne(gpuQueryBuffer *gq_buf, int index)
 	gq_buf->gpumem_devptrs[index] = 0UL;
 	gq_buf->gpumem_lengths[index] = 0UL;
 	gq_buf->gpumem_kinds[index] = 0;
+	gq_buf->gpumem_dindexes[index] = -1;
 }
 
 static void
@@ -1688,6 +2183,10 @@ __putGpuQueryBufferNoLock(gpuQueryBuffer *gq_buf)
 				__gsDebug("failed on munmap: %m");
 		}
 		dlist_delete(&gq_buf->chain);
+		free(gq_buf->gpumem_devptrs);
+		free(gq_buf->gpumem_lengths);
+		free(gq_buf->gpumem_kinds);
+		free(gq_buf->gpumem_dindexes);
 		free(gq_buf);
 	}
 }
@@ -2538,10 +3037,21 @@ __expandGpuQueryGroupByBuffer(gpuClient *gclient,
 		gettimeofday(&tv1, NULL);
 		assert(kds_old->length == kds_length_last);
 		length = kds_old->length + Max(kds_old->length, 1UL<<30);
+		/* Reserve the full replacement while the old buffer is still live.
+		 * This accounts for the real expansion peak, not only the final delta. */
+		if (!gpuSharedBudgetReserve(GpuWorkerCurrentContext, length))
+		{
+			pthreadRWLockUnlock(&gq_buf->m_kds_rwlock);
+			gpuClientELog(gclient,
+						  "shared GPU budget rejected GpuPreAgg expansion (%lu bytes)",
+						  length);
+			return false;
+		}
 		rc = cuMemAllocManaged(&m_devptr, length,
 							   CU_MEM_ATTACH_GLOBAL);
 		if (rc != CUDA_SUCCESS)
 		{
+			gpuSharedBudgetRelease(GpuWorkerCurrentContext, length);
 			pthreadRWLockUnlock(&gq_buf->m_kds_rwlock);
 			gpuClientELog(gclient, "failed on cuMemAllocManaged(%lu): %s",
 						  length, cuStrError(rc));
@@ -2559,6 +3069,7 @@ __expandGpuQueryGroupByBuffer(gpuClient *gclient,
 		{
 			pthreadRWLockUnlock(&gq_buf->m_kds_rwlock);
 			cuMemFree(m_devptr);
+			gpuSharedBudgetRelease(GpuWorkerCurrentContext, length);
 			gpuClientELog(gclient, "failed on cuMemcpyDtoD: %s", cuStrError(rc));
 			return false;
 		}
@@ -2572,6 +3083,7 @@ __expandGpuQueryGroupByBuffer(gpuClient *gclient,
 		{
 			pthreadRWLockUnlock(&gq_buf->m_kds_rwlock);
 			cuMemFree(m_devptr);
+			gpuSharedBudgetRelease(GpuWorkerCurrentContext, length);
 			gpuClientELog(gclient, "failed on cuMemcpyDtoD: %s", cuStrError(rc));
 			return false;
 		}
@@ -2582,6 +3094,7 @@ __expandGpuQueryGroupByBuffer(gpuClient *gclient,
 			if (gq_buf->gpumem_devptrs[i] == (CUdeviceptr)kds_old)
 			{
 				gq_buf->gpumem_devptrs[i] = (CUdeviceptr)kds_new;
+				gq_buf->gpumem_lengths[i] = length;
 				goto found;
 			}
 		}
@@ -2592,6 +3105,7 @@ __expandGpuQueryGroupByBuffer(gpuClient *gclient,
 				  (double)((tv2.tv_sec  - tv1.tv_sec)   * 1000000 +
 						   (tv2.tv_usec - tv1.tv_usec)) / 1000000.0);
 		cuMemFree((CUdeviceptr)kds_old);
+		gpuSharedBudgetRelease(GpuWorkerCurrentContext, kds_length_last);
 		gq_buf->gpus[MY_DINDEX_PER_THREAD].m_kds_final = m_devptr;
 		gq_buf->gpus[MY_DINDEX_PER_THREAD].m_kds_final_length = length;
 	}
@@ -6746,6 +7260,7 @@ gpuservSetupGpuContext(int cuda_dindex)
 	gpuservSetupGpuModule(gcontext);
 	gpuMemoryPoolInit(gcontext, false, dattrs->DEV_TOTAL_MEMSZ);
 	gpuMemoryPoolInit(gcontext, true, dattrs->DEV_TOTAL_MEMSZ);
+	gpuSharedBudgetAttach(gcontext);
 	/* enable kernel profiling if captured */
 	if (getenv("NSYS_PROFILING_SESSION_ID") != NULL)
 	{
@@ -6827,6 +7342,13 @@ gpuservCleanupOnProcExit(int code, Datum arg)
 	struct stat	stat_buf;
 	char		path[MAXPGPATH];
 
+	/* Retire host-wide owner slots at the latest process-exit callback. */
+	if (gpuserv_gpucontext_array)
+	{
+		for (int i=0; i < numGpuDevAttrs; i++)
+			gpuSharedBudgetDetach(&gpuserv_gpucontext_array[i]);
+	}
+
 	snprintf(path, sizeof(path),
 			 ".pg_strom.%u.gpuserv.sock", PostmasterPid);
 	if (stat(path, &stat_buf) == 0 &&
@@ -6862,6 +7384,9 @@ gpuservBgWorkerMain(Datum arg)
 		pg_atomic_write_u32(&dstats->actual_workers, 0);
 		pg_atomic_write_u32(&dstats->queued_commands, 0);
 		pg_atomic_write_u32(&dstats->active_commands, 0);
+		pg_atomic_write_u64(&dstats->shared_budget_bytes, 0);
+		pg_atomic_write_u64(&dstats->shared_reserved_bytes, 0);
+		pg_atomic_write_u64(&dstats->local_reserved_bytes, 0);
 	}
 	pg_memory_barrier();
 
@@ -7002,8 +7527,15 @@ pgstrom_gpu_service_status(PG_FUNCTION_ARGS)
 	bool		ready;
 	char		fatbin_name[MAXPGPATH];
 	char	   *device_config;
-	Datum		values[18];
-	bool		isnull[18];
+	uint64_t	shared_budget_bytes;
+	uint64_t	shared_reserved_bytes;
+	uint64_t	local_reserved_bytes;
+	uint64_t	budget_admissions;
+	uint64_t	budget_rejections;
+	uint64_t	budget_waits;
+	uint64_t	stale_reclaims;
+	Datum		values[25];
+	bool		isnull[25];
 	HeapTuple	tuple;
 	gpuServDeviceStats *dstats;
 
@@ -7014,7 +7546,7 @@ pgstrom_gpu_service_status(PG_FUNCTION_ARGS)
 
 		fncxt = SRF_FIRSTCALL_INIT();
 		oldcxt = MemoryContextSwitchTo(fncxt->multi_call_memory_ctx);
-		tupdesc = CreateTemplateTupleDesc(18);
+		tupdesc = CreateTemplateTupleDesc(25);
 		TupleDescInitEntry(tupdesc, 1, "content_id", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, 2, "postmaster_pid", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, 3, "service_pid", INT4OID, -1, 0);
@@ -7031,8 +7563,15 @@ pgstrom_gpu_service_status(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, 14, "completed_commands", INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, 15, "failed_commands", INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, 16, "cancelled_commands", INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, 17, "fatbin_name", TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, 18, "device_config", TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, 17, "shared_budget_bytes", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 18, "shared_reserved_bytes", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 19, "local_reserved_bytes", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 20, "budget_admissions", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 21, "budget_rejections", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 22, "budget_waits", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 23, "stale_reclaims", INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 24, "fatbin_name", TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, 25, "device_config", TEXTOID, -1, 0);
 		fncxt->tuple_desc = BlessTupleDesc(tupdesc);
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -7043,6 +7582,21 @@ pgstrom_gpu_service_status(PG_FUNCTION_ARGS)
 
 	dstats = &gpuserv_shared_state->device_stats[dindex];
 	service_pid = pg_atomic_read_u32(&gpuserv_shared_state->service_pid);
+	shared_budget_bytes = pg_atomic_read_u64(&dstats->shared_budget_bytes);
+	shared_reserved_bytes = pg_atomic_read_u64(&dstats->shared_reserved_bytes);
+	local_reserved_bytes = pg_atomic_read_u64(&dstats->local_reserved_bytes);
+	budget_admissions = pg_atomic_read_u64(&dstats->budget_admissions);
+	budget_rejections = pg_atomic_read_u64(&dstats->budget_rejections);
+	budget_waits = pg_atomic_read_u64(&dstats->budget_waits);
+	stale_reclaims = pg_atomic_read_u64(&dstats->stale_reclaims);
+	(void)gpuSharedBudgetReadStatus(dindex, (pid_t)service_pid,
+								&shared_budget_bytes,
+								&shared_reserved_bytes,
+								&local_reserved_bytes,
+								&budget_admissions,
+								&budget_rejections,
+								&budget_waits,
+								&stale_reclaims);
 	ready = gpuserv_shared_state->gpuserv_ready_accept && service_pid > 0;
 	if (ready && kill((pid_t)service_pid, 0) != 0 && errno != EPERM)
 		ready = false;
@@ -7079,8 +7633,15 @@ pgstrom_gpu_service_status(PG_FUNCTION_ARGS)
 	values[13] = Int64GetDatum(pg_atomic_read_u64(&dstats->completed_commands));
 	values[14] = Int64GetDatum(pg_atomic_read_u64(&dstats->failed_commands));
 	values[15] = Int64GetDatum(pg_atomic_read_u64(&dstats->cancelled_commands));
-	values[16] = CStringGetTextDatum(fatbin_name);
-	values[17] = CStringGetTextDatum(device_config);
+	values[16] = Int64GetDatum(shared_budget_bytes);
+	values[17] = Int64GetDatum(shared_reserved_bytes);
+	values[18] = Int64GetDatum(local_reserved_bytes);
+	values[19] = Int64GetDatum(budget_admissions);
+	values[20] = Int64GetDatum(budget_rejections);
+	values[21] = Int64GetDatum(budget_waits);
+	values[22] = Int64GetDatum(stale_reclaims);
+	values[23] = CStringGetTextDatum(fatbin_name);
+	values[24] = CStringGetTextDatum(device_config);
 
 	tuple = heap_form_tuple(fncxt->tuple_desc, values, isnull);
 	SRF_RETURN_NEXT(fncxt, HeapTupleGetDatum(tuple));
@@ -7131,6 +7692,13 @@ pgstrom_startup_executor(void)
 			pg_atomic_init_u64(&dstats->completed_commands, 0);
 			pg_atomic_init_u64(&dstats->failed_commands, 0);
 			pg_atomic_init_u64(&dstats->cancelled_commands, 0);
+			pg_atomic_init_u64(&dstats->shared_budget_bytes, 0);
+			pg_atomic_init_u64(&dstats->shared_reserved_bytes, 0);
+			pg_atomic_init_u64(&dstats->local_reserved_bytes, 0);
+			pg_atomic_init_u64(&dstats->budget_admissions, 0);
+			pg_atomic_init_u64(&dstats->budget_rejections, 0);
+			pg_atomic_init_u64(&dstats->budget_waits, 0);
+			pg_atomic_init_u64(&dstats->stale_reclaims, 0);
 		}
 	}
 }
@@ -7144,6 +7712,26 @@ pgstrom_init_gpu_service(void)
 	BackgroundWorker worker;
 
 	Assert(numGpuDevAttrs > 0);
+	DefineCustomRealVariable("pg_strom.shared_gpu_budget_ratio",
+							 "Host-wide budget ratio for PG-Strom allocations on each physical GPU",
+							 "All GPU-Service processes of the same OS user and GPU UUID use the most conservative configured ratio.",
+							 &pgstrom_shared_gpu_budget_ratio,
+							 0.80,
+							 0.10,
+							 0.95,
+							 PGC_SIGHUP,
+							 GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL,
+							 NULL, NULL, NULL);
+	DefineCustomIntVariable("pg_strom.shared_gpu_budget_timeout",
+							"Maximum wait for host-wide GPU budget admission",
+							"Zero rejects immediately; a positive value applies bounded backpressure.",
+							&pgstrom_shared_gpu_budget_timeout_ms,
+							5000,
+							0,
+							600000,
+							PGC_SIGHUP,
+							GUC_NOT_IN_SAMPLE | GUC_UNIT_MS | GUC_NO_SHOW_ALL,
+							NULL, NULL, NULL);
 	DefineCustomIntVariable("pg_strom.gpu_mempool_segment_sz",
 							"Segment size of GPU memory pool",
 							NULL,

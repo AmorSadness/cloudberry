@@ -487,6 +487,10 @@ CustomScan mutation。如果实现中发现 extension hook 时点无法合法构
 
 ### M4b：成本校准和性能探索
 
+M4b 在单机共享 GPU 拓扑下由 P0 资源门前置。主机级预算、并发 admission 与
+异常回收的实现见 `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`；当前代码完成但真实
+GPU 并发验收 pending，因此尚不能据此宣称并发资源隔离已经验收。
+
 - 不再依赖强制 planner GUC 时，典型低基数组可以按成本选择 GpuPreAgg；
 - 比较明细 Motion rows 与 partial Motion rows；
 - 记录高基数组、倾斜和 GPU final-buffer 内存压力；

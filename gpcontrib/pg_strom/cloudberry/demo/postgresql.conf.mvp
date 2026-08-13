@@ -3,10 +3,12 @@
 shared_preload_libraries = 'pg_strom'
 max_worker_processes = 16
 
-# The single-host demo shares one GPU among independent QD/QE services.  This
-# is a per-service limit, not a host-wide quota.  Keep the demo serial and use
-# the minimum allowed ratio and allocation segment size when several primaries
-# and mirrors run on one host.  Idle services do not reserve the full limit.
+# The single-host demo shares one GPU among independent QD/QE services.  The
+# shared budget is keyed by OS user and physical GPU UUID, so 0.20 is the total
+# admission limit across all postmasters rather than a per-service allowance.
+# A request waits at most five seconds before failing explicitly.
+pg_strom.shared_gpu_budget_ratio = 0.20
+pg_strom.shared_gpu_budget_timeout = '5s'
 pg_strom.gpu_mempool_segment_sz = '256MB'
 pg_strom.gpu_mempool_max_ratio = 0.20
 pg_strom.cpu_fallback = 'off'

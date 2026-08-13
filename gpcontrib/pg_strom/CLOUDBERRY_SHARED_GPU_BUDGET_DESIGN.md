@@ -1,0 +1,214 @@
+# Cloudberry PG-Strom 单机共享 GPU 资源预算与并发安全设计
+
+## 1. 状态与完成定义
+
+实现状态：**代码完成，静态验收待完成，真实 GPU 并发验收 pending**。
+
+本 P0 面向当前可用拓扑：一个 coordinator 与多个 Primary Segment 位于同一
+主机，各 postmaster 启动独立 GPU Service，并共享同一块物理 GPU。它不依赖、
+也不证明多主机或每主机独立 GPU 的行为。
+
+只有同时满足以下条件，文档状态才可改为“真实 GPU 验收通过”：
+
+1. 两个以上 Segment 并发执行 GpuPreAgg 时，所有 GPU Service 看到相同的主机级
+   `shared_budget_bytes`，且 `shared_reserved_bytes` 不超过该值；
+2. 预算充足的查询与 CPU baseline 一致；预算不足时在超时内明确失败，不出现
+   Service crash、CUDA OOM 风暴或部分聚合结果；
+3. 查询正常结束、SQL cancel、客户端断连后 `local_reserved_bytes` 回到基线；
+4. GPU Service 被 SIGKILL 后，其他 Service 能回收死进程账目并继续 admission，
+   `stale_reclaims` 增长；
+5. M1–M4a、cancel 与 failure-recovery runner 最终回归通过。
+
+## 2. 问题
+
+原有 `pg_strom.gpu_mempool_max_ratio` 是单 GPU Service 的本地上限。Cloudberry
+的每个 Segment 是独立 postmaster，因此 PostgreSQL shared memory、memory pool
+及上限都不跨 Segment。两个 Service 都配置 20% 并不代表主机总共 20%，而是
+各自最多 20%。此外，GpuPreAgg final buffer 使用直接 `cuMemAllocManaged()`，
+原先完全绕过 memory-pool 上限。
+
+M4a 提供了结构化规划估算，但 planner estimate 不能替代执行时 admission：并发
+查询可能分别合法，合计却超过同一块卡的安全容量；GpuPreAgg 扩容还会短暂同时
+持有旧、新两个 buffer。
+
+## 3. 设计目标与边界
+
+目标：
+
+- 以物理 GPU UUID 为隔离键，在同一 OS 用户的所有 postmaster 间共享预算；
+- CUDA 分配发生前原子预留，避免 check-then-allocate 竞态；
+- 对暂时不足提供有界等待，对持续不足明确拒绝；
+- 正常结束、取消、断连、SIGHUP 和 SIGKILL 都不会永久泄漏额度；
+- 从 `pgstrom.gpu_service_status` 同时观察主机总额度与本 Service 占用。
+
+本阶段纳入预算的对象：
+
+- raw/managed GPU memory pool 新 segment 的完整物理 allocation；
+- GpuJoin/GpuPreAgg 共用 query buffer 中的 final、aggregation、projection 与
+  fallback allocation；
+- GpuPreAgg 扩容期间新旧 buffer 同时存在的峰值。
+
+CUDA module/driver 内部开销及 GpuCache 的独立常驻 allocation 尚未统一计入，
+因此默认预算最多为物理显存的 80%，保留至少 20% 给驱动、context、kernel 和
+未纳入账目的开销。本 P0 是 PG-Strom Service allocation 的主机级硬门，不是
+Cloudberry resource group 的用户级公平调度器。
+
+## 4. 跨 postmaster 共享账本
+
+每块物理 GPU 使用一个 POSIX shared-memory object：
+
+```text
+/pgstrom-gpu-budget-<euid>-<normalized GPU UUID>
+```
+
+`euid` 防止不同系统用户互相占用账本；GPU UUID 保证同一块物理卡即使在各
+postmaster 中拥有不同 device index，仍落到同一个账本。对象权限为 `0600`。
+
+账本包含：
+
+- magic、协议版本和物理显存大小，用于拒绝 ABI 或设备不一致；
+- process-shared robust mutex，序列化检查、预留、释放和回收；
+- 最多 128 个 GPU Service owner slot，记录 PID、Linux `/proc` start time、配置
+  预算和已预留字节；
+- admission、rejection、wait、stale reclaim 累计计数。
+
+初始化使用文件锁保护，magic 最后发布。持锁进程异常死亡时，下一个调用者通过
+robust mutex 取得所有权并修复锁状态。每次 admission/释放还会结合
+`kill(pid, 0)` 与 `/proc/<pid>/stat` start time 清扫已经死亡或 PID 已复用的 GPU
+Service；其 reservation 与 waiter 一并回收。
+
+账本不在最后一个 Service 退出时 `shm_unlink()`，以保留跨 Service 重启的诊断
+计数。新版本若改变共享结构，必须增加协议版本；不兼容对象会使 GPU Service
+明确启动失败，不能静默解释旧布局。
+
+## 5. Admission 算法
+
+每个存活 Service owner 发布：
+
+```text
+configured_budget = physical_device_bytes * shared_gpu_budget_ratio
+effective_budget  = min(configured_budget of all live owners)
+```
+
+采用最小值使配置滚动变更保持保守：不同 Segment 暂时配置不一致时，不会因为
+较宽松的 Service 放大整机上限。
+
+分配 `N` 字节前，在共享 mutex 内执行：
+
+```text
+reclaim dead owners
+if N <= effective_budget - sum(live reservations):
+    current owner reservation += N
+    admit
+else:
+    wait up to shared_gpu_budget_timeout, then reject
+```
+
+锁只保护账本，不包围 CUDA API。预留成功、CUDA allocation 失败时立即回滚；
+释放顺序是先完成 `cuMemFree()`，再归还预算，避免另一个 Service 在显存实际尚未
+释放时被提前放行。
+
+GpuPreAgg 扩容需要先预留完整的新 buffer，再分配和复制，最后释放旧 buffer 并
+归还旧额度。因此账目覆盖扩容峰值。若峰值无法 admission，查询明确失败，旧
+buffer 在 query cleanup 路径释放。
+
+## 6. 配置
+
+新增两个 SIGHUP 级 GUC；修改配置并 reload 后，GPU Service 按现有 SIGHUP 重启
+流程应用新值：
+
+| GUC | 默认值 | 范围 | 含义 |
+|---|---:|---:|---|
+| `pg_strom.shared_gpu_budget_ratio` | `0.80` | `0.10..0.95` | 每块物理 GPU 可供受控 PG-Strom allocation 使用的比例 |
+| `pg_strom.shared_gpu_budget_timeout` | `5s` | `0..600s` | admission 最大等待时间；`0` 为立即拒绝 |
+
+单机多 Segment demo 使用更保守的 `0.20`，以便在共享 GPU 上验证 admission。
+该 ratio 是主机总预算，不再乘以 Segment 数。`gpu_mempool_max_ratio` 仍控制单个
+raw pool 的局部上限，但任何新 pool segment 还必须通过主机级 gate。
+
+## 7. 生命周期与并发安全
+
+- Service 启动：按 GPU UUID attach，清扫 stale slot，注册自己的 owner；
+- 分配成功：allocation metadata 同时保存 device index、长度和类型；
+- 正常释放：依据原 device index 归还对应物理 GPU 的额度；
+- query cancel/客户端断连：既有 `gpuClientPut()` → `putGpuQueryBuffer()` 引用计数
+  路径最终释放全部 allocation；
+- 多客户端共享同一 `query_plan_id`：`gpuQueryBuffer.refcnt` 保证只对真实 CUDA
+  allocation 记一次账；
+- Service SIGHUP/正常退出：移除 owner slot，其剩余额度一次性归零；
+- Service SIGKILL：下一个访问账本的 Service 发现 PID 不存在后回收；
+- mutex owner SIGKILL：robust mutex 防止账本永久死锁。
+
+bounded wait 位于每客户端独立 monitor thread，不阻塞 GPU Service 主 accept loop
+或其他已建立客户端。等待采用短周期重试，超时后沿现有 XPU error 通道传播，
+分布式查询不得返回部分结果。
+
+## 8. SQL 可观测性与扩展升级
+
+扩展版本从 6.1 升为 6.2，`pgstrom.gpu_service_status` 新增：
+
+| 列 | 含义 |
+|---|---|
+| `shared_budget_bytes` | 当前存活 owner 中最保守的主机级预算 |
+| `shared_reserved_bytes` | 同 GPU UUID 所有存活 Service 的预留总和 |
+| `local_reserved_bytes` | 当前行对应 GPU Service 的预留 |
+| `budget_admissions` | 账本累计成功 admission |
+| `budget_rejections` | 等待超时或立即拒绝累计数 |
+| `budget_waits` | 至少等待过一次的 admission 累计数 |
+| `stale_reclaims` | 回收死亡 Service slot 的累计次数 |
+
+同一物理 GPU 的 host-wide 数值会出现在多个 Segment 行中，这是有意的：每行仍以
+`content_id/postmaster_pid/service_pid` 标识本地 Service，而 host-wide 列应相同。
+`local_reserved_bytes` 的和应等于任一新鲜行的 `shared_reserved_bytes`。
+SQL C 函数直接锁定并读取 POSIX 账本，而不是只返回各 postmaster 的旧快照；读取
+本身也可触发 stale owner 清扫。
+
+升级命令：
+
+```sql
+ALTER EXTENSION pg_strom UPDATE TO '6.2';
+```
+
+## 9. 验收计划
+
+静态/构建门：
+
+- 共享键包含 euid 与 GPU UUID，mutex 为 process-shared robust；
+- pool allocation、query buffer 与 GpuPreAgg expansion 三条路径均先 reserve；
+- CUDA allocation/copy 失败路径回滚，新旧 buffer 替换后账目为新长度；
+- 扩展 6.1→6.2 SQL 与 C tuple descriptor 列数、顺序一致。
+
+真实 GPU 门：
+
+1. idle 时记录所有 Service status，要求 `reserved <= budget`；
+2. 并发启动至少三个强制 GpuPreAgg 查询，使总需求跨过 20% demo 预算；
+3. 允许一部分查询成功，至少一个发生 wait 或 rejection；所有成功结果匹配 CPU；
+4. 取消一个持有额度的查询，确认等待查询被放行或额度回到基线；
+5. SIGKILL 一个持有额度的 GPU Service，确认其他 Service 触发 stale reclaim；
+6. 最终要求 queue/active/client 排空、reservation 回到基线，并执行 M1–M4a 与
+   M3 全量回归。
+
+并发主路径 runner：
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_SHARED_BUDGET_CLIENTS=3 \
+PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION=1 \
+./gpcontrib/pg_strom/cloudberry/demo/run_shared_gpu_budget.sh
+```
+
+验收时还应同步采集 `nvidia-smi`，证明 SQL 账本上限与设备实际占用趋势一致；
+由于 CUDA context 与 driver 开销不在账本内，两者不要求逐字节相等。
+
+## 10. 已知限制与后续工作
+
+- 当前 stale 判断基于同一 PID namespace 内的 `kill(pid, 0)`；容器跨 PID
+  namespace 共享 GPU 时需要宿主机 broker 或 PID identity 扩展；
+- 固定 128 owner slots 足以覆盖当前单机 demo，超出时 Service 明确拒绝启动；
+- 未提供 FIFO/资源组公平性，大查询可能在持续小查询下等待至超时；
+- GpuCache、CUDA module/context 及第三方 GPU 进程只依赖预留 headroom，不在账本；
+- POSIX shared-memory 对象的协议升级需要运维确认旧 Service 已退出后清理旧对象；
+- 多主机模式天然按 GPU UUID/主机内核 shared memory 分开，仍需独立验收。
+
+后续优先级是：先完成本 P0 的真实并发、cancel、SIGKILL 验收，再进行 M4b 成本
+校准和性能探索；在资源门未验证前，不以扩大算子覆盖面替代并发安全验收。

@@ -486,3 +486,44 @@ The runner then requires a replacement service and worker pool, SQL-visible
 readiness, a surviving Segment postmaster, and a recovered GpuPreAgg signature
 equal to the CPU baseline.  A generation reset after SIGKILL is accepted only
 when Segment crash recovery recreated the shared-memory epoch.
+
+### Shared GPU budget concurrency
+
+PG-Strom 6.2 adds one host-wide allocation budget per OS user and physical GPU
+UUID.  The demo configuration sets the total budget to 20% and a five-second
+admission timeout.  Install the new library/configuration on the coordinator
+and all Segment instances, restart or reload as required, then upgrade the
+extension metadata:
+
+```sql
+ALTER EXTENSION pg_strom UPDATE TO '6.2';
+```
+
+Run the non-destructive concurrent admission check on an otherwise idle demo
+cluster:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_SHARED_BUDGET_CLIENTS=3 \
+./gpcontrib/pg_strom/cloudberry/demo/run_shared_gpu_budget.sh
+```
+
+The runner requires a real GpuPreAgg plan, continuously checks
+`shared_reserved_bytes <= shared_budget_bytes`, compares every successful
+query with the CPU baseline, and correlates failed clients with the rejection
+counter.  To make rejection a mandatory acceptance result, use
+`PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION=1`; increase the client count if the
+queries do not overlap long enough.  Status can be inspected directly with:
+
+```sql
+SELECT content_id, service_pid, shared_budget_bytes,
+       shared_reserved_bytes, local_reserved_bytes,
+       budget_admissions, budget_rejections, budget_waits, stale_reclaims
+FROM pgstrom.gpu_service_status
+ORDER BY content_id, gpu_id;
+```
+
+Passing this runner proves bounded concurrent admission and result integrity.
+The P0 completion definition additionally requires the existing GpuPreAgg
+cancel and SIGKILL runners while watching the reservation and stale-reclaim
+counters; see `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`.
