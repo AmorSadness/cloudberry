@@ -520,10 +520,12 @@ PGSTROM_GPUPREAGG_HAVING_REPEAT=3 \
   | tee /tmp/pgstrom-having.log
 ```
 
-The grouped cases use ordinary planner costs.  The explicitly labeled
-empty-input case uses correctness-only costs so the legal GPU path remains
-observable.  FILTER, DISTINCT and numeric HAVING aggregates must retain native
-plans.  See `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`.
+Positive HAVING cases use explicitly labeled correctness-only costs to expose
+the legal path; this milestone validates replacement, placement and semantics,
+not automatic selection for every HAVING shape.  The runner also prints the
+ordinary-cost colocated choice as a non-failing diagnostic.  FILTER, DISTINCT
+and numeric HAVING aggregates must retain native plans.  See
+`CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`.
 
 ### GpuPreAgg cancellation and failure recovery
 

@@ -36,6 +36,29 @@ if [[ ! $primary_segment_count =~ ^[0-9]+$ ]] || (( primary_segment_count < 2 ))
     exit 1
 fi
 
+feature_settings="
+ SET optimizer=off;
+ SET pg_strom.enabled=on;
+ SET pg_strom.enable_gpuscan=on;
+ SET pg_strom.enable_gpupreagg=on;
+ SET pg_strom.enable_gpusort=off;
+ SET pg_strom.enable_numeric_aggfuncs=off;
+ SET pg_strom.enable_partitionwise_gpupreagg=off;
+ SET pg_strom.cloudberry_enable_host_quals=off;
+ SET pg_strom.cpu_fallback=off;
+ SET enable_seqscan=off;
+ SET gp_enable_multiphase_agg=off;
+ SET pg_strom.gpu_setup_cost=0;
+ SET pg_strom.gpu_tuple_cost=0;
+ SET pg_strom.gpu_operator_cost=0;
+ SET gp_motion_cost_per_row=1000000;
+ SET cpu_tuple_cost=10;
+ SET cpu_operator_cost=10;"
+
+# Keep one normal-cost observation for planner diagnostics.  HAVING support is
+# a correctness/placement milestone; it does not require every legal shape to
+# beat native HashAggregate, especially for colocated groups with no Motion to
+# eliminate.
 normal_settings="
  SET optimizer=off;
  SET pg_strom.enabled=on;
@@ -46,16 +69,6 @@ normal_settings="
  SET pg_strom.enable_partitionwise_gpupreagg=off;
  SET pg_strom.cloudberry_enable_host_quals=off;
  SET pg_strom.cpu_fallback=off;"
-
-# Empty-input aggregation is a correctness-only shape whose estimated row count
-# makes GPU setup uneconomical.  Expose the legal path without making a
-# performance claim; ordinary-cost selection is checked by the grouped cases.
-empty_settings="$normal_settings
- SET enable_seqscan=off;
- SET gp_enable_multiphase_agg=off;
- SET pg_strom.gpu_setup_cost=0;
- SET pg_strom.gpu_tuple_cost=0;
- SET pg_strom.gpu_operator_cost=0;"
 
 colocated_query="
  SELECT dist_key, count(*), sum(id)
@@ -153,21 +166,29 @@ require_native() {
     echo "$label: safely retained native aggregate"
 }
 
-stable_having_plan colocated "$normal_settings" "$colocated_query" no
-stable_having_plan noncolocated "$normal_settings" "$noncolocated_query" yes
-stable_having_plan empty_is_null "$empty_settings" "$empty_is_null_query" yes
-stable_having_plan empty_unknown "$empty_settings" "$empty_unknown_query" yes
+normal_plan=$("${psql_cmd[@]}" -Atqc \
+    "$normal_settings EXPLAIN (VERBOSE, COSTS OFF) $colocated_query")
+if grep -q 'Custom Scan (GpuPreAgg)' <<<"$normal_plan"; then
+    echo "normal-cost colocated HAVING selected GpuPreAgg"
+else
+    echo "normal-cost colocated HAVING reasonably selected native CPU final aggregation"
+fi
 
-compare_result_digest colocated "$normal_settings" "$colocated_query"
-compare_result_digest noncolocated "$normal_settings" "$noncolocated_query"
-compare_result_digest unknown "$normal_settings" "$unknown_query"
-compare_result_digest empty_is_null "$empty_settings" "$empty_is_null_query"
-compare_result_digest empty_unknown "$empty_settings" "$empty_unknown_query"
+stable_having_plan colocated "$feature_settings" "$colocated_query" no
+stable_having_plan noncolocated "$feature_settings" "$noncolocated_query" yes
+stable_having_plan empty_is_null "$feature_settings" "$empty_is_null_query" yes
+stable_having_plan empty_unknown "$feature_settings" "$empty_unknown_query" yes
+
+compare_result_digest colocated "$feature_settings" "$colocated_query"
+compare_result_digest noncolocated "$feature_settings" "$noncolocated_query"
+compare_result_digest unknown "$feature_settings" "$unknown_query"
+compare_result_digest empty_is_null "$feature_settings" "$empty_is_null_query"
+compare_result_digest empty_unknown "$feature_settings" "$empty_unknown_query"
 
 null_rows=$("${psql_cmd[@]}" -Atqc \
-    "$empty_settings SELECT count(*) FROM ($empty_is_null_query) q;")
+    "$feature_settings SELECT count(*) FROM ($empty_is_null_query) q;")
 unknown_rows=$("${psql_cmd[@]}" -Atqc \
-    "$empty_settings SELECT count(*) FROM ($empty_unknown_query) q;")
+    "$feature_settings SELECT count(*) FROM ($empty_unknown_query) q;")
 [[ $null_rows == 1 && $unknown_rows == 0 ]] || {
     echo "HAVING NULL three-valued result mismatch: is_null=$null_rows unknown=$unknown_rows" >&2
     exit 1

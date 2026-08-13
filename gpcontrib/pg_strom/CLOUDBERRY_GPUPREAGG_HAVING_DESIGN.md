@@ -81,7 +81,8 @@ M5b 不在 GPU 端重新实现布尔或 NULL 语义。
 `cloudberry/demo/setup.sql` 为 `pgstrom_mvp_colocated` 增加 `nullable_metric`，并让
 `grp=0` 的所有输入均为 NULL。`run_gpupreagg_having.sh` 验证：
 
-1. 普通成本下，共置和非共置 HAVING 稳定自动选择 GpuPreAgg；
+1. correctness-only 成本下，共置、非共置和无 GROUP BY HAVING 稳定生成合法
+   GpuPreAgg；普通成本的共置计划同时输出用于观察，但允许原生 HashAggregate 获胜；
 2. HAVING `Filter` 位于 CPU final aggregate，GpuPreAgg 节点不执行 HAVING；
 3. 共置路径没有 pre-final Gather，非共置路径保留 Gather-final；
 4. grouping key、输出 aggregate 和仅 HAVING 使用 aggregate 的表达式替换正确；
@@ -89,8 +90,11 @@ M5b 不在 GPU 端重新实现布尔或 NULL 语义。
 6. FILTER、DISTINCT 和 numeric HAVING aggregate 保持原生计划；
 7. M5a、M4b、共享 GPU、cancel 和 failure-recovery 回归不退化。
 
-空输入形状因正常成本下 GPU setup 不经济，runner 只对该形状使用明确标注的
-correctness-only 成本；分组正向用例保持普通 planner 成本。
+HAVING 增加的 final aggregate 工作可能使原生 HashAggregate 在普通成本下获胜，
+尤其是共置 GROUP BY 没有 Motion 可消除时。本里程碑验证合法路径、执行位置和结果
+语义，不承诺所有 HAVING 形状自动选 GPU。因此所有正向语义用例使用与历史 MVP
+一致、明确标注的 correctness-only 成本；runner 另行打印普通成本计划选择作为诊断，
+但不把它作为完成门槛。
 
 执行命令：
 
