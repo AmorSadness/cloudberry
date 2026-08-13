@@ -116,8 +116,11 @@ group and byte estimate/actual ratios, while `GpuPreAgg Cost` separates GPU
 setup, host-device DMA, partial aggregation, QE-to-QD Motion, and CPU final
 aggregation without duplicating native Motion/Agg costing.  The new normal-
 planner acceptance runner leaves multiphase aggregation, scan choice, and all
-GPU/CPU/Motion cost parameters unforced.  Source and static acceptance are
-complete; real-GPU M4b acceptance is pending.  See
+GPU/CPU/Motion cost parameters unforced.  Source, static, normal-planner, and
+real-GPU M4b acceptance completed on 2026-08-13.  Low-cardinality buffers were
+16MiB, high-cardinality group estimation was within 1.02x, detail-to-partial
+Motion rows fell from 2,000,000 to 2,000, all 24 concurrent clients succeeded,
+and the combined concurrency/failure rollback matrix drained cleanly.  See
 `CLOUDBERRY_GPUPREAGG_M4B_DESIGN.md`.
 
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,

@@ -499,11 +499,12 @@ runner。真实 GPU 矩阵已于 2026-08-13 通过：两种组合结果匹配且
 1GiB request 可观察，注入失败无泄漏/无部分结果且后续查询恢复。因此 P0a/P0b/P0c
 在当前单机共享 GPU 边界内均完成验收。
 
-M4b 已完成代码和静态验收，真实 GPU 验收待执行。实现包括 16MiB grouped buffer
-下限、2MiB 对齐、自适应几何扩容、五段成本分解、estimate/actual 偏差指标以及
-不写入强制成本参数的 normal-planner runner。低/中/高基数、均匀/倾斜、明细与
-partial Motion、适合/不适合 GpuPreAgg 的选择边界均纳入矩阵。完整设计和完成定义
-见 `CLOUDBERRY_GPUPREAGG_M4B_DESIGN.md`；在 GPU 日志通过前不宣称 M4b 验收完成。
+M4b 已于 2026-08-13 完成代码、静态检查和真实 GPU 验收。16MiB grouped buffer
+下限、2MiB 对齐、自适应几何扩容、五段成本归属、estimate/actual 偏差指标以及
+不写入强制成本参数的 normal-planner runner 均通过。低/中/高基数、均匀/倾斜、
+明细与 partial Motion、适合/不适合 GpuPreAgg 的选择边界结果符合预期；24 客户端
+全部成功，组合并发与注入失败回滚也通过。完整证据见
+`CLOUDBERRY_GPUPREAGG_M4B_DESIGN.md`。
 
 ### 后续非本 MVP 阶段
 

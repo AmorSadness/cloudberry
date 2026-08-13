@@ -297,6 +297,7 @@ admission/backpressure、P0c 并发验收现均有真实 GPU 证据。
 
 P0a 静态诊断、P0b admission/backpressure、P0c 组合并发/故障回收现已全部完成
 真实 GPU 验收。M4b 已把 grouped request 改为 16MiB 起步的自适应估算，并让
-budget/matrix runner 使用 normal planner、检查最新请求小于 1GiB；该回归仍待真实
-GPU 执行。多主机、资源组公平性、
+budget/matrix runner 使用 normal planner、检查最新请求小于 1GiB。2026-08-13
+真实 GPU 回归中 24 客户端全部成功且无等待/拒绝；组合并发排空，注入失败无泄漏、
+无部分结果且后续恢复。多主机、资源组公平性、
 GpuCache 统一计费和跨 PID namespace 协调仍需分别设计与验收。

@@ -454,14 +454,21 @@ plus QE-returned `GpuPreAgg Actual` group/byte deviations, and a low-cardinality
 below 1GiB.  It also compares actual detail-row and partial-row Motion counts.
 The medium/high NDV keys are physical analyzed columns; rerun `setup.sql` once
 after installing M4b so an existing demo database receives them.
-See `CLOUDBERRY_GPUPREAGG_M4B_DESIGN.md`.  Until this runner and the shared-GPU
-matrix pass on a real GPU, M4b is implemented but not GPU-accepted.
+See `CLOUDBERRY_GPUPREAGG_M4B_DESIGN.md`.  This runner and the shared-GPU
+matrix completed real Tesla T4 acceptance on 2026-08-13.
 
 For the admission-capacity regression, also run 24 clients with
 `PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION=0`.  A low-cardinality request is now
 about 16MiB rather than 1GiB, so absence of rejection is an expected capacity
 improvement; the controlled allocation-failure matrix still proves rejection
 rollback and recovery.
+
+The accepted run selected the expected normal-cost plans, matched all six
+CPU result digests, used a 16MiB low-cardinality buffer, estimated high
+cardinality within 1.02x, and reduced Motion rows from 2,000,000 details to
+2,000 partials.  All 24 admission clients succeeded without waits or
+rejections.  Both mixed concurrency pairs drained, and injected allocation
+failure produced no leak or partial result before recovery.
 
 ### GpuPreAgg cancellation and failure recovery
 

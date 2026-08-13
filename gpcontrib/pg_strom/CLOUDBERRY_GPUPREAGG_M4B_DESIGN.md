@@ -1,15 +1,15 @@
 # Cloudberry GpuPreAgg M4b 成本、内存与性能校准设计
 
-状态（2026-08-13）：实现与静态验收完成；真实 GPU M4b 验收待在单机 1 QD、
-2 Primary 共享 GPU 环境执行。M1–M4a 以及共享 GPU P0a/P0b/P0c 的既有真实 GPU
-结论不受此状态影响。
+状态（2026-08-13）：实现、静态检查和单机 1 QD + 2 Primary 共享 Tesla T4 的
+真实 GPU 验收全部通过。M4b P0 在本文限定拓扑内完成；不外推为多主机、独立 GPU、
+资源组公平性或所有 SQL 形状的性能结论。
 
 ## 1. 完成定义
 
 M4b 不以“通过人为成本参数生成 GpuPreAgg”作为完成。完成必须同时满足：
 
-1. 验收会话保持 `gp_enable_multiphase_agg=on`、`enable_seqscan=on`，GPU/CPU/
-   CPU/GPU 成本均为正常非零值；Motion GUC 使用正常值（Cloudberry 的 `0`
+1. 验收会话保持 `gp_enable_multiphase_agg=on`、`enable_seqscan=on`，CPU/GPU
+   成本均为正常非零值；Motion GUC 使用正常值（Cloudberry 的 `0`
    表示采用 `2 * cpu_tuple_cost`，不是零成本）；
 2. 低、中和仍有明显压缩收益的高基数组由普通 Postgres planner 稳定选择
    GpuPreAgg；按分布键、接近一行一组的反例使用原生聚合；
@@ -125,4 +125,27 @@ PGDATABASE=pgstrom_mvp \
   人为制造 rejection；成功容量应明显高于历史固定 1GiB）；
 - `Cloudberry shared-GPU P0a/P0c concurrency matrix passed`。
 
-在真实日志到达前，文档只称“实现完成、GPU 验收待执行”，不称 M4b 完成验收。
+## 6. 真实 GPU 验收记录
+
+2026-08-13 在单机 1 QD + 2 Primary 共享 Tesla T4 环境完成：
+
+- planner 使用 `on|100|0.01|0.00015625|0|0.01|0.0025|on`，即 multiphase 与
+  seqscan 开启、GPU/CPU 成本为正常非零值、Motion 使用正常 `0` sentinel；
+- uniform low/medium/high 连续三次稳定自动选择 GpuPreAgg；near-detail uniform
+  和 skew 自动选择原生聚合；skew low/medium/high 在普通成本下选择 GpuPreAgg；
+- uniform/skew 的低、中、高基数六类结果 digest 均匹配 CPU；
+- low uniform 每设备 buffer 为 16MiB，实际 1,000 groups、125KiB payload，
+  groups actual/estimate 为 1.00x；
+- high uniform 估算 128,481 local groups、实际 131,069，为 1.02x；80MiB buffer
+  中 payload 为 16MiB、`usage/estimate=20%`。差额来自按 hash slots、两倍 tuple
+  容量及对齐进行的保守峰值估算，不是 NDV 失真；
+- skew low 估算 1,999、实际 2,001，偏差 1.00x；
+- low uniform 明细 Motion 为 2,000,000 rows，partial-row Motion 为 2,000 rows；
+- 24 客户端并发全部成功：`successes=24 failures=0 waits=0 rejections=0`，相比历史
+  固定 1GiB buffer 明显提高 admission 容量；
+- GpuScan+GpuScan、GpuScan+GpuPreAgg 均结果匹配并排空资源；自适应 request 在
+  admission 状态可见；受控 allocation failure 无泄漏、无部分结果，后续查询恢复；
+- 三个 runner 分别输出本文第 5 节列出的成功标志。
+
+上述证据满足本文第 1 节全部完成门槛，因此 M4b P0 在记录的单机共享 GPU 边界内
+标记为完成。

@@ -291,8 +291,9 @@ require_text 'GpuPreAgg Actual: nitems:' "$repo_root/gpcontrib/pg_strom/src/exec
 require_text 'cdbexplainfun = pgstromCdbExplainTaskActual' "$repo_root/gpcontrib/pg_strom/src/executor.c"
 require_text 'Motion rows: detail=' "$gpupreagg_m4b_runner"
 require_text 'M4b normal-cost acceptance passed' "$gpupreagg_m4b_runner"
-require_text '实现与静态验收完成' "$gpupreagg_m4b_design"
-require_text '真实 GPU M4b 验收待' "$gpupreagg_m4b_design"
+require_text '真实 GPU 验收全部通过' "$gpupreagg_m4b_design"
+require_text 'successes=24 failures=0 waits=0 rejections=0' "$gpupreagg_m4b_design"
+require_text '标记为完成' "$gpupreagg_m4b_design"
 if grep -Eq 'gp_enable_multiphase_agg=off|gpu_setup_cost=0|gpu_tuple_cost=0|gpu_operator_cost=0|gp_motion_cost_per_row=1000000|cpu_tuple_cost=10|cpu_operator_cost=10|enable_seqscan=off' \
     "$gpupreagg_m4b_runner" "$budget_runner" "$budget_matrix_runner"; then
     echo 'M4b acceptance runners must not contain correctness-only planner forcing' >&2
