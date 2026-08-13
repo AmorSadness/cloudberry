@@ -53,10 +53,13 @@ has completed real multi-Segment GPU acceptance for plans, CPU/GPU signatures,
 query cancellation, SIGHUP, and SIGKILL/crash recovery; see
 `CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md`.
 
-The Gather-only GpuPreAgg MVP is also default-off.  When explicitly enabled,
-each QE fuses a device-only GpuScan with local partial aggregation, sends the
-partial rows through a real Cloudberry Motion, and uses one CPU final aggregate
-to merge groups across Segments.  Its first whitelist is count/sum/min/max on
+The experimental GpuPreAgg path is also default-off.  When explicitly enabled,
+each QE fuses a device-only GpuScan with local partial aggregation.  M5a keeps
+GROUP BY results local when the keys provably cover the input distribution key,
+and executes one CPU final aggregate per QE without a pre-final Gather Motion.
+Other GROUP BY shapes and global aggregates send partial rows through a real
+Cloudberry Motion and use one CPU final aggregate to merge groups across
+Segments.  Its first whitelist is count/sum/min/max on
 integer and floating-point inputs; mixed quals, numeric, FILTER, HAVING,
 DISTINCT aggregates, partitionwise aggregation and GPU-Sort retain native
 plans.  Source and acceptance assets are complete.  Real dual-Primary GPU
@@ -122,6 +125,24 @@ real-GPU M4b acceptance completed on 2026-08-13.  Low-cardinality buffers were
 Motion rows fell from 2,000,000 to 2,000, all 24 concurrent clients succeeded,
 and the combined concurrency/failure rollback matrix drained cleanly.  See
 `CLOUDBERRY_GPUPREAGG_M4B_DESIGN.md`.
+
+M5a source and acceptance assets implement the colocated GROUP BY local-final
+path.  The planner preserves a projected Hashed locus only when the full
+distribution key survives the partial target, skips the SingleQE Motion in
+that case, and retains Gather-final for every unproven shape.  See
+`CLOUDBERRY_GPUPREAGG_M5A_DESIGN.md`.
+
+## Development topology constraint
+
+The available development and acceptance environment is one host with multiple
+Segment postmasters sharing one physical GPU.  It cannot deploy Segments on
+different hosts with an independent GPU per host.  Work in this tree may claim
+single-host plan correctness, result correctness, resource isolation,
+concurrency and recovery evidence.  It must not claim multi-host or multi-GPU
+scaling, cross-host load balancing, or independent-GPU performance.  Near-term
+features are prioritized only when their correctness and resource behavior can
+be closed in this topology; multi-host GPU coordination and performance-only
+GpuHashJoin scaling are outside the current validation plan.
 
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.

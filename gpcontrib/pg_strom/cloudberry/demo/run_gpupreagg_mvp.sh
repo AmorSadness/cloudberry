@@ -64,11 +64,11 @@ gpu_settings="
     SET cpu_operator_cost=10;
     SET enable_seqscan=off;"
 
-# The deliberately tiny one-nonempty-QE relation contains only 16 rows and is
-# distributed by its GROUP BY key.  Its native local aggregate therefore has
-# no Redistribute cost and can dominate GpuPreAgg even with the general
-# acceptance costs above.  Penalize CPU work only for this plan/result check;
-# this is still a correctness test, not a benchmark configuration.
+# The deliberately tiny one-nonempty-QE relation contains only 16 rows.  Its
+# native aggregate can dominate GpuPreAgg even with the general acceptance
+# costs above.  Penalize CPU work only for this plan/result check; this is still
+# a correctness test, not a benchmark configuration.  M5a colocated placement
+# has its own runner, so this historical Gather-only matrix groups by metric.
 small_gpu_settings="
     SET cpu_tuple_cost=100000;
     SET cpu_operator_cost=100000;"
@@ -173,11 +173,11 @@ skew_query="
     GROUP BY metric
     ORDER BY metric;"
 small_query="
-    SELECT dist_key, count(*), count(nullable_metric), sum(id), min(id), max(id)
+    SELECT metric, count(*), count(nullable_metric), sum(id), min(id), max(id)
     FROM pgstrom_mvp_small
     WHERE id BETWEEN 1 AND 16
-    GROUP BY dist_key
-    ORDER BY dist_key;"
+    GROUP BY metric
+    ORDER BY metric;"
 empty_query="
     SELECT count(*), count(id), sum(id), min(id), max(id)
     FROM pgstrom_mvp_heap

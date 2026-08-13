@@ -79,10 +79,14 @@ sentinel，但拒绝验收专用极大值。
 - uniform low：`grp`，约 1,000 groups；
 - uniform medium：`grp_medium`，约 16,384 groups；
 - uniform high：`grp_high`，约 131,072 groups；
-- uniform near-detail：按 `id` 聚合；
+- uniform near-detail：按不保留分布 locus 的 `id + 0` 表达式聚合；
 - single-Segment skew low：按 `metric` 聚合；
 - single-Segment skew medium/high：按有统计信息的 `grp_medium`/`grp_high` 聚合；
 - single-Segment skew near-detail：按 `id` 聚合。
+
+M5a 允许共置 GROUP BY 绕过面向 Motion reduction 的固定 50% gate，因此 M5a
+之后的 M4b 回归使用 `id + 0` 作为非共置 near-detail 反例。第 6 节记录的原始
+`GROUP BY id` 结果是 M5a 之前的历史验收事实。
 
 中/高基数键是 setup 中的实体列并执行 `ANALYZE`，避免把“表达式没有 NDV 统计”
 误判为 hash sizing 模型偏差。升级已有 demo 数据库后必须重跑 `setup.sql`。

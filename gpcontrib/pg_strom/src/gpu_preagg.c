@@ -1560,6 +1560,10 @@ typedef struct
 	double			final_num_groups;
 	bool			try_parallel;
 	bool			has_aggfuncs;
+#ifdef GP_VERSION_NUM
+	bool			groupby_collocated;
+	CdbPathLocus	input_locus;
+#endif
 	PathTarget	   *target_upper;
 	PathTarget	   *target_partial;
 	PathTarget	   *target_agg_final;
@@ -2285,18 +2289,23 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con,
 {
 	Query	   *parse = con->root->parse;
 	Path	   *__path;
-	double		num_groups = con->final_num_groups;
+	double		num_groups;
 
 #ifdef GP_VERSION_NUM
 	/*
-	 * The GPU final buffer is local to each QE.  Even when GROUP BY is used,
-	 * the same group can exist on multiple Segments, so it must cross a real
-	 * Cloudberry Motion and be merged once by a CPU aggregate.  A PostgreSQL
-	 * Gather only combines workers inside one backend and is not sufficient.
+	 * If the input distribution keys are covered by GROUP BY, every global
+	 * group belongs to exactly one Segment.  The GPU partial rows can therefore
+	 * be finalized by a CPU aggregate on their source QE without a Motion.
+	 * Otherwise the same group may exist on multiple Segments and all partial
+	 * rows must cross a real Cloudberry Motion to one final aggregate.
 	 */
+	if (parse->groupClause != NIL && con->groupby_collocated)
+		num_groups = con->num_groups;
+	else
 	{
 		CdbPathLocus singleqe_locus;
 
+		num_groups = con->final_num_groups;
 		CdbPathLocus_MakeSingleQE(&singleqe_locus, getgpsegmentCount());
 		part_path = cdbpath_create_motion_path(con->root,
 										  part_path,
@@ -2306,6 +2315,8 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con,
 		if (!part_path)
 			return;
 	}
+#else
+	num_groups = con->final_num_groups;
 #endif
 
 	if (parse->groupClause)
@@ -2404,6 +2415,7 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 #ifdef GP_VERSION_NUM
 	size_t		final_buffer_per_device;
 	EstimatedBytes final_buffer_per_qe;
+	CdbPathLocus output_locus;
 #endif
 
 	/*
@@ -2438,12 +2450,43 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 
 #ifdef GP_VERSION_NUM
 	/*
+	 * Preserve a hashed locus only when GROUP BY covers the input distribution
+	 * keys and those keys survive in the partial target.  Supplying the partial
+	 * expressions as newvarlist keeps the distribution EquivalenceClasses in
+	 * the same expression space used by this upper CustomPath.  Any unexpected
+	 * projection failure safely disables the local-final optimization.
+	 */
+	if (con->groupby_collocated)
+	{
+		output_locus = cdbpathlocus_pull_above_projection(con->root,
+													con->input_locus,
+													con->input_rel->relids,
+													con->target_partial->exprs,
+													con->target_partial->exprs,
+													0,
+													false);
+		if (!CdbPathLocus_IsHashed(output_locus))
+			con->groupby_collocated = false;
+	}
+	if (!con->groupby_collocated)
+	{
+		int		numsegments = planner_segment_count(con->input_rel->cdbpolicy);
+
+		if (numsegments < 1)
+			numsegments = 1;
+		CdbPathLocus_MakeStrewn(&output_locus, numsegments, 0);
+	}
+
+	/*
 	 * A local partial aggregate that preserves at least half of its input rows
 	 * cannot materially reduce Motion, yet it still needs a pinned hash buffer,
 	 * GPU setup and a QD final aggregate.  Treat this as an unsuitable M4b shape
 	 * instead of allowing cheap device operators to hide the memory/Motion cost.
+	 * A colocated GROUP BY has no cross-Segment Motion, so its complete cost is
+	 * allowed to compete even when the partial-row reduction is small.
 	 */
 	if ((parse->groupClause || parse->distinctClause) &&
+		!con->groupby_collocated &&
 		con->num_groups >= 0.5 * input_nrows)
 	{
 		elog(DEBUG1,
@@ -2549,18 +2592,7 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 		0;
 #endif
 #ifdef GP_VERSION_NUM
-	/*
-	 * Partial rows stay on their source Segments, but the partial target may
-	 * no longer carry the base table distribution keys.  Strewn is therefore
-	 * the conservative and correct locus until a later Redistribute milestone.
-	 */
-	{
-		int		numsegments = planner_segment_count(con->input_rel->cdbpolicy);
-
-		if (numsegments < 1)
-			numsegments = 1;
-		CdbPathLocus_MakeStrewn(&cpath->path.locus, numsegments, 0);
-	}
+	cpath->path.locus             = output_locus;
 	cpath->path.parallel_workers = cpath->path.locus.parallel_workers;
 	cpath->path.motionHazard     = false;
 	cpath->path.barrierHazard    = false;
@@ -2812,6 +2844,10 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 	double		num_groups = 1.0;
 	double		final_num_groups = 1.0;
 	bool		needs_cpu_final;
+#ifdef GP_VERSION_NUM
+	CdbPathLocus input_locus = {0};
+	bool		groupby_collocated = false;
+#endif
 
 #ifdef GP_VERSION_NUM
 	/* Defense in depth against future changes to the GpuScan path tracker. */
@@ -2829,7 +2865,6 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 		groupExprs = get_sortgrouplist_exprs(parse->groupClause,
 											 gp_extra->targetList);
 #ifdef GP_VERSION_NUM
-		CdbPathLocus input_locus;
 		List   *group_tles = NIL;
 		List   *group_sortops = NIL;
 		List   *group_eqops = NIL;
@@ -2850,7 +2885,9 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 								  &group_tles,
 								  &group_sortops,
 								  &group_eqops);
-		if (cdbpathlocus_collocates_tlist(root, input_locus, group_tles))
+		groupby_collocated =
+			cdbpathlocus_collocates_tlist(root, input_locus, group_tles);
+		if (groupby_collocated)
 		{
 			double		numsegments = CdbPathLocus_NumSegments(input_locus);
 
@@ -2896,6 +2933,10 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 	con.num_groups     = num_groups;
 	con.final_num_groups = final_num_groups;
 	con.try_parallel   = be_parallel;
+#ifdef GP_VERSION_NUM
+	con.groupby_collocated = groupby_collocated;
+	con.input_locus    = input_locus;
+#endif
 	con.target_upper   = root->upper_targets[upper_stage];
 	con.target_partial = create_empty_pathtarget();
 	con.target_agg_final = create_empty_pathtarget();

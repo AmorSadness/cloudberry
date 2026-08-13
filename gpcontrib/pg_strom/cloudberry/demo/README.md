@@ -470,6 +470,31 @@ cardinality within 1.02x, and reduced Motion rows from 2,000,000 details to
 rejections.  Both mixed concurrency pairs drained, and injected allocation
 failure produced no leak or partial result before recovery.
 
+### GpuPreAgg M5a colocated local final
+
+M5a recognizes a GROUP BY that covers the complete table distribution key.
+Such groups cannot span Segments, so each QE runs its CPU final aggregate
+directly above GpuPreAgg without gathering partial rows to one QE.  A top-level
+result-collection Motion may still be present.  Non-colocated and global
+aggregates retain the established Gather-final path.
+
+Rerun `setup.sql` to create the M5a `pgstrom_mvp_colocated` table, then run:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_GPUPREAGG_M5A_REPEAT=3 \
+./gpcontrib/pg_strom/cloudberry/demo/run_gpupreagg_m5a.sh \
+  | tee /tmp/pgstrom-m5a.log
+```
+
+The runner uses normal planner costs, requires at least two up preferred
+Primaries, checks that `GROUP BY dist_key` has no Gather Motion between
+GpuPreAgg and CPU final aggregate, checks that non-colocated `GROUP BY grp`
+still has that Motion, and compares both results with CPU baselines.  The
+available acceptance topology remains one host with all Segment GPU Services
+sharing one physical GPU; this runner does not establish multi-host or
+multi-GPU scaling.
+
 ### GpuPreAgg cancellation and failure recovery
 
 The M3 runners reuse the established GpuScan cancellation and recovery

@@ -24,6 +24,28 @@ FROM generate_series(1, 2000000) AS g;
 
 ANALYZE pgstrom_mvp_heap;
 
+-- M5a validation table.  GROUP BY dist_key is colocated because it covers
+-- the complete distribution key, while GROUP BY grp is deliberately not.
+-- Both shapes have enough rows per group for normal-cost GpuPreAgg planning.
+DROP TABLE IF EXISTS pgstrom_mvp_colocated;
+CREATE TABLE pgstrom_mvp_colocated
+(
+    id bigint,
+    dist_key integer,
+    grp integer,
+    metric integer
+)
+DISTRIBUTED BY (dist_key);
+
+INSERT INTO pgstrom_mvp_colocated
+SELECT g,
+       (g % 4096)::integer,
+       (g % 1000)::integer,
+       ((g % 2001) - 1000)::integer
+FROM generate_series(1, 2000000) AS g;
+
+ANALYZE pgstrom_mvp_colocated;
+
 -- All rows share the distribution key, so one primary receives the data and
 -- the remaining primaries execute an empty local scan.  The values also cover
 -- NULL, negative integer/numeric, and text projection cases.

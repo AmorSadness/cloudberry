@@ -508,13 +508,21 @@ M4b 已于 2026-08-13 完成代码、静态检查和真实 GPU 验收。16MiB gr
 
 ### 后续非本 MVP 阶段
 
-- Redistribute Motion by GROUP BY keys + parallel final aggregate；
-- 已证明 group keys 覆盖 distribution keys 时的无 Motion/local final 优化；
+- 已证明 group keys 覆盖 distribution keys 时的无 pre-final Motion/local final
+  优化已进入 M5a 实现与验收阶段，见
+  `CLOUDBERRY_GPUPREAGG_M5A_DESIGN.md`；
+- Redistribute Motion by GROUP BY keys + parallel final aggregate只能在当前单机
+  共享 GPU 环境形成计划和正确性结论，不形成多 GPU 扩展性结论；
 - HAVING；
 - numeric 和更多 aggregates/types；
 - mixed host/device quals 在 pre-aggregation 之前执行；
 - GpuSort/Top-N/window rank；
 - GpuHashJoin。
+
+当前验收环境固定为单机多 Segment 共享一块 GPU，不支持多机 Segment 各自使用独立
+GPU。因此后续优先开发能在该拓扑完整验证的 local-final、共享 GPU 公平 admission、
+HAVING、mixed quals、类型覆盖和存储覆盖；多主机 GPU 协调、跨主机 GPU-Direct 和
+多 GPU 性能扩展不作为近期出口。
 
 ## 11. 验收矩阵
 

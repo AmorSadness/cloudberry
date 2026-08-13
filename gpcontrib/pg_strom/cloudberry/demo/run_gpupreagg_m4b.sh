@@ -83,9 +83,9 @@ high_query="
  FROM pgstrom_mvp_heap WHERE id > 0
  GROUP BY grp_high ORDER BY grp_high;"
 unsuitable_query="
- SELECT id, count(*), sum(id)
+ SELECT id + 0 AS id_expr, count(*), sum(id)
  FROM pgstrom_mvp_heap WHERE id > 0
- GROUP BY id;"
+ GROUP BY id + 0;"
 skew_low_query="
  SELECT metric, count(*), sum(id), min(id), max(id)
  FROM pgstrom_mvp_skew WHERE id > 0
