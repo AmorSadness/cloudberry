@@ -103,8 +103,12 @@ performance claim; see `CLOUDBERRY_SHARED_GPU_BUDGET_DESIGN.md`.
 
 The 6.3 acceptance matrix also covers GpuScan+GpuScan,
 GpuScan+GpuPreAgg, and a superuser-only post-reservation allocation-failure
-injection.  These additions are code/static-check complete and require a fresh
-GPU run before the expanded P0a/P0b/P0c checklist is marked fully accepted.
+injection.  Real GPU acceptance completed on 2026-08-13: both concurrency
+pairs matched CPU and drained resources, the planner-derived 1GiB GpuPreAgg
+request was visible in admission status, and the injected failure produced no
+leak or partial result before a successful recovery query.  Together with the
+earlier multi-GpuPreAgg, cancel and SIGKILL runs, the expanded P0a/P0b/P0c
+checklist is fully accepted for the tested single-host topology.
 
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.

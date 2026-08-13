@@ -555,3 +555,11 @@ CUDA.  The injected query must return no partial result, reservations must
 return exactly to baseline, and a subsequent GpuPreAgg must match CPU.  The
 hook avoids deliberately exhausting the physical GPU while covering the same
 budget rollback and query cleanup path.
+
+This 6.3 matrix completed real GPU acceptance on 2026-08-13.  Both GpuScan
+pairings matched CPU and drained resources, the planner-derived 1GiB request
+was visible, and the injected allocation failure returned no partial result,
+leaked no reservation, and was followed by a successful GpuPreAgg.  The runner
+ended with `Cloudberry shared-GPU P0a/P0c concurrency matrix passed`.  Combined
+with the earlier multi-GpuPreAgg, cancel, and SIGKILL/stale-reclaim results,
+P0a, P0b, and P0c are complete for the documented single-host topology.

@@ -7,8 +7,8 @@
 的环境完成。
 
 按 P0a/P0b/P0c 扩展清单补充的静态诊断、GpuScan 组合矩阵和受控 allocation
-failure 已完成代码与静态检查；新增 GPU 矩阵需要在安装 6.3 后执行，结果未记录
-前不把这些新增用例写成已完成的真实 GPU 验收。
+failure 也已完成代码、静态检查和真实 GPU 验收。因此 P0a、P0b、P0c 在本设计
+限定的单机、同用户、同 PID namespace 拓扑下均已完成。
 
 本 P0 面向当前可用拓扑：一个 coordinator 与多个 Primary Segment 位于同一
 主机，各 postmaster 启动独立 GPU Service，并共享同一块物理 GPU。它不依赖、
@@ -264,6 +264,24 @@ GpuScan+GpuPreAgg，然后由仅限 superuser 的 6.3 SQL hook 在预算预留�
   保持原生计划，输出 `Cloudberry Gather-only GpuPreAgg MVP acceptance passed`；
   回归结束后资源再次回到相同基线。
 
+### 9.2 P0a/P0b/P0c 扩展矩阵验收记录
+
+扩展 6.3 安装并升级后，`run_shared_gpu_concurrency_matrix.sh` 在同一套单机
+1 coordinator + 2 Primary、共享 Tesla T4 的环境通过：
+
+- GpuScan + GpuScan：两个结果均匹配 CPU baseline，结束后资源排空；
+- GpuScan + GpuPreAgg：两个结果均匹配 CPU baseline，结束后资源排空；
+- P0b request tracking：两个 Segment 均可观察到 planner-derived 1GiB
+  GpuPreAgg admission request；
+- 受控 allocation failure：预算预留后、CUDA 调用前注入失败，查询没有部分结果，
+  reservation 精确回到注入前基线，随后 GpuPreAgg 与 CPU baseline 一致；
+- runner 最终输出
+  `Cloudberry shared-GPU P0a/P0c concurrency matrix passed`。
+
+结合 9.1 已通过的 24 客户端多 GpuPreAgg、三轮 cancel、三轮 SIGKILL/stale
+reclaim 和最终 M1–M4a 回归，原始清单中的 P0a 静态主机预算、P0b query
+admission/backpressure、P0c 并发验收现均有真实 GPU 证据。
+
 验收时还应同步采集 `nvidia-smi`，证明 SQL 账本上限与设备实际占用趋势一致；
 由于 CUDA context 与 driver 开销不在账本内，两者不要求逐字节相等。
 
@@ -277,7 +295,6 @@ GpuScan+GpuPreAgg，然后由仅限 superuser 的 6.3 SQL hook 在预算预留�
 - POSIX shared-memory 对象的协议升级需要运维确认旧 Service 已退出后清理旧对象；
 - 多主机模式天然按 GPU UUID/主机内核 shared memory 分开，仍需独立验收。
 
-P0 核心资源门已经完成真实多 GpuPreAgg、cancel、SIGKILL 和最终回归验收；6.3
-补齐 P0a 静态诊断和 P0c 组合/故障注入资产。新增矩阵在 GPU 环境通过后，才可将
-扩展清单的 P0a/P0b/P0c 全部标为真实 GPU 验收完成。多主机、资源组公平性、
+P0a 静态诊断、P0b admission/backpressure、P0c 组合并发/故障回收现已全部完成
+真实 GPU 验收。后续可转向 M4b 成本校准和性能探索；多主机、资源组公平性、
 GpuCache 统一计费和跨 PID namespace 协调仍需分别设计与验收。

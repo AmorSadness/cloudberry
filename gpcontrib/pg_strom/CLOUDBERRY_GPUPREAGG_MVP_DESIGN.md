@@ -495,8 +495,9 @@ reclaim 及故障后 M1–M4a 全量回归；单机同用户/同 PID namespace �
 
 扩展 6.3 进一步补齐静态 Service 配额和/安全余量诊断、planner-derived request
 追踪、GpuScan+GpuScan、GpuScan+GpuPreAgg 以及受控 allocation-failure rollback
-runner。该扩展矩阵代码和静态检查完成，真实 GPU 结果需单独记录后才并入上述
-P0a/P0b/P0c 完成结论。
+runner。真实 GPU 矩阵已于 2026-08-13 通过：两种组合结果匹配且资源排空，1GiB
+request 可观察，注入失败无泄漏/无部分结果且后续查询恢复。因此 P0a/P0b/P0c
+在当前单机共享 GPU 边界内均完成验收。
 
 - 不再依赖强制 planner GUC 时，典型低基数组可以按成本选择 GpuPreAgg；
 - 比较明细 Motion rows 与 partial Motion rows；
