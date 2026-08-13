@@ -419,6 +419,12 @@ local groups and per-device final buffer.  With `EXPLAIN ANALYZE`, the same
 line includes actual final items, payload usage, and total KDS use.  M4a uses
 these values for diagnosis and later calibration; it does not turn this
 single-host, shared-GPU runner into a performance benchmark.
+The M4a plan and correctness matrix completed real acceptance on 2026-08-13
+with one coordinator and two Primaries sharing one GPU.  All six positive
+query shapes matched their CPU baselines for three executions and the negative
+matrix retained native plans.  This result does not claim calibrated cost
+constants, high-cardinality pressure coverage, concurrency isolation, or
+multi-host performance.
 It also verifies safe fallback for no device qual, mixed host/device quals,
 numeric aggregation, aggregate `FILTER`, `HAVING`, AO/AOCO, partitioned tables,
 and ORCA.  Passing this runner proves the M1/M2 result and placement matrix; it

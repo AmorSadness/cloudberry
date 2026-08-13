@@ -73,6 +73,15 @@ to own their respective costs.  These estimates are structural safeguards,
 not benchmark-calibrated performance claims, especially while all demo
 postmasters share one GPU.
 
+M4a completed real GPU acceptance on 2026-08-13 using one coordinator and two
+Primaries sharing one GPU.  Six positive query shapes each matched their CPU
+baseline for three executions, all positive plans exposed the expected
+Gather-only placement and sizing information, and the established unsupported
+shapes retained native plans.  This validates the structural model on the
+single-host topology; cardinality/cost calibration, high-cardinality pressure,
+multi-host execution, concurrency isolation, and performance claims remain
+outside M4a.
+
 `src/backend/cdb/cdbplan.c` recursively mutates `CustomScan.custom_plans`,
 `custom_exprs`, and `custom_scan_tlist` during QD-to-QE plan rewriting.
 `custom_private` remains opaque extension data.

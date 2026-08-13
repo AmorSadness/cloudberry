@@ -6,7 +6,8 @@
 > 设计日期：2026-08-10  
 > 当前状态：Gather-only MVP 源码已实现，真实双 Primary GPU M1/M2 与 M3
 > cancel、SIGHUP、SIGKILL 验收及故障后的最终全量回归均已通过；M4a 结构化
-> 成本与内存估算源码已实现，当前无 GPU 环境，待真实 GPU 回归
+> 成本与内存估算已于 2026-08-13 完成真实单机双 Primary、共享单 GPU 计划与
+> 正确性验收
 
 ## 1. 结论
 
@@ -464,8 +465,25 @@ CustomScan mutation。如果实现中发现 extension hook 时点无法合法构
 - planner/executor 使用相同 final-buffer 公式，`Path.memory` 不再为零；
 - 无法表示或超过单设备物理显存的估算安全回退；
 - `EXPLAIN (ANALYZE)` 暴露估算和实际 final-buffer 指标；
-- 源码与静态验收已完成；因当前开发环境没有 GPU/CUDA Toolkit，真实 GPU
-  计划、结果与估算校准回归待执行。
+- 源码、静态检查与真实 GPU 验收均已完成。
+
+真实 GPU 验收于 2026-08-13 在单机 1 QD + 2 Primary、三个 postmaster 共享
+同一块 GPU 的环境完成：
+
+- uniform cross-Segment groups、global aggregate、float8 aggregate、单 Segment
+  skew、仅一个 QE 非空和全空输入六类正向计划均生成 Gather-only GpuPreAgg；
+- 每个正向计划均显示双 Primary Gather Motion 和 `GpuPreAgg Sizing`；GROUP BY
+  计划显示每设备 1024MiB 的既有最小 hash buffer，无 GROUP BY 计划显示每设备
+  4096KiB buffer；
+- 六类查询各连续执行三轮，CPU/GPU 结果全部一致；
+- no device qual、mixed quals、numeric、FILTER、HAVING、AO/AOCO、分区表和
+  ORCA 等负向边界继续使用原生计划；
+- runner 最终输出 `Cloudberry Gather-only GpuPreAgg MVP acceptance passed`。
+
+本次验收确认 M4a 的结构化行数/成本口径、planner/executor sizing 公式、计划
+放置和结果正确性在上述拓扑下成立。local-group 估算仍是保守估算，成本常量与
+估算精度校准、高基数压力和性能结论继续属于 M4b；本次结果也不外推到多主机、
+独立 GPU 或并发资源隔离。
 
 ### M4b：成本校准和性能探索
 
