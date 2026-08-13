@@ -62,6 +62,16 @@ assert_idle_safe() {
     done
     [[ $bad == 0 ]] || {
         echo "GPU Service did not return to an idle, budget-safe state" >&2
+		"${psql_cmd[@]}" -P pager=off -c "
+		  SELECT content_id, ready, active_clients, queued_commands,
+		         active_commands, shared_reserved_bytes, shared_budget_bytes
+		  FROM pgstrom.gpu_service_status ORDER BY content_id, gpu_id;" >&2 || true
+		"${psql_cmd[@]}" -P pager=off -c "
+		  SELECT pid, application_name, state, wait_event_type, wait_event,
+		         now() - query_start AS elapsed
+		  FROM pg_stat_activity
+		  WHERE application_name LIKE 'pgstrom_shared_budget_%'
+		  ORDER BY pid;" >&2 || true
         return 1
     }
 }

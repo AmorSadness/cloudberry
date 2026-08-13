@@ -8,14 +8,34 @@ poll_timeout=${PGSTROM_SHARED_BUDGET_TIMEOUT:-60}
 require_rejection=${PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION:-0}
 psql_cmd=("$psql_bin" -X -v ON_ERROR_STOP=1 -d "$database")
 run_dir=$(mktemp -d /tmp/pgstrom-shared-budget.XXXXXX)
+app_prefix="pgstrom_shared_budget_$$"
 pids=()
 
 cleanup() {
-    local pid
+	local pid deadline
+	# Cancel only server backends started by this exact runner instance.  Killing
+	# a local psql does not reliably cancel a distributed query.
+	"${psql_cmd[@]}" -Atqc "
+		SELECT pg_cancel_backend(pid)
+		FROM pg_stat_activity
+		WHERE application_name LIKE '${app_prefix}_%'
+		  AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
     for pid in "${pids[@]:-}"; do
         kill "$pid" 2>/dev/null || true
     done
     wait 2>/dev/null || true
+	deadline=$((SECONDS + 10))
+	while (( SECONDS < deadline )); do
+		[[ $("${psql_cmd[@]}" -Atqc "
+			SELECT count(*) FROM pg_stat_activity
+			WHERE application_name LIKE '${app_prefix}_%';" 2>/dev/null || echo 1) == 0 ]] && break
+		sleep 0.1
+	done
+	"${psql_cmd[@]}" -Atqc "
+		SELECT pg_terminate_backend(pid)
+		FROM pg_stat_activity
+		WHERE application_name LIKE '${app_prefix}_%'
+		  AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
     rm -rf "$run_dir"
 }
 trap cleanup EXIT INT TERM
@@ -103,10 +123,14 @@ assert_budget_invariant
 
 for ((i=1; i<=client_count; i++)); do
     (
+		set +e
         "${psql_cmd[@]}" -AtF '|' -qc "
-            SET application_name = 'pgstrom_shared_budget_$i';
+            SET application_name = '${app_prefix}_$i';
             $gpu_settings
             $test_query" >"$run_dir/client.$i.out" 2>"$run_dir/client.$i.err"
+		rc=$?
+		printf '%d\n' "$rc" >"$run_dir/client.$i.status"
+		exit "$rc"
     ) &
     pids+=("$!")
 done
@@ -114,8 +138,8 @@ done
 deadline=$((SECONDS + poll_timeout))
 while :; do
     live=0
-    for pid in "${pids[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
+	for ((i=1; i<=client_count; i++)); do
+		if [[ ! -f "$run_dir/client.$i.status" ]]; then
             live=$((live + 1))
         fi
     done
@@ -123,6 +147,13 @@ while :; do
     (( live == 0 )) && break
     if (( SECONDS >= deadline )); then
         echo "concurrent budget workload timed out after ${poll_timeout}s" >&2
+		"${psql_cmd[@]}" -P pager=off -c "
+			SELECT pid, application_name, state, wait_event_type, wait_event,
+			       now() - query_start AS elapsed
+			FROM pg_stat_activity
+			WHERE application_name LIKE '${app_prefix}_%'
+			ORDER BY pid;" >&2 || true
+		"${psql_cmd[@]}" -P pager=off -c "$status_sql" >&2 || true
         exit 1
     fi
     sleep 0.1
