@@ -69,7 +69,8 @@ stable_plan() {
 }
 
 assert_final_shape() {
-    local label=$1 expect_motion=$2 plan_file="$run_dir/$label.1.plan"
+    local label=$1 expect_motion=$2
+    local plan_file="$run_dir/$label.1.plan"
     local agg_line gpu_line between
     agg_line=$(grep -n 'Aggregate' \
         "$plan_file" | head -1 | cut -d: -f1)
