@@ -20,7 +20,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [[ ! $client_count =~ ^[2-9][0-9]*$ ]]; then
+if [[ ! $client_count =~ ^[0-9]+$ ]] || (( client_count < 2 )); then
     echo "PGSTROM_SHARED_BUDGET_CLIENTS must be at least 2: $client_count" >&2
     exit 1
 fi
