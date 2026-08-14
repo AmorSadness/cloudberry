@@ -121,7 +121,7 @@ stable_having_plan() {
         echo "[$label PG-Strom planner diagnostics]" >&2
         "${psql_cmd[@]}" -Atqc \
             "$settings SET client_min_messages=debug1;
-             EXPLAIN (VERBOSE, COSTS OFF) $query" >&2 || true
+             EXPLAIN (VERBOSE, COSTS ON) $query" >&2 || true
         exit 1
     }
     agg_line=$(grep -n 'Aggregate' "$run_dir/$label.1.plan" | head -1 | cut -d: -f1)

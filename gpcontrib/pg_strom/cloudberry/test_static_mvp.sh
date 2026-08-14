@@ -94,6 +94,7 @@ require_text 'Cloudberry always executes a CPU final aggregate after GpuPreAgg' 
 require_text 'Cloudberry GpuPreAgg HAVING passed query eligibility' "$gpu_preagg"
 require_text 'Cloudberry GpuPreAgg HAVING target rewrite rejected' "$gpu_preagg"
 require_text 'Cloudberry GpuPreAgg HAVING path constructed' "$gpu_preagg"
+require_text 'Cloudberry GpuPreAgg HAVING final path' "$gpu_preagg"
 require_text 'extra->patype != PARTITIONWISE_AGGREGATE_NONE' "$gpu_preagg"
 require_text 'GpPolicyIsPartitioned\(input_rel->cdbpolicy\)' "$gpu_preagg"
 require_text 'op_leaf->pp_info->scan_quals == NIL' "$gpu_preagg"

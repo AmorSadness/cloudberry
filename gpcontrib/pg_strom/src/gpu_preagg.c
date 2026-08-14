@@ -2371,6 +2371,18 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con,
 										 num_groups);
 		if (con->has_aggfuncs)
 			__path = pgstrom_create_dummy_path(con->root, __path);
+#ifdef GP_VERSION_NUM
+		if (parse->havingQual != NULL)
+			elog(DEBUG1,
+				 "Cloudberry GpuPreAgg HAVING final path "
+				 "(collocated=%d partial_startup=%.2f partial_total=%.2f "
+				 "partial_rows=%.0f final_startup=%.2f final_total=%.2f "
+				 "final_rows=%.0f locus=%d)",
+				 con->groupby_collocated,
+				 part_path->startup_cost, part_path->total_cost, part_path->rows,
+				 __path->startup_cost, __path->total_cost, __path->rows,
+				 __path->locus.locustype);
+#endif
 		add_path(con->group_rel, __path
 #ifdef GP_VERSION_NUM
 				 , con->root
