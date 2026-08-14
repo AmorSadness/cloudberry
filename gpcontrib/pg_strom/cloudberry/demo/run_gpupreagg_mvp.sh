@@ -199,10 +199,9 @@ compare_result "all QEs empty" "$empty_query"
 
 require_native_aggregate_plan "no device qual" \
     "SELECT grp, count(*) FROM pgstrom_mvp_heap GROUP BY grp;"
-require_native_aggregate_plan "mixed host/device quals" \
+require_native_aggregate_plan "mixed host/device quals with P1 GUC off" \
     "SELECT grp, count(*) FROM pgstrom_mvp_heap
-     WHERE id > 0 AND payload ~ '^[0-7]' GROUP BY grp;" \
-    "SET pg_strom.cloudberry_enable_host_quals=on;"
+     WHERE id > 0 AND payload ~ '^[0-7]' GROUP BY grp;"
 require_native_aggregate_plan "numeric aggregate" \
     "SELECT grp, sum(amount) FROM pgstrom_mvp_heap WHERE id > 0 GROUP BY grp;"
 require_native_aggregate_plan "aggregate FILTER" \

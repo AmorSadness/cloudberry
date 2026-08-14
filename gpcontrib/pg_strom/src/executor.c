@@ -1334,6 +1334,112 @@ __setupTaskStateRequestBuffer(pgstromTaskState *pts,
 }
 
 /*
+ * Materialize rows that survived a mixed-qual GpuScan (device predicate in
+ * the child GPU task, host predicate in its QE executor) into a ROW-format
+ * KDS.  The parent GpuPreAgg sends this KDS to a second GPU task.  This extra
+ * round trip is intentional: evaluating a CPU-only predicate after partial
+ * aggregation is semantically invalid.
+ */
+static XpuCommand *
+pgstromOuterPlanChunk(pgstromTaskState *pts,
+					 struct iovec *xcmd_iov, int *xcmd_iovcnt)
+{
+	PlanState	 *outer_ps = pts->outer_plan_state;
+	XpuCommand	 *xcmd;
+	kern_data_store *kds;
+	size_t		  kds_offset;
+	size_t		  head_sz;
+	size_t		  front_sz;
+	const size_t  max_length = PGSTROM_CHUNK_SIZE;
+
+	Assert(outer_ps != NULL);
+	xcmd = (XpuCommand *)pts->xcmd_buf.data;
+	kds_offset = xcmd->u.task.kds_src_offset;
+	enlargeStringInfo(&pts->xcmd_buf, kds_offset + max_length);
+	xcmd = (XpuCommand *)pts->xcmd_buf.data;
+	kds = (kern_data_store *)((char *)xcmd + kds_offset);
+	head_sz = KDS_HEAD_LENGTH(kds);
+	kds->length = max_length;
+	kds->usage = 0;
+	kds->nitems = 0;
+
+	while (!pts->scan_done)
+	{
+		TupleTableSlot *slot = NULL;
+		MinimalTuple mtup;
+		bool		should_free = false;
+		size_t		tuple_sz;
+		size_t		required;
+
+		CHECK_FOR_INTERRUPTS();
+		if (pts->outer_pending_tuple != NULL)
+		{
+			mtup = pts->outer_pending_tuple;
+			pts->outer_pending_tuple = NULL;
+			should_free = true;
+		}
+		else
+		{
+			slot = ExecProcNode(outer_ps);
+			if (TupIsNull(slot))
+			{
+				pts->scan_done = true;
+				break;
+			}
+			mtup = ExecFetchSlotMinimalTuple(slot, &should_free);
+		}
+
+		tuple_sz = MAXALIGN(mtup->t_len + ROWID_SIZE);
+		required = (head_sz +
+					MAXALIGN(sizeof(uint64_t) * (kds->nitems + 1)) +
+					kds->usage + tuple_sz);
+		if (required > max_length)
+		{
+			if (kds->nitems == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("mixed-qual GpuPreAgg input tuple is too large")));
+			pts->outer_pending_tuple = heap_copy_minimal_tuple(mtup);
+			if (should_free)
+				heap_free_minimal_tuple(mtup);
+			break;
+		}
+		else
+		{
+			char		   *tail = (char *)kds + max_length -
+								 kds->usage - tuple_sz;
+			kern_tupitem *titem = (kern_tupitem *)tail;
+
+			memcpy(titem, mtup, mtup->t_len);
+			titem->t_len += ROWID_SIZE;
+			KERN_TUPITEM_SET_ROWID(titem, kds->nitems);
+			KDS_GET_ROWINDEX(kds)[kds->nitems] =
+				(uint64_t)((char *)kds + max_length - tail);
+			kds->nitems++;
+			kds->usage += tuple_sz;
+			if (should_free)
+				heap_free_minimal_tuple(mtup);
+		}
+	}
+
+	if (kds->nitems == 0)
+		return NULL;
+	front_sz = MAXALIGN(head_sz + sizeof(uint64_t) * kds->nitems);
+	memmove((char *)kds + front_sz,
+			(char *)kds + max_length - kds->usage,
+			kds->usage);
+	kds->length = front_sz + kds->usage;
+	xcmd = (XpuCommand *)pts->xcmd_buf.data;
+	xcmd->repeat_id = 0;
+	xcmd->length = kds_offset + kds->length;
+	pts->xcmd_buf.len = xcmd->length;
+	xcmd_iov[0].iov_base = xcmd;
+	xcmd_iov[0].iov_len = xcmd->length;
+	*xcmd_iovcnt = 1;
+	return xcmd;
+}
+
+/*
  * fixup_fallback_expression
  */
 static Node *
@@ -1574,7 +1680,7 @@ pgstromCreateTaskState(CustomScan *cscan,
 {
 	pgstromPlanInfo *pp_info = deform_pgstrom_plan_info(cscan);
 	pgstromTaskState *pts;
-	int		num_rels = list_length(cscan->custom_plans);
+	int		num_rels = pp_info->num_rels;
 
 	pts = palloc0(offsetof(pgstromTaskState, inners[num_rels]));
 	NodeSetTag(pts, T_CustomScanState);
@@ -1585,7 +1691,9 @@ pgstromCreateTaskState(CustomScan *cscan,
 #endif
 	pts->xpu_task_flags = pp_info->xpu_task_flags;
 	pts->pp_info = pp_info;
-	Assert(pp_info->num_rels == num_rels);
+	Assert(list_length(cscan->custom_plans) == num_rels +
+		   (((pp_info->xpu_task_flags & DEVTASK__SCAN_OUTER_CHUNKS) != 0)
+			? 1 : 0));
 	pts->num_scan_repeats = 1;
 	pts->num_rels = num_rels;
 
@@ -1652,9 +1760,11 @@ pgstromExecInitTaskState(CustomScanState *node, EState *estate, int eflags)
 	pgstromPlanInfo	*pp_info = pts->pp_info;
 	CustomScan *cscan = (CustomScan *)pts->css.ss.ps.plan;
 	Relation	rel = pts->css.ss.ss_currentRelation;
-	TupleDesc	tupdesc_src = RelationGetDescr(rel);
+	TupleDesc	tupdesc_src;
 	int			depth_index = 0;
 	ListCell   *lc;
+	bool		scan_outer_chunks = ((pts->xpu_task_flags &
+									 DEVTASK__SCAN_OUTER_CHUNKS) != 0);
 
 #ifdef GP_VERSION_NUM
 	if (estate->es_instrument &&
@@ -1666,14 +1776,34 @@ pgstromExecInitTaskState(CustomScanState *node, EState *estate, int eflags)
 	Assert(rel != NULL &&
 		   outerPlanState(node) == NULL &&
 		   innerPlanState(node) == NULL &&
-		   pp_info->num_rels == list_length(cscan->custom_plans) &&
-		   pts->num_rels == list_length(cscan->custom_plans));
+		   pp_info->num_rels + (scan_outer_chunks ? 1 : 0) ==
+				list_length(cscan->custom_plans) &&
+		   pts->num_rels == pp_info->num_rels);
+	lc = list_head(cscan->custom_plans);
+	if (scan_outer_chunks)
+	{
+		Plan *plan = lfirst(lc);
+
+		Assert((pts->xpu_task_flags & DEVKIND__NVIDIA_GPU) != 0);
+		pts->outer_plan_state = ExecInitNode(plan, estate, eflags);
+		pts->css.custom_ps = lappend(pts->css.custom_ps,
+								  pts->outer_plan_state);
+		tupdesc_src = ExecGetResultType(pts->outer_plan_state);
+		pts->optimal_gpus = GetSystemAvailableGpus();
+		lc = lnext(cscan->custom_plans, lc);
+	}
+	else
+		tupdesc_src = RelationGetDescr(rel);
 	/*
 	 * PG-Strom supports:
 	 * - regular relation with 'heap' access method
 	 * - foreign-table with 'arrow_fdw' driver
 	 */
-	if (RelationGetForm(rel)->relkind == RELKIND_RELATION ||
+	if (scan_outer_chunks)
+	{
+		/* Input is supplied by the CPU-filtered child plan. */
+	}
+	else if (RelationGetForm(rel)->relkind == RELKIND_RELATION ||
 		RelationGetForm(rel)->relkind == RELKIND_MATVIEW)
 	{
 		SMgrRelation smgr = RelationGetSmgr(rel);
@@ -1749,7 +1879,7 @@ pgstromExecInitTaskState(CustomScanState *node, EState *estate, int eflags)
 	 * init inner relations
 	 */
 	depth_index = 0;
-	foreach (lc, cscan->custom_plans)
+	for (; lc != NULL; lc = lnext(cscan->custom_plans, lc))
 	{
 		pgstromTaskInnerState *istate = &pts->inners[depth_index];
 		pgstromPlanInnerInfo *pp_inner = &pp_info->inners[depth_index];
@@ -1829,7 +1959,15 @@ pgstromExecInitTaskState(CustomScanState *node, EState *estate, int eflags)
 	/*
 	 * Setup request buffer
 	 */
-	if (pts->arrow_state)		/* Apache Arrow */
+	if (scan_outer_chunks)
+	{
+		pts->cb_next_chunk = pgstromOuterPlanChunk;
+		pts->cb_next_tuple = pgstromScanNextTuple;
+		__setupTaskStateRequestBuffer(pts,
+								  tupdesc_src,
+								  KDS_FORMAT_ROW);
+	}
+	else if (pts->arrow_state)		/* Apache Arrow */
 	{
 		pts->cb_next_chunk = pgstromScanChunkArrowFdw;
 		pts->cb_next_tuple = pgstromScanNextTuple;
@@ -2192,6 +2330,8 @@ pgstromExecEndTaskState(CustomScanState *node)
 		pgstromArrowFdwExecEnd(pts->arrow_state);
 	if (pts->base_slot)
 		ExecDropSingleTupleTableSlot(pts->base_slot);
+	if (pts->outer_pending_tuple)
+		heap_free_minimal_tuple(pts->outer_pending_tuple);
 	if (scan)
 		table_endscan(scan);
 	for (int i=0; i < pts->num_rels; i++)
@@ -2248,6 +2388,11 @@ pgstromExecResetTaskState(CustomScanState *node)
 			   !pts->final_done);
 	}
 	/* reset related stuff */
+	if (pts->outer_pending_tuple)
+	{
+		heap_free_minimal_tuple(pts->outer_pending_tuple);
+		pts->outer_pending_tuple = NULL;
+	}
 	if (pts->br_state)
 		pgstromBrinIndexExecReset(pts);
 	if (pts->arrow_state)
@@ -2297,13 +2442,15 @@ pgstromSharedStateEstimateDSM(CustomScanState *node,
 	Relation	relation = node->ss.ss_currentRelation;
 	EState	   *estate   = node->ss.ps.state;
 	Snapshot	snapshot = estate->es_snapshot;
-	int			num_rels = list_length(node->custom_ps);
+	int			num_rels = pts->num_rels;
 	Size		len = 0;
 
 	if (pts->br_state)
 		len += pgstromBrinIndexEstimateDSM(pts);
 	len += MAXALIGN(offsetof(pgstromSharedState, inners[num_rels]));
 
+	if ((pts->xpu_task_flags & DEVTASK__SCAN_OUTER_CHUNKS) != 0)
+		return MAXALIGN(len);
 	if (!pts->arrow_state)
 		len += table_parallelscan_estimate(relation, snapshot);
 
@@ -2322,7 +2469,7 @@ pgstromSharedStateInitDSM(CustomScanState *node,
 	Relation	relation = node->ss.ss_currentRelation;
 	EState	   *estate   = node->ss.ps.state;
 	Snapshot	snapshot = estate->es_snapshot;
-	int			num_rels = list_length(node->custom_ps);
+	int			num_rels = pts->num_rels;
 	size_t		dsm_length = offsetof(pgstromSharedState, inners[num_rels]);
 	char	   *dsm_addr = coordinate;
 	pgstromSharedState *ps_state;
@@ -2333,6 +2480,31 @@ pgstromSharedStateInitDSM(CustomScanState *node,
 	if (pts->br_state)
 		dsm_addr += pgstromBrinIndexInitDSM(pts, dsm_addr);
 	Assert(!pts->css.ss.ss_currentScanDesc);
+	if ((pts->xpu_task_flags & DEVTASK__SCAN_OUTER_CHUNKS) != 0)
+	{
+		if (dsm_addr)
+		{
+			ps_state = (pgstromSharedState *)dsm_addr;
+			memset(ps_state, 0, dsm_length);
+			ps_state->ss_handle = dsm_segment_handle(pcxt->seg);
+		}
+		else
+		{
+			ps_state = MemoryContextAllocZero(estate->es_query_cxt,
+										  dsm_length);
+			ps_state->ss_handle = DSM_HANDLE_INVALID;
+		}
+		ps_state->ss_length = dsm_length;
+		ps_state->query_plan_id = ((uint64_t)MyProcPid) << 32 |
+			(uint64_t)pts->css.ss.ps.plan->plan_node_id;
+		ps_state->pgsql_curr_xid = GetCurrentTransactionIdIfAny();
+		ps_state->pgsql_curr_cid = GetCurrentCommandId(true);
+		ps_state->num_rels = num_rels;
+		ConditionVariableInit(&ps_state->preload_cond);
+		SpinLockInit(&ps_state->preload_mutex);
+		pts->ps_state = ps_state;
+		return;
+	}
 	if (dsm_addr)
 	{
 		ps_state = (pgstromSharedState *) dsm_addr;
@@ -2399,7 +2571,7 @@ pgstromSharedStateAttachDSM(CustomScanState *node,
 	pgstromTaskState *pts = (pgstromTaskState *)node;
 	pgstromSharedState *ps_state;
 	char	   *dsm_addr = coordinate;
-	int			num_rels = list_length(pts->css.custom_ps);
+	int			num_rels = pts->num_rels;
 
 	if (pts->br_state)
 		dsm_addr += pgstromBrinIndexAttachDSM(pts, dsm_addr);
@@ -2407,6 +2579,8 @@ pgstromSharedStateAttachDSM(CustomScanState *node,
 	Assert(ps_state->num_rels == num_rels);
 	dsm_addr += MAXALIGN(offsetof(pgstromSharedState, inners[num_rels]));
 
+	if ((pts->xpu_task_flags & DEVTASK__SCAN_OUTER_CHUNKS) != 0)
+		return;
 	if (pts->gcache_desc)
 		pgstromGpuCacheAttachDSM(pts, pts->ps_state);
 	if (pts->arrow_state)
@@ -3001,6 +3175,10 @@ pgstromExplainTaskState(CustomScanState *node,
 		size_t		buffer_sz;
 		bool		hash_format = ((pp_info->xpu_task_flags &
 									 DEVTASK__PINNED_HASH_RESULTS) != 0);
+
+		if ((pp_info->xpu_task_flags & DEVTASK__SCAN_OUTER_CHUNKS) != 0)
+			ExplainPropertyText("Pre-Aggregation Input",
+								"CPU host-filtered GpuScan rows", es);
 
 		resetStringInfo(&buf);
 		forboth (lc1, pp_info->groupby_actions,

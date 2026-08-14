@@ -1571,6 +1571,7 @@ typedef struct
 	AggClauseCosts	final_agg_clause_costs;
 	QualCost		final_proj_clause_costs;
 	pgstromPlanInfo *pp_info;
+	Path		   *outer_path;	/* CPU-filtered GpuScan for mixed quals */
 	int				sibling_param_id;
 	List		   *inner_paths_list;
 	List		   *inner_target_list;
@@ -2447,7 +2448,9 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	CustomPath *cpath = makeNode(CustomPath);
 	PathTarget *target_partial = con->target_partial;
 	pgstromPlanInfo *pp_info = copy_pgstrom_plan_info(con->pp_info);
-	double		input_nrows = PP_INFO_NUM_ROWS(pp_info);
+	double		input_nrows = (con->outer_path != NULL
+							 ? con->outer_path->rows
+							 : PP_INFO_NUM_ROWS(pp_info));
 	double		num_group_keys;
 	double		xpu_ratio;
 	double		dma_input_width_factor;
@@ -2491,6 +2494,29 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	else
 		pp_info->xpu_task_flags |= (DEVTASK__PREAGG | DEVTASK__PINNED_ROW_RESULTS);
 	pp_info->sibling_param_id = con->sibling_param_id;
+	if (con->outer_path != NULL)
+	{
+		/*
+		 * The child GpuScan has already applied both the device qual and the
+		 * CPU host qual.  This second GPU task consumes its filtered row KDS;
+		 * it must not repeat either predicate or charge a direct base scan.
+		 */
+		Assert(pp_info->num_rels == 0);
+		pp_info->xpu_task_flags |= DEVTASK__SCAN_OUTER_CHUNKS;
+		pp_info->host_quals = NIL;
+		pp_info->scan_quals = NIL;
+		pp_info->brin_index_oid = InvalidOid;
+		pp_info->brin_index_conds = NIL;
+		pp_info->brin_index_quals = NIL;
+		pp_info->scan_tuples = input_nrows;
+		pp_info->scan_nrows = input_nrows;
+		pp_info->startup_cost = (con->outer_path->total_cost +
+								 (xpu_cpath_methods == &gpupreagg_path_methods
+								  ? pgstrom_gpu_setup_cost : 0.0));
+		pp_info->inner_cost = 0.0;
+		pp_info->run_cost = 0.0;
+		pp_info->final_cost = 0.0;
+	}
 	/* Result cardinality here is the number of partial rows produced per QE. */
 	pp_info->final_nrows = con->num_groups;
 
@@ -2647,7 +2673,9 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 #endif
 	cpath->path.pathkeys         = NIL;
 	cpath->flags                 = 0;	/* prevent Result pushdown before plan creation */
-	cpath->custom_paths          = con->inner_paths_list;
+	cpath->custom_paths          = (con->outer_path != NULL
+								  ? list_make1(con->outer_path)
+								  : con->inner_paths_list);
 	cpath->custom_private        = list_make3(pp_info, NULL, NULL);
 	cpath->methods               = xpu_cpath_methods;
 	return cpath;
@@ -2898,7 +2926,8 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 #ifdef GP_VERSION_NUM
 	/* Defense in depth against future changes to the GpuScan path tracker. */
 	if (op_leaf->pp_info->scan_quals == NIL ||
-		op_leaf->pp_info->host_quals != NIL ||
+		(op_leaf->pp_info->host_quals != NIL &&
+		 op_leaf->host_qual_path == NULL) ||
 		op_leaf->pp_info->scan_relid <= 0)
 		return;
 #endif
@@ -2988,6 +3017,7 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 	con.target_agg_final = create_empty_pathtarget();
 	con.target_proj_final = create_empty_pathtarget();
 	con.pp_info        = op_leaf->pp_info;
+	con.outer_path     = op_leaf->host_qual_path;
 	con.sibling_param_id = -1;
 	con.inner_paths_list = op_leaf->inner_paths_list;
 	con.inner_target_list = inner_target_list;
@@ -3935,14 +3965,26 @@ PlanGpuPreAggPath(PlannerInfo *root,
 {
 	pgstromPlanInfo *pp_info = linitial(cpath->custom_private);
 	CustomScan	   *cscan;
+	List		   *xpu_custom_plans = custom_plans;
+	List		   *source_paths = NIL;
+
+	if ((pp_info->xpu_task_flags & DEVTASK__SCAN_OUTER_CHUNKS) != 0)
+	{
+		Assert(pp_info->num_rels == 0 && list_length(custom_plans) == 1);
+		xpu_custom_plans = NIL;
+		source_paths = cpath->custom_paths;
+		cpath->custom_paths = NIL;
+	}
 
 	cscan = PlanXpuJoinPathCommon(root,
 								  joinrel,
 								  cpath,
 								  tlist,
-								  custom_plans,
+								  xpu_custom_plans,
 								  pp_info,
 								  &gpupreagg_plan_methods);
+	if (source_paths != NIL)
+		cpath->custom_paths = source_paths;
 	if ((pp_info->xpu_task_flags & DEVTASK__MERGE_FINAL_BUFFER) != 0)
 	{
 		List	   *having_proj_quals = lthird(cpath->custom_private);
@@ -3952,6 +3994,8 @@ PlanGpuPreAggPath(PlannerInfo *root,
 			elog(ERROR, "Bug? GPU-Sort and HAVING clause are not usable together");
 		cscan->scan.plan.qual = having_proj_quals;
 	}
+	if ((pp_info->xpu_task_flags & DEVTASK__SCAN_OUTER_CHUNKS) != 0)
+		cscan->custom_plans = custom_plans;
 	form_pgstrom_plan_info(cscan, pp_info);
 	return &cscan->scan.plan;
 }

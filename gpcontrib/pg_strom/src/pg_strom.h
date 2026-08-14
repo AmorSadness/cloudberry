@@ -368,6 +368,7 @@ typedef struct
 	ParamPathInfo  *leaf_param;
 	Cardinality		leaf_nrows;
 	Cost			leaf_cost;
+	Path		   *host_qual_path;	/* materialized mixed-qual GpuScan input */
 	List		   *inner_paths_list;
 } pgstromOuterPathLeafInfo;
 
@@ -509,6 +510,8 @@ struct pgstromTaskState
 	bool				scan_done;
 	bool				final_done;
 	uint32_t			num_scan_repeats;
+	PlanState		   *outer_plan_state; /* CPU-filtered source for mixed PreAgg */
+	MinimalTuple		outer_pending_tuple;
 	/* base relation scan, if any */
 	TupleTableSlot	   *base_slot;
 	ExprState		   *base_quals;	/* equivalent to device quals */

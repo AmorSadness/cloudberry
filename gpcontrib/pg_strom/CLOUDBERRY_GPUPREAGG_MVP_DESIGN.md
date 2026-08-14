@@ -516,7 +516,8 @@ M4b 已于 2026-08-13 完成代码、静态检查和真实 GPU 验收。16MiB gr
 - HAVING 已于 2026-08-14 完成 M5b 单机共享 GPU 真实验收，见
   `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`；
 - numeric 和更多 aggregates/types；
-- mixed host/device quals 在 pre-aggregation 之前执行；
+- mixed host/device quals 在 pre-aggregation 之前执行的 P1-1 已实现，待真实 GPU
+  验收，见 `CLOUDBERRY_GPUPREAGG_MIXED_QUALS_DESIGN.md`；
 - GpuSort/Top-N/window rank；
 - GpuHashJoin。
 
@@ -602,6 +603,7 @@ GROUP BY grp;
 上述 Gather-only 出口已于 2026-08-10 完成真实双 Primary GPU 验收及故障后全量
 回归，是首个代码里程碑的历史描述。当前能力已继续完成 M5a 共置 GROUP BY
 local-final（2026-08-13）和 M5b CPU-final HAVING（2026-08-14）真实 GPU 验收；HAVING
-不再属于当前保留边界，但 DISTINCT aggregate、numeric、mixed quals、AO/AOCO、分区、
+不再属于当前保留边界；mixed quals 已进入 P1-1 opt-in 两阶段实现和验收。DISTINCT
+aggregate、numeric、AO/AOCO、分区、
 ORCA 和多主机/多 GPU 性能结论仍保持边界。所有结论继续保留“实验特性、默认关闭、
 无多主机或多 GPU 性能结论”的限定。

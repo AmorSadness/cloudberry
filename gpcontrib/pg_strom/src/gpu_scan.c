@@ -505,6 +505,7 @@ try_add_simple_scan_path(PlannerInfo *root,
 	if (op_leaf)
 	{
 		pgstromPlanInfo *pp_info = op_leaf->pp_info;
+		CustomPath *scan_cpath = NULL;
 
 		if ((!allow_host_quals && pp_info->host_quals != NIL) ||
 			(!allow_no_device_quals && pp_info->scan_quals == NIL))
@@ -512,6 +513,7 @@ try_add_simple_scan_path(PlannerInfo *root,
 		if (pp_info->scan_quals != NIL)
 		{
 			CustomPath *cpath = makeNode(CustomPath);
+			scan_cpath = cpath;
 
 			cpath->path.pathtype    = T_CustomScan;
 			cpath->path.parent      = baserel;
@@ -554,9 +556,32 @@ try_add_simple_scan_path(PlannerInfo *root,
 				add_partial_path(baserel, &cpath->path);
 		}
 		/*
-		 * unable pullup the scan path with host-quals
+		 * A fused GpuPreAgg cannot evaluate host quals after aggregation.  For
+		 * Cloudberry mixed quals, retain a private full-row GpuScan path so the
+		 * host filter runs in this child and its surviving rows can be fed to a
+		 * second GPU task for partial aggregation.  The physical target keeps
+		 * base attribute numbers identical in the row KDS consumed by PreAgg.
 		 */
-		if (pp_info->host_quals == NIL)
+		if (pp_info->host_quals != NIL && scan_cpath != NULL)
+		{
+			List *physical_tlist = build_physical_tlist(root, baserel);
+
+			if (physical_tlist != NIL)
+			{
+				CustomPath *mixed_cpath = palloc(sizeof(CustomPath));
+				PathTarget *physical_target = make_pathtarget_from_tlist(physical_tlist);
+				pgstromPlanInfo *mixed_pp_info = copy_pgstrom_plan_info(pp_info);
+
+				set_pathtarget_cost_width(root, physical_target);
+				memcpy(mixed_cpath, scan_cpath, sizeof(CustomPath));
+				mixed_cpath->path.pathtarget = physical_target;
+				mixed_cpath->path.rows = pp_info->final_nrows;
+				mixed_cpath->custom_private = list_make1(mixed_pp_info);
+				op_leaf->host_qual_path = &mixed_cpath->path;
+				op_leaf->leaf_nrows = pp_info->final_nrows;
+			}
+		}
+		if (pp_info->host_quals == NIL || op_leaf->host_qual_path != NULL)
 		{
 			pgstrom_remember_op_normal(root,
 									   baserel,

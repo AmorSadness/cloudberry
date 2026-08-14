@@ -71,7 +71,8 @@ M5b 不在 GPU 端重新实现布尔或 NULL 语义。
 
 - HAVING 中的 aggregate FILTER、DISTINCT 或 aggregate ORDER BY；
 - numeric 或其他未进入 whitelist 的 aggregate/type；
-- grouping sets、mixed host/device scan quals、AO/AOCO、分区表和 ORCA；
+- grouping sets、AO/AOCO、分区表和 ORCA；mixed host/device scan quals 仅在 P1-1
+  opt-in 两阶段路径下开放；
 - 任何无法完成 alternative aggregate 替换的表达式。
 
 回退必须发生在 path 创建阶段，不得等到 executor 报错。

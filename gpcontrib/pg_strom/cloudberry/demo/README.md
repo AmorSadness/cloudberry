@@ -425,9 +425,10 @@ query shapes matched their CPU baselines for three executions and the negative
 matrix retained native plans.  This result does not claim calibrated cost
 constants, high-cardinality pressure coverage, concurrency isolation, or
 multi-host performance.
-It also verifies safe fallback for no device qual, mixed host/device quals,
-numeric aggregation, aggregate `FILTER`, `HAVING`, AO/AOCO, partitioned tables,
-and ORCA.  Passing this runner proves the M1/M2 result and placement matrix; it
+It also verifies safe fallback for no device qual, mixed host/device quals with
+the P1 opt-in GUC off, numeric aggregation, aggregate `FILTER`, AO/AOCO,
+partitioned tables, and ORCA.  Passing this runner proves the M1/M2 result and
+placement matrix; it
 does not by itself complete query-cancel or GPU Service failure recovery
 acceptance for GpuPreAgg.
 
@@ -532,6 +533,31 @@ is checked separately for CPU/GPU result equality.  FILTER, DISTINCT and
 numeric HAVING aggregates must retain native plans.  A successful accepted run
 ends with `Cloudberry GpuPreAgg HAVING acceptance passed`.  See
 `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`.
+
+### GpuPreAgg mixed host/device quals
+
+P1-1 uses a two-stage path for an opt-in mixed WHERE clause.  A child GpuScan
+applies device predicates and its QE CPU applies the host `Filter`; the
+surviving detail rows are packed into a ROW KDS and consumed by GpuPreAgg.
+`EXPLAIN` reports `Pre-Aggregation Input: CPU host-filtered GpuScan rows` on the
+parent, making the pre-aggregation execution boundary explicit.
+
+Run:
+
+```sh
+PGDATABASE=pgstrom_mvp \
+PGSTROM_GPUPREAGG_MIXED_REPEAT=3 \
+./gpcontrib/pg_strom/cloudberry/demo/run_gpupreagg_mixed_quals.sh \
+  2>&1 | tee /tmp/pgstrom-gpupreagg-mixed.log
+```
+
+The runner covers colocated, Gather-final, global aggregate, and mixed
+WHERE-plus-HAVING shapes; it compares all results with CPU baselines and checks
+GUC-off/host-only fallback.  The two GPU tasks add a GPU-to-CPU-to-GPU detail
+round trip, so P1-1 is a correctness/placement milestone rather than a
+performance claim.  Success ends with
+`Cloudberry GpuPreAgg mixed host/device quals acceptance passed`.  See
+`CLOUDBERRY_GPUPREAGG_MIXED_QUALS_DESIGN.md`.
 
 ### GpuPreAgg cancellation and failure recovery
 

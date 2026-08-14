@@ -79,6 +79,10 @@ M4b 的“partial rows 达到输入 50% 则拒绝”规则是针对无法有效�
 键、HashedOJ/Strewn locus、DISTINCT、mixed host/device quals、numeric、
 AO/AOCO、分区表和 ORCA。
 
+其中 mixed host/device quals 是 M5a 完成时的边界；P1-1 后续使用
+`GpuScan -> CPU host filter -> ROW KDS -> GpuPreAgg` 两阶段路径受控开放，见
+`CLOUDBERRY_GPUPREAGG_MIXED_QUALS_DESIGN.md`。
+
 HAVING 在 M5a 完成时仍是保留边界；后续 M5b 已于 2026-08-14 在 CPU final
 aggregate 上受控开放并通过单机共享 GPU 真实验收，见
 `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`。

@@ -54,17 +54,23 @@ query cancellation, SIGHUP, and SIGKILL/crash recovery; see
 `CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md`.
 
 The experimental GpuPreAgg path is also default-off.  When explicitly enabled,
-each QE fuses a device-only GpuScan with local partial aggregation.  M5a keeps
+each QE can fuse a device-only GpuScan with local partial aggregation.  P1-1
+also constructs an opt-in two-stage mixed-qual path: GpuScan applies the device
+qual, its QE CPU applies the host qual, then a ROW KDS feeds GpuPreAgg so the
+host predicate is guaranteed to run before partial aggregation.  M5a keeps
 GROUP BY results local when the keys provably cover the input distribution key,
 and executes one CPU final aggregate per QE without a pre-final Gather Motion.
 Other GROUP BY shapes and global aggregates send partial rows through a real
 Cloudberry Motion and use one CPU final aggregate to merge groups across
 Segments.  Its first whitelist is count/sum/min/max on
-integer and floating-point inputs; mixed quals, numeric, aggregate FILTER,
-DISTINCT aggregates, partitionwise aggregation and GPU-Sort retain native
-plans.  Source and acceptance assets are complete.  Real dual-Primary GPU
+integer and floating-point inputs; numeric, aggregate FILTER, DISTINCT
+aggregates, partitionwise aggregation and GPU-Sort retain native plans.  Mixed
+quals remain native unless `pg_strom.cloudberry_enable_host_quals` is explicitly
+enabled.  P1-1 source and acceptance assets are complete; real-GPU acceptance
+is pending.  Real dual-Primary GPU
 M1/M2/M3 acceptance and the post-failure full regression completed on
 2026-08-10; see `CLOUDBERRY_GPUPREAGG_MVP_DESIGN.md`.
+See `CLOUDBERRY_GPUPREAGG_MIXED_QUALS_DESIGN.md` for the P1-1 boundary.
 
 The M4a planner now estimates global groups once and derives expected local
 groups per QE from the input locus.  Local groups drive partial-row/DMA cost
