@@ -4,6 +4,13 @@
 单机 1 QD + 2 Primary、所有 GPU Service 共享同一块物理 GPU 的环境完成真实 GPU
 验收。验收前只称“实现完成”，不称“P1-1 GPU 验收完成”。
 
+2026-08-14 首轮 GPU 复验已证明共置、非共置、全局聚合和 HAVING 四类 mixed
+计划均能形成正确的 `GpuScan -> CPU Filter -> GpuPreAgg` 边界。该轮执行暴露 GPU
+scan source dispatcher 尚未接受 QE 构造的 `KDS_FORMAT_ROW`；现已增加 ROW loader，
+待重新编译后的结果一致性复验。系统目录确认验收表不存在 dropped/missing-value 列，
+因此本次实际 planner 修复点是避免未引用列以多余 `Var` 进入子路径；NULL 占位同时
+保留对未来无关 dropped/missing-value 列的防护。
+
 ## 1. 目标与语义边界
 
 P1-1 允许同一 WHERE 中同时存在 GPU 可执行和 CPU-only 条件时使用 GpuPreAgg。
@@ -54,6 +61,8 @@ Pre-Aggregation Input: CPU host-filtered GpuScan rows
 最多 `PGSTROM_CHUNK_SIZE` 组成 `KDS_FORMAT_ROW`：
 
 - row index 从 KDS 头部增长，MinimalTuple 从尾部反向写入；
+- GPU scan source dispatcher 识别 `KDS_FORMAT_ROW`，以
+  `ExecLoadVarsMinimalTuple()` 装载 CPU 已过滤的输入；
 - 单行跨 chunk 时复制为 pending tuple，下一批首先消费；
 - 单个 tuple 本身超过 chunk 上限时明确报 `PROGRAM_LIMIT_EXCEEDED`；
 - cancel、rescan 和 executor end 都释放 pending tuple，并 rescan/end 子 plan；

@@ -460,11 +460,12 @@ buildSimpleScanPlanInfo(PlannerInfo *root,
 #ifdef GP_VERSION_NUM
 /*
  * Build a row target whose output positions match base-table attribute
- * numbers.  build_physical_tlist() rejects the entire relation when any
- * column has a missing value (for example, a column added by ALTER TABLE),
- * even if that column is irrelevant to this query.  Mixed GpuPreAgg only
- * needs referenced attributes to be real Vars; unused positions can be typed
- * NULL placeholders so the second GPU task still sees stable attno mapping.
+ * numbers.  build_physical_tlist() exposes every base attribute as a Var,
+ * including columns irrelevant to this query, and rejects the entire relation
+ * if any column has a missing value.  Mixed GpuPreAgg only needs referenced
+ * attributes to be real Vars; unused positions can be typed NULL placeholders
+ * so they neither create spurious codegen dependencies nor disturb the stable
+ * attno mapping seen by the second GPU task.
  */
 static PathTarget *
 cloudberry_build_gpupreagg_host_input_target(PlannerInfo *root,

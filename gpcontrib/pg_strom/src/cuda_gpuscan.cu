@@ -534,6 +534,86 @@ __gpuscan_load_source_block(kern_context *kcxt,
 }
 
 /*
+ * __gpuscan_load_source_row
+ *
+ * ROW input is produced by the QE executor after a child GpuScan has applied
+ * its device predicate and ExecQual has applied the CPU-only predicate.  The
+ * tuples are MinimalTuples, unlike the HeapTupleHeaderData stored in a BLOCK
+ * KDS, so load them through ExecLoadVarsMinimalTuple().
+ */
+STATIC_FUNCTION(int)
+__gpuscan_load_source_row(kern_context *kcxt,
+						  kern_warp_context *wp,
+						  const kern_data_store *kds_src,
+						  const kern_expression *kexp_load_vars,
+						  const kern_expression *kexp_scan_quals,
+						  const kern_expression *kexp_move_vars,
+						  char *dst_kvecs_buffer)
+{
+	uint32_t	count;
+	uint32_t	index;
+	uint32_t	wr_pos;
+	bool		is_valid = false;
+
+	index = get_global_size() * wp->smx_row_count + get_global_base();
+	if (index >= kds_src->nitems)
+	{
+		if (get_local_id() == 0)
+			wp->scan_done = 1;
+		return 1;
+	}
+	index += get_local_id();
+
+	if (index < kds_src->nitems)
+	{
+		const kern_tupitem *titem = KDS_GET_TUPITEM(kds_src, index);
+
+		if (titem != NULL &&
+			ExecLoadVarsMinimalTuple(kcxt,
+								 kexp_load_vars,
+								 0,
+								 kds_src,
+								 titem))
+		{
+			if (!kexp_scan_quals)
+				is_valid = true;
+			else
+			{
+				xpu_bool_t retval;
+
+				if (EXEC_KERN_EXPRESSION(kcxt, kexp_scan_quals, &retval))
+					is_valid = (!XPU_DATUM_ISNULL(&retval) && retval.value);
+				else if (!HandleErrorIfCpuFallback(kcxt, 0, 0, false))
+					assert(kcxt->errcode != ERRCODE_STROM_SUCCESS);
+			}
+		}
+	}
+	if (__syncthreads_count(kcxt->errcode != ERRCODE_STROM_SUCCESS) > 0)
+		return -1;
+
+	wr_pos = WARP_WRITE_POS(wp,0);
+	wr_pos += pgstrom_stair_sum_binary(is_valid, &count);
+	if (is_valid)
+	{
+		if (!ExecMoveKernelVariables(kcxt,
+								 kexp_move_vars,
+								 dst_kvecs_buffer,
+								 (wr_pos % KVEC_UNITSZ)))
+			assert(kcxt->errcode != ERRCODE_STROM_SUCCESS);
+	}
+	if (__syncthreads_count(kcxt->errcode != ERRCODE_STROM_SUCCESS) > 0)
+		return -1;
+	if (get_local_id() == 0)
+	{
+		wp->smx_row_count++;
+		WARP_WRITE_POS(wp,0) += count;
+	}
+	__syncthreads();
+	return (WARP_WRITE_POS(wp,0) >= WARP_READ_POS(wp,0) + get_local_size()
+			? 1 : 0);
+}
+
+/*
  * __gpuscan_load_source_arrow
  */
 STATIC_FUNCTION(int)
@@ -753,6 +833,13 @@ execGpuScanLoadSource(kern_context *kcxt,
 
 	switch (kds_src->format)
 	{
+		case KDS_FORMAT_ROW:
+			return __gpuscan_load_source_row(kcxt, wp,
+									 kds_src,
+									 kexp_load_vars,
+									 kexp_scan_quals,
+									 kexp_move_vars,
+									 dst_kvecs_buffer);
 		case KDS_FORMAT_BLOCK:
 			return __gpuscan_load_source_block(kcxt, wp,
 											   kds_src,
