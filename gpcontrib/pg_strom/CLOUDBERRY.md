@@ -142,8 +142,11 @@ expressions are rewritten to consume GPU partial states and are evaluated only
 by the CPU final Agg, after a colocated local final or a non-colocated/global
 Gather-final.  NULL and UNKNOWN therefore retain native PostgreSQL semantics;
 FILTER, DISTINCT, numeric and unreplaceable HAVING aggregates safely retain
-native plans.  Source, static and acceptance assets are complete; real GPU
-acceptance is pending.  See `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`.
+native plans.  Source, static and real-GPU acceptance completed on 2026-08-14
+in the single-host 1 QD + 2 Primary shared-GPU topology.  Colocated,
+grouping-key, non-colocated, NULL/UNKNOWN and empty-input CPU/GPU results
+matched; unsupported FILTER, DISTINCT and numeric HAVING aggregates retained
+native plans.  See `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`.
 
 ## Development topology constraint
 

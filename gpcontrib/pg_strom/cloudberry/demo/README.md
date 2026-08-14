@@ -510,6 +510,8 @@ aggregation.  It supports grouping keys and the current count/sum/min/max
 integer/float whitelist, including aggregates used only by HAVING.  Colocated
 groups use per-QE local final plus HAVING; non-colocated and global aggregates
 apply HAVING after Gather-final.  NULL and UNKNOWN use native CPU semantics.
+Real-GPU acceptance completed on 2026-08-14 in the single-host 1 QD + 2
+Primary shared-GPU topology.
 
 Rerun `setup.sql` to add the M5b `nullable_metric` column, then run:
 
@@ -524,9 +526,11 @@ Positive HAVING cases use explicitly labeled correctness-only costs to expose
 the legal path; this milestone validates replacement, placement and semantics,
 not automatic selection for every HAVING shape.  The runner also prints the
 ordinary-cost colocated choice as a non-failing diagnostic.  The correctness
-settings disable native HashAggregate and Sort candidates while retaining the
-CPU final HashAggregate explicitly attached to GpuPreAgg.  FILTER, DISTINCT and
-numeric HAVING aggregates must retain native plans.  See
+settings do not disable native HashAggregate or Sort, because their large
+disable cost distorts fuzzy path comparison.  The grouping-key pushdown shape
+is checked separately for CPU/GPU result equality.  FILTER, DISTINCT and
+numeric HAVING aggregates must retain native plans.  A successful accepted run
+ends with `Cloudberry GpuPreAgg HAVING acceptance passed`.  See
 `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`.
 
 ### GpuPreAgg cancellation and failure recovery

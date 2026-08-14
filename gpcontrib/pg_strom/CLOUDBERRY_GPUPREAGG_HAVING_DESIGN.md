@@ -1,8 +1,8 @@
 # Cloudberry GpuPreAgg M5b HAVING 设计
 
-状态（2026-08-13）：源码、静态检查和真实 GPU 验收 runner 已实现；待在单机
-1 QD + 2 Primary、所有 GPU Service 共享同一块 GPU 的环境完成真实 GPU 验收。
-验收完成前只称“实现完成”，不称“HAVING GPU 验收完成”。
+状态（2026-08-14）：源码、静态检查和真实 GPU 验收全部通过。验收环境为单机
+1 QD + 2 Primary，所有 GPU Service 共享同一块物理 GPU。P0-3/M5b 在本文限定
+拓扑内完成；不外推为多主机、多 GPU 扩展性或独立 GPU 性能结论。
 
 ## 1. 目标和执行语义
 
@@ -117,6 +117,15 @@ PGSTROM_GPUPREAGG_HAVING_REPEAT=3 \
 ```text
 Cloudberry GpuPreAgg HAVING acceptance passed
 ```
+
+2026-08-14 真实 GPU 验收结果：
+
+- colocated、grouping-key、non-colocated、UNKNOWN、空输入 `IS NULL` 和空输入
+  UNKNOWN 六组 CPU/GPU digest 全部一致；
+- 空输入 `HAVING sum(x) IS NULL` 保留 1 行，`HAVING sum(x) > 0` 的 UNKNOWN
+  丢弃结果，符合 CPU 三值逻辑；
+- FILTER、DISTINCT 和 numeric HAVING aggregate 全部安全保留原生 aggregate；
+- runner 最终输出 `Cloudberry GpuPreAgg HAVING acceptance passed`。
 
 本里程碑仍只形成单机多 Segment 共享单 GPU 的计划、结果、资源和故障恢复结论，
 不形成多主机或多 GPU 性能结论。
