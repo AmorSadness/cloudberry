@@ -66,8 +66,8 @@ Segments.  Its first whitelist is count/sum/min/max on
 integer and floating-point inputs; numeric, aggregate FILTER, DISTINCT
 aggregates, partitionwise aggregation and GPU-Sort retain native plans.  Mixed
 quals remain native unless `pg_strom.cloudberry_enable_host_quals` is explicitly
-enabled.  P1-1 source and acceptance assets are complete; real-GPU acceptance
-is pending.  Real dual-Primary GPU
+enabled.  P1-1 completed real-GPU plan, result, and safe-fallback acceptance
+on the single-host dual-Primary shared-GPU topology on 2026-08-14.  Real dual-Primary GPU
 M1/M2/M3 acceptance and the post-failure full regression completed on
 2026-08-10; see `CLOUDBERRY_GPUPREAGG_MVP_DESIGN.md`.
 See `CLOUDBERRY_GPUPREAGG_MIXED_QUALS_DESIGN.md` for the P1-1 boundary.

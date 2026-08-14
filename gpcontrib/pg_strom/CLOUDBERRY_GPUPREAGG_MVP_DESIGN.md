@@ -516,8 +516,9 @@ M4b 已于 2026-08-13 完成代码、静态检查和真实 GPU 验收。16MiB gr
 - HAVING 已于 2026-08-14 完成 M5b 单机共享 GPU 真实验收，见
   `CLOUDBERRY_GPUPREAGG_HAVING_DESIGN.md`；
 - numeric 和更多 aggregates/types；
-- mixed host/device quals 在 pre-aggregation 之前执行的 P1-1 已实现，待真实 GPU
-  验收，见 `CLOUDBERRY_GPUPREAGG_MIXED_QUALS_DESIGN.md`；
+- mixed host/device quals 在 pre-aggregation 之前执行的 P1-1 已于 2026-08-14
+  完成单机双 Primary 共享 GPU 真实验收，见
+  `CLOUDBERRY_GPUPREAGG_MIXED_QUALS_DESIGN.md`；
 - GpuSort/Top-N/window rank；
 - GpuHashJoin。
 

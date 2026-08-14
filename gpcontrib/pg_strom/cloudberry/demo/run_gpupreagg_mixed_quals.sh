@@ -4,12 +4,17 @@ set -euo pipefail
 psql_bin=${PSQL:-psql}
 database=${PGDATABASE:-postgres}
 repeat_count=${PGSTROM_GPUPREAGG_MIXED_REPEAT:-3}
+ready_timeout=${PGSTROM_GPUPREAGG_MIXED_READY_TIMEOUT:-60}
 psql_cmd=("$psql_bin" -X -v ON_ERROR_STOP=1 -d "$database")
 run_dir=$(mktemp -d /tmp/pgstrom-gpupreagg-mixed.XXXXXX)
 trap 'rm -rf "$run_dir"' EXIT INT TERM
 
 if [[ ! $repeat_count =~ ^[1-9][0-9]*$ ]]; then
     echo "PGSTROM_GPUPREAGG_MIXED_REPEAT must be a positive integer: $repeat_count" >&2
+    exit 1
+fi
+if [[ ! $ready_timeout =~ ^[1-9][0-9]*$ ]]; then
+    echo "PGSTROM_GPUPREAGG_MIXED_READY_TIMEOUT must be a positive integer: $ready_timeout" >&2
     exit 1
 fi
 
@@ -28,6 +33,42 @@ if [[ ! $primary_segment_count =~ ^[0-9]+$ ]] || (( primary_segment_count < 2 ))
     echo "GpuPreAgg mixed quals requires at least two up preferred Primary segments" >&2
     exit 1
 fi
+
+if [[ $("${psql_cmd[@]}" -Atqc \
+    "SELECT to_regclass('pgstrom.gpu_service_status') IS NOT NULL;") != t ]]; then
+    echo "pgstrom.gpu_service_status is missing; update the pg_strom extension" >&2
+    exit 1
+fi
+
+deadline=$((SECONDS + ready_timeout))
+service_status=
+while (( SECONDS < deadline )); do
+    service_status=$("${psql_cmd[@]}" -AtF '|' -qc "
+        SELECT count(DISTINCT content_id) FILTER (WHERE content_id >= 0),
+               count(DISTINCT content_id) FILTER (WHERE content_id = -1),
+               coalesce(bool_and(ready AND
+                                 actual_workers = configured_workers), false)
+        FROM pgstrom.gpu_service_status;" 2>/dev/null || true)
+    IFS='|' read -r ready_primary_count ready_qd_count all_services_ready \
+        <<<"$service_status"
+    if [[ $ready_primary_count == "$primary_segment_count" &&
+          $ready_qd_count == 1 && $all_services_ready == t ]]; then
+        break
+    fi
+    sleep 0.2
+done
+if [[ ${ready_primary_count:-0} != "$primary_segment_count" ||
+      ${ready_qd_count:-0} != 1 || ${all_services_ready:-f} != t ]]; then
+    echo "GPU Service readiness timed out after ${ready_timeout}s: ${service_status:-<no status>}" >&2
+    "${psql_cmd[@]}" -P pager=off -c "
+        SELECT content_id, service_pid, service_generation, ready, gpu_id,
+               configured_workers, actual_workers, active_clients,
+               queued_commands, active_commands, fatbin_name
+        FROM pgstrom.gpu_service_status
+        ORDER BY content_id, gpu_id;" >&2 || true
+    exit 1
+fi
+echo "GPU Service status: primaries=$ready_primary_count coordinator=$ready_qd_count ready=$all_services_ready"
 
 feature_settings="
  SET optimizer=off;

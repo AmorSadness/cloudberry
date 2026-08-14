@@ -553,9 +553,12 @@ PGSTROM_GPUPREAGG_MIXED_REPEAT=3 \
 
 The runner covers colocated, Gather-final, global aggregate, and mixed
 WHERE-plus-HAVING shapes; it compares all results with CPU baselines and checks
-GUC-off/host-only fallback.  The two GPU tasks add a GPU-to-CPU-to-GPU detail
+GUC-off/host-only fallback.  It waits for the QD and every Primary GPU Service
+to be ready with its configured worker count before planning.  The two GPU
+tasks add a GPU-to-CPU-to-GPU detail
 round trip, so P1-1 is a correctness/placement milestone rather than a
-performance claim.  Success ends with
+performance claim.  This matrix completed real single-host dual-Primary
+shared-GPU acceptance on 2026-08-14.  Success ends with
 `Cloudberry GpuPreAgg mixed host/device quals acceptance passed`.  See
 `CLOUDBERRY_GPUPREAGG_MIXED_QUALS_DESIGN.md`.
 

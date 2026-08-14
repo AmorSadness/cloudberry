@@ -1,13 +1,13 @@
 # Cloudberry GpuPreAgg P1-1 mixed host/device quals 设计
 
-状态（2026-08-14）：源码、静态检查、设计和真实 GPU 验收 runner 已实现；待在
+状态（2026-08-14）：源码、静态检查、设计和真实 GPU 验收 runner 已完成；已在
 单机 1 QD + 2 Primary、所有 GPU Service 共享同一块物理 GPU 的环境完成真实 GPU
-验收。验收前只称“实现完成”，不称“P1-1 GPU 验收完成”。
+验收，P1-1 在该拓扑下验收完成。
 
 2026-08-14 首轮 GPU 复验已证明共置、非共置、全局聚合和 HAVING 四类 mixed
 计划均能形成正确的 `GpuScan -> CPU Filter -> GpuPreAgg` 边界。该轮执行暴露 GPU
-scan source dispatcher 尚未接受 QE 构造的 `KDS_FORMAT_ROW`；现已增加 ROW loader，
-待重新编译后的结果一致性复验。系统目录确认验收表不存在 dropped/missing-value 列，
+scan source dispatcher 尚未接受 QE 构造的 `KDS_FORMAT_ROW`；增加 ROW loader 后，
+重新编译并完成结果一致性复验。系统目录确认验收表不存在 dropped/missing-value 列，
 因此本次实际 planner 修复点是避免未引用列以多余 `Var` 进入子路径；NULL 占位同时
 保留对未来无关 dropped/missing-value 列的防护。
 
@@ -102,18 +102,36 @@ PGSTROM_GPUPREAGG_MIXED_REPEAT=3 \
 
 runner 验证：
 
-1. 共置、非共置、无 GROUP BY 和 mixed WHERE + HAVING 稳定生成 GpuPreAgg；
-2. GpuScan 同时显示 `GPU Scan Quals` 和 regex CPU `Filter`；
-3. host filter 位于 GpuScan 子节点，严格早于 GpuPreAgg；
-4. 共置路径无 pre-final Gather，其他路径保留 Gather-final；
-5. 四组结果 digest 与纯 CPU baseline 一致；
-6. opt-in GUC off 和 host-only 查询安全保留原生 aggregate。
+1. 最多等待 `PGSTROM_GPUPREAGG_MIXED_READY_TIMEOUT` 秒，确认 QD 和全部 Primary
+   GPU Service ready 且 worker 数完整，再开始规划；
+2. 共置、非共置、无 GROUP BY 和 mixed WHERE + HAVING 稳定生成 GpuPreAgg；
+3. GpuScan 同时显示 `GPU Scan Quals` 和 regex CPU `Filter`；
+4. host filter 位于 GpuScan 子节点，严格早于 GpuPreAgg；
+5. 共置路径无 pre-final Gather，其他路径保留 Gather-final；
+6. 四组结果 digest 与纯 CPU baseline 一致；
+7. opt-in GUC off 和 host-only 查询安全保留原生 aggregate。
 
 成功标志：
 
 ```text
 Cloudberry GpuPreAgg mixed host/device quals acceptance passed
 ```
+
+## 6. 真实 GPU 验收记录
+
+2026-08-14 在单机 1 QD + 2 Primary 共享同一块物理 GPU 的环境完成：
+
+- colocated、noncolocated、global 和 mixed WHERE + HAVING 四类计划均执行成功；
+- 四类 CPU/GPU result digest 全部匹配；
+- opt-in GUC off 安全保留原生 aggregate；
+- host-only qual 安全保留原生 aggregate；
+- runner 最终输出
+  `Cloudberry GpuPreAgg mixed host/device quals acceptance passed`。
+
+复验过程中曾在 GPU Service/fatbin 尚未 ready 时观察到原生
+`Seq Scan + GroupAggregate`。这不是 mixed planner 的语义回退结论。runner 现会等待
+QD 和全部 Primary 的 Service ready、实际 worker 数等于配置值后才开始规划，避免把
+环境未就绪误判为特性失败。
 
 本里程碑仍只形成单机多 Segment 共享单 GPU 的计划、结果、资源和恢复结论，不形成
 多主机或多 GPU 性能结论。
