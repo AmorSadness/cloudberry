@@ -94,9 +94,15 @@ HAVING 增加的 final aggregate 工作可能使原生 HashAggregate 在普通�
 尤其是共置 GROUP BY 没有 Motion 可消除时。本里程碑验证合法路径、执行位置和结果
 语义，不承诺所有 HAVING 形状自动选 GPU。因此所有正向语义用例使用与历史 MVP
 一致、明确标注的 correctness-only 成本；runner 另行打印普通成本计划选择作为诊断，
-但不把它作为完成门槛。correctness-only 会关闭原生 HashAggregate 和 Sort 候选；
-PG-Strom 显式创建的 CPU final HashAggregate 仍保留，用于验证 HAVING Filter 的
-真实执行语义。
+但不把它作为完成门槛。correctness-only 不关闭原生 HashAggregate 或 Sort：关闭它们
+会给原生路径引入 `disable_cost`，使路径成本在模糊比较中失真，并可能因有序 pathkeys
+错误淘汰实际成本更低的 GpuPreAgg 路径。
+
+正向 GpuPreAgg 计划用例不在 HAVING 中加入 `(dist_key % 2) = 0`。Cloudberry 会合法地
+把纯 grouping-key 条件下推成 scan qual；该条件的默认选择率会把百万行输入估算成
+约千行，令这个用例不再代表 partial aggregation 的收益。runner 另用
+`groupkey_query` 对该下推形状做 CPU/GPU 结果一致性验证，而 aggregate HAVING 的执行
+位置由正向 GpuPreAgg 用例验证。
 
 执行命令：
 

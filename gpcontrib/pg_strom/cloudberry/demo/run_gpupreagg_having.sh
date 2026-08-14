@@ -47,8 +47,6 @@ feature_settings="
  SET pg_strom.cloudberry_enable_host_quals=off;
  SET pg_strom.cpu_fallback=off;
  SET enable_seqscan=off;
- SET enable_hashagg=off;
- SET enable_sort=off;
  SET gp_enable_multiphase_agg=off;
  SET pg_strom.gpu_setup_cost=0;
  SET pg_strom.gpu_tuple_cost=0;
@@ -60,9 +58,9 @@ feature_settings="
 # Keep one normal-cost observation for planner diagnostics.  HAVING support is
 # a correctness/placement milestone; it does not require every legal shape to
 # beat native HashAggregate, especially for colocated groups with no Motion to
-# eliminate.  The correctness settings disable native HashAggregate and Sort
-# candidates; PG-Strom's explicitly constructed CPU final HashAggregate remains
-# part of the GpuPreAgg path and is the node whose HAVING semantics are tested.
+# eliminate.  Do not disable native HashAggregate or Sort here: their disable
+# cost is large enough to make the planner's fuzzy path comparison hide the real
+# cost difference and prefer an ordered native GroupAggregate path.
 normal_settings="
  SET optimizer=off;
  SET pg_strom.enabled=on;
@@ -75,6 +73,11 @@ normal_settings="
  SET pg_strom.cpu_fallback=off;"
 
 colocated_query="
+ SELECT dist_key, count(*), sum(id)
+ FROM pgstrom_mvp_colocated WHERE id > 0
+ GROUP BY dist_key
+ HAVING max(nullable_metric) IS NULL OR sum(nullable_metric) > 0"
+groupkey_query="
  SELECT dist_key, count(*), sum(id)
  FROM pgstrom_mvp_colocated WHERE id > 0
  GROUP BY dist_key
@@ -188,6 +191,7 @@ stable_having_plan empty_is_null "$feature_settings" "$empty_is_null_query" yes
 stable_having_plan empty_unknown "$feature_settings" "$empty_unknown_query" yes
 
 compare_result_digest colocated "$feature_settings" "$colocated_query"
+compare_result_digest grouping_key "$feature_settings" "$groupkey_query"
 compare_result_digest noncolocated "$feature_settings" "$noncolocated_query"
 compare_result_digest unknown "$feature_settings" "$unknown_query"
 compare_result_digest empty_is_null "$feature_settings" "$empty_is_null_query"

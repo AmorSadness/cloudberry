@@ -332,8 +332,10 @@ require_text 'run_gpupreagg_m4b\.sh' "$demo_readme"
 require_text 'run_gpupreagg_m5a\.sh' "$demo_readme"
 require_text 'run_gpupreagg_having\.sh' "$demo_readme"
 require_text 'PGSTROM_GPUPREAGG_HAVING_REPEAT' "$gpupreagg_having_runner"
-require_text 'enable_hashagg=off' "$gpupreagg_having_runner"
-require_text 'enable_sort=off' "$gpupreagg_having_runner"
+if grep -Eq 'enable_hashagg=off|enable_sort=off' "$gpupreagg_having_runner"; then
+    echo 'HAVING runner must not use disable_cost to force aggregation paths' >&2
+    exit 1
+fi
 require_text 'HAVING filter is not attached to the CPU final aggregate' "$gpupreagg_having_runner"
 require_text 'empty aggregate HAVING NULL semantics' "$gpupreagg_having_runner"
 require_text 'FILTER aggregate in HAVING' "$gpupreagg_having_runner"
