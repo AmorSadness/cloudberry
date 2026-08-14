@@ -32,8 +32,10 @@ GpuScan 在 opt-in GUC 开启且同时存在 device/host quals 时，除普通�
 GpuPreAgg tracker 保存一个不进入 baserel pathlist 的完整物理行目标路径：
 
 - 子 GpuScan 负责 device qual、CPU host qual 和物理行投影；
-- 完整物理 target 保持 base attribute number 与 ROW KDS 列号一致；
-- 含 dropped/missing column、无法构造 physical target 时安全回退；
+- 物理 target 保持 base attribute number 与 ROW KDS 列号一致；实际引用列使用
+  `Var`，未引用列使用同类型 NULL 占位；
+- 因此，与查询无关的 dropped/missing-value 列不会误伤 mixed 路径；实际引用列为
+  dropped/missing-value 列、无法安全物化时才回退；
 - GpuPreAgg 不再重复继承 child 的 scan/host quals 或直接 base-scan 成本；
 - GpuPreAgg CustomPath 将该 GpuScan 作为 source custom plan，输出 locus 仍沿用 M5a
   的共置证明，否则保持 Gather-final。
@@ -74,7 +76,7 @@ Pre-Aggregation Input: CPU host-filtered GpuScan rows
 继续回退：
 
 - GUC off 或只有 host qual；
-- 无法构造完整物理 target；
+- 实际引用的 dropped/missing-value 列导致无法安全构造物理 target；
 - AO/AOCO、分区、ORCA、numeric、DISTINCT/FILTER 和现有其他 guards；
 - 多主机、多 GPU 性能或调度能力不在结论范围。
 

@@ -97,6 +97,10 @@ stable_mixed_plan() {
     printf '\n[%s GpuPreAgg mixed-quals plan]\n%s\n' "$label" "$first"
     grep -q 'Custom Scan (GpuPreAgg)' <<<"$first" || {
         echo "$label did not produce GpuPreAgg" >&2
+        echo "[$label PG-Strom planner diagnostics]" >&2
+        "${psql_cmd[@]}" -Atqc \
+            "SET client_min_messages = debug1; $feature_settings EXPLAIN (VERBOSE, COSTS ON) $query" \
+            >&2 || true
         exit 1
     }
     grep -q 'Pre-Aggregation Input: CPU host-filtered GpuScan rows' <<<"$first" || {

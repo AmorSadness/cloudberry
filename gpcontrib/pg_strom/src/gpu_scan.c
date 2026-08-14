@@ -10,6 +10,9 @@
  * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
+#ifdef GP_VERSION_NUM
+#include "parser/parsetree.h"
+#endif
 
 /* static variables */
 static set_rel_pathlist_hook_type set_rel_pathlist_next = NULL;
@@ -454,6 +457,71 @@ buildSimpleScanPlanInfo(PlannerInfo *root,
 	return op_leaf;
 }
 
+#ifdef GP_VERSION_NUM
+/*
+ * Build a row target whose output positions match base-table attribute
+ * numbers.  build_physical_tlist() rejects the entire relation when any
+ * column has a missing value (for example, a column added by ALTER TABLE),
+ * even if that column is irrelevant to this query.  Mixed GpuPreAgg only
+ * needs referenced attributes to be real Vars; unused positions can be typed
+ * NULL placeholders so the second GPU task still sees stable attno mapping.
+ */
+static PathTarget *
+cloudberry_build_gpupreagg_host_input_target(PlannerInfo *root,
+										 RelOptInfo *baserel,
+										 const pgstromPlanInfo *pp_info)
+{
+	RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
+	Relation	relation;
+	TupleDesc	tupdesc;
+	List	   *tlist = NIL;
+	PathTarget *target = NULL;
+
+	Assert(rte->rtekind == RTE_RELATION);
+	relation = table_open(rte->relid, NoLock);
+	tupdesc = RelationGetDescr(relation);
+	for (int attno=1; attno <= tupdesc->natts; attno++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attno - 1);
+		int		member = attno - FirstLowInvalidHeapAttributeNumber;
+		Expr   *expr;
+
+		if (bms_is_member(member, pp_info->outer_refs))
+		{
+			if (attr->attisdropped || attr->atthasmissing)
+			{
+				elog(DEBUG1,
+					 "Cloudberry GpuPreAgg mixed quals rejected: referenced "
+					 "attribute %d is dropped or has a missing value",
+					 attno);
+				goto out;
+			}
+			expr = (Expr *)makeVar(baserel->relid,
+								 attno,
+								 attr->atttypid,
+								 attr->atttypmod,
+								 attr->attcollation,
+								 0);
+		}
+		else
+		{
+			Oid type_oid = OidIsValid(attr->atttypid) ? attr->atttypid : INT4OID;
+
+			expr = (Expr *)makeNullConst(type_oid,
+									 attr->atttypmod,
+									 attr->attcollation);
+		}
+		tlist = lappend(tlist,
+					makeTargetEntry(expr, attno, NULL, false));
+	}
+	target = make_pathtarget_from_tlist(tlist);
+	set_pathtarget_cost_width(root, target);
+out:
+	table_close(relation, NoLock);
+	return target;
+}
+#endif
+
 /*
  * try_add_simple_scan_path
  */
@@ -564,15 +632,17 @@ try_add_simple_scan_path(PlannerInfo *root,
 		 */
 		if (pp_info->host_quals != NIL && scan_cpath != NULL)
 		{
-			List *physical_tlist = build_physical_tlist(root, baserel);
+			PathTarget *physical_target;
 
-			if (physical_tlist != NIL)
+			physical_target =
+				cloudberry_build_gpupreagg_host_input_target(root,
+													 baserel,
+													 pp_info);
+			if (physical_target != NULL)
 			{
 				CustomPath *mixed_cpath = palloc(sizeof(CustomPath));
-				PathTarget *physical_target = make_pathtarget_from_tlist(physical_tlist);
 				pgstromPlanInfo *mixed_pp_info = copy_pgstrom_plan_info(pp_info);
 
-				set_pathtarget_cost_width(root, physical_target);
 				memcpy(mixed_cpath, scan_cpath, sizeof(CustomPath));
 				mixed_cpath->path.pathtarget = physical_target;
 				mixed_cpath->path.rows = pp_info->final_nrows;
@@ -580,6 +650,9 @@ try_add_simple_scan_path(PlannerInfo *root,
 				op_leaf->host_qual_path = &mixed_cpath->path;
 				op_leaf->leaf_nrows = pp_info->final_nrows;
 			}
+			else
+				elog(DEBUG1,
+					 "Cloudberry GpuPreAgg mixed quals did not build an input target");
 		}
 		if (pp_info->host_quals == NIL || op_leaf->host_qual_path != NULL)
 		{
