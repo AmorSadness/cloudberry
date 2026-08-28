@@ -79,3 +79,5 @@ lib*.pc
 /.cache/
 /install/
 /portlock/
+/conf/
+/logs/
