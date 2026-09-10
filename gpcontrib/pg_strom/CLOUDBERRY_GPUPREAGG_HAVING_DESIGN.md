@@ -1,5 +1,8 @@
 # Cloudberry GpuPreAgg M5b HAVING 设计
 
+> 下文为历史验收。新增 AVG/device FILTER 与 HAVING 的组合尚待 GPU 验收，
+> 开关和用例见 `CLOUDBERRY_DEVELOPMENT.md`。
+
 状态（2026-08-14）：源码、静态检查和真实 GPU 验收全部通过。验收环境为单机
 1 QD + 2 Primary，所有 GPU Service 共享同一块物理 GPU。P0-3/M5b 在本文限定
 拓扑内完成；不外推为多主机、多 GPU 扩展性或独立 GPU 性能结论。

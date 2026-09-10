@@ -1,5 +1,9 @@
 # PG-Strom v6.1 Cloudberry GpuScan MVP
 
+Current development beyond the historical milestones is tracked in
+`CLOUDBERRY_DEVELOPMENT.md`. Those changes have **not** received GPU acceptance;
+use its regression entry point when validating a new build.
+
 This directory is a complete source snapshot of PG-Strom v6.1 from upstream
 commit `4d12ef415759dc48cd4c1421565e9c694b7bd3f9`:
 
@@ -26,7 +30,8 @@ a build or runtime requirement for the non-GPU-Direct GpuScan MVP.
 ## Supported scope
 
 The Cloudberry build registers GpuScan (plus its GPU Service) and a default-off
-experimental Gather-only GpuPreAgg path.  Both are restricted to a
+experimental GpuPreAgg path (Gather-final or proven colocated local-final).
+Both are restricted to a
 non-partitioned, ordinarily distributed heap table.  AO, AOCO, partitioned
 tables, foreign/Arrow tables and coordinator-local or replicated tables retain
 native paths.  GpuJoin, GpuCache, BRIN acceleration, SELECT-INTO-Direct and
@@ -71,6 +76,14 @@ on the single-host dual-Primary shared-GPU topology on 2026-08-14.  Real dual-Pr
 M1/M2/M3 acceptance and the post-failure full regression completed on
 2026-08-10; see `CLOUDBERRY_GPUPREAGG_MVP_DESIGN.md`.
 See `CLOUDBERRY_GPUPREAGG_MIXED_QUALS_DESIGN.md` for the P1-1 boundary.
+
+The new development flags additionally allow AVG/device aggregate FILTER,
+predicate-free aggregate input, a competing Redistribute-final path, expanded
+scalar COUNT inputs, pure host WHERE input, CPU-only aggregate FILTER, and
+native heap partition scans feeding GPU aggregation. Each
+flag is off by default and **GPU acceptance is pending**; see the current
+capability table and manual regression instructions in `CLOUDBERRY_DEVELOPMENT.md`.
+The milestone narratives below describe their recorded historical scope.
 
 The M4a planner now estimates global groups once and derives expected local
 groups per QE from the input locus.  Local groups drive partial-row/DMA cost
@@ -195,7 +208,8 @@ only suitable for source-level host compilation.
 
 ## Service observability and recovery development
 
-The Cloudberry extension version is 6.1.  It exposes the postmaster-local GPU
+The Cloudberry extension SQL catalog version is 6.3 (upstream snapshot 6.1).
+It exposes the postmaster-local GPU
 Service state through `pgstrom.gpu_service_status_local()` on the coordinator,
 `pgstrom.gpu_service_status_segments()` on all Primaries, and the combined
 `pgstrom.gpu_service_status` view.  The rows include service PID/generation,

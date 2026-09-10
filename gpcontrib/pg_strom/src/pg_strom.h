@@ -167,6 +167,11 @@
 #include "pg_compat.h"
 #include "heterodb_extra.h"
 
+#ifdef GP_VERSION_NUM
+extern bool cloudberry_enable_unfiltered_agg;
+extern bool cloudberry_enable_host_quals;
+#endif
+
 /* ------------------------------------------------
  *
  * Global Type Definitions

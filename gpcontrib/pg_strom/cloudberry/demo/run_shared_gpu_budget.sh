@@ -6,6 +6,7 @@ database=${PGDATABASE:-postgres}
 client_count=${PGSTROM_SHARED_BUDGET_CLIENTS:-3}
 poll_timeout=${PGSTROM_SHARED_BUDGET_TIMEOUT:-60}
 require_rejection=${PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION:-0}
+fairness=${PGSTROM_SHARED_BUDGET_FAIRNESS:-0}
 psql_cmd=("$psql_bin" -X -v ON_ERROR_STOP=1 -d "$database")
 run_dir=$(mktemp -d /tmp/pgstrom-shared-budget.XXXXXX)
 app_prefix="pgstrom_shared_budget_$$"
@@ -46,6 +47,15 @@ if [[ ! $client_count =~ ^[0-9]+$ ]] || (( client_count < 2 )); then
 fi
 if [[ $require_rejection != 0 && $require_rejection != 1 ]]; then
     echo "PGSTROM_SHARED_BUDGET_REQUIRE_REJECTION must be 0 or 1" >&2
+    exit 1
+fi
+
+if [[ $fairness != 0 && $fairness != 1 ]]; then
+    echo "PGSTROM_SHARED_BUDGET_FAIRNESS must be 0 or 1" >&2
+    exit 1
+fi
+if [[ $fairness == 1 && $require_rejection == 1 ]]; then
+    echo "fairness progress and intentional rejection are separate test runs" >&2
     exit 1
 fi
 
@@ -116,18 +126,34 @@ fi
 
 cpu_result=$("${psql_cmd[@]}" -AtF '|' -qc "
     SET optimizer=off; SET pg_strom.enabled=off; $test_query")
+large_query="SELECT grp_high, count(*), sum(id), min(id), max(id)
+    FROM pgstrom_mvp_heap WHERE id > 0
+    GROUP BY grp_high ORDER BY grp_high;"
+if [[ $fairness == 1 ]]; then
+    large_plan=$("${psql_cmd[@]}" -Atqc "$gpu_settings EXPLAIN (VERBOSE) $large_query")
+    grep -q 'Custom Scan (GpuPreAgg)' <<<"$large_plan" || {
+        echo "fairness large query did not produce GpuPreAgg" >&2
+        exit 1
+    }
+    large_cpu_result=$("${psql_cmd[@]}" -AtF '|' -qc \
+        "SET optimizer=off; SET pg_strom.enabled=off; $large_query")
+fi
 old_admissions=$(read_counter budget_admissions)
 old_rejections=$(read_counter budget_rejections)
 old_waits=$(read_counter budget_waits)
 assert_budget_invariant
 
 for ((i=1; i<=client_count; i++)); do
+    client_query=$test_query
+    if [[ $fairness == 1 ]] && (( i % 2 == 1 )); then
+        client_query=$large_query
+    fi
     (
 		set +e
         "${psql_cmd[@]}" -AtF '|' -qc "
             SET application_name = '${app_prefix}_$i';
             $gpu_settings
-            $test_query" >"$run_dir/client.$i.out" 2>"$run_dir/client.$i.err"
+            $client_query" >"$run_dir/client.$i.out" 2>"$run_dir/client.$i.err"
 		rc=$?
 		printf '%d\n' "$rc" >"$run_dir/client.$i.status"
 		exit "$rc"
@@ -163,9 +189,13 @@ successes=0
 failures=0
 for ((i=1; i<=client_count; i++)); do
     if wait "${pids[i-1]}"; then
-        if [[ $(<"$run_dir/client.$i.out") != "$cpu_result" ]]; then
+        expected_result=$cpu_result
+        if [[ $fairness == 1 ]] && (( i % 2 == 1 )); then
+            expected_result=$large_cpu_result
+        fi
+        if [[ $(<"$run_dir/client.$i.out") != "$expected_result" ]]; then
             echo "client $i returned a result different from the CPU baseline" >&2
-            diff -u <(printf '%s\n' "$cpu_result") "$run_dir/client.$i.out" >&2 || true
+            diff -u <(printf '%s\n' "$expected_result") "$run_dir/client.$i.out" >&2 || true
             exit 1
         fi
         successes=$((successes + 1))
@@ -205,4 +235,20 @@ if (( failures > 0 && new_rejections <= old_rejections )); then
     exit 1
 fi
 
+if [[ $fairness == 1 ]]; then
+    if (( failures > 0 || new_waits <= old_waits )); then
+        echo "FIFO pressure gate failed: both sizes must complete and budget_waits must increase" >&2
+        echo "Tune the isolated cluster's shared_gpu_budget_ratio/client count and admission timeout; no waiting is not FIFO evidence." >&2
+        exit 1
+    fi
+    deadline=$((SECONDS + poll_timeout))
+    while :; do
+        busy=$("${psql_cmd[@]}" -Atqc "SELECT count(*) FROM pgstrom.gpu_service_status
+          WHERE active_clients<>0 OR queued_commands<>0 OR active_commands<>0;")
+        [[ $busy == 0 ]] && break
+        (( SECONDS < deadline )) || { echo "FIFO workload did not drain" >&2; exit 1; }
+        sleep 0.1
+    done
+    echo "FIFO pressure progress: both request sizes completed after observed budget waiting"
+fi
 echo "shared GPU budget concurrent acceptance passed: successes=$successes failures=$failures waits=$((new_waits-old_waits)) rejections=$((new_rejections-old_rejections))"

@@ -1,5 +1,13 @@
 # Multi-segment GPU demo
 
+Current development beyond the historical records below has **GPU acceptance
+pending**. See [CLOUDBERRY_DEVELOPMENT.md](../../CLOUDBERRY_DEVELOPMENT.md) for
+the opt-in switches and `run_development_suite.sh` manual acceptance entry point.
+The four operator-foundation groups can also be run with
+`python3 run_development_regression.py --stage operators` (individual stages:
+`count_types`, `host_input`, `cpu_filter`, `heap_partition`). These require a GPU;
+`../test_development.sh` only performs GPU-free development checks.
+
 Use one coordinator and at least two up preferred primary segments.  The
 initial technical demo may run every instance on one host and share one NVIDIA
 GPU, but it must run serially.  Do not use `LOAD 'pg_strom'`: the module

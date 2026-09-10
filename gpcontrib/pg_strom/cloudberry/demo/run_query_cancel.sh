@@ -196,7 +196,20 @@ if [[ $test_operator == gpupreagg ]]; then
         WHERE grp BETWEEN 101 AND 207 AND id > 0;"
 fi
 
+if [[ ${PGSTROM_GPUPREAGG_MIXED_RELIABILITY:-0} == 1 ]]; then
+    [[ $test_operator == gpupreagg ]] || die "mixed reliability requires gpupreagg"
+    gpu_settings+=" SET pg_strom.cloudberry_enable_host_quals=on;"
+    mixed_predicate="id > 0 AND payload ~ '^[0-7]'"
+    cancel_scan_query=${cancel_scan_query//t.id > 0/$mixed_predicate}
+    cancel_query=${cancel_query//t.id > 0/$mixed_predicate}
+    signature_query=${signature_query//id > 0/$mixed_predicate}
+fi
+
 plan=$("${psql_cmd[@]}" -Atqc "$gpu_settings EXPLAIN (VERBOSE, COSTS OFF) $cancel_scan_query")
+if [[ ${PGSTROM_GPUPREAGG_MIXED_RELIABILITY:-0} == 1 ]]; then
+    grep -q 'Pre-Aggregation Input: CPU host-filtered GpuScan rows' <<<"$plan" ||
+        die "cancel statement did not exercise the two-stage mixed path"
+fi
 if ! grep -q "Custom Scan ($expected_custom_scan)" <<<"$plan"; then
     die "cancel loop statement does not contain $expected_custom_scan: $plan"
 fi

@@ -21,7 +21,7 @@ static CustomScanMethods	gpuscan_plan_methods;
 static CustomExecMethods	gpuscan_exec_methods;
 static bool					enable_gpuscan = false;		/* GUC */
 #ifdef GP_VERSION_NUM
-static bool					cloudberry_enable_host_quals = false;	/* GUC */
+bool						cloudberry_enable_host_quals = false;	/* GUC */
 #endif
 static CustomPathMethods	dpuscan_path_methods;
 static CustomScanMethods	dpuscan_plan_methods;
@@ -579,6 +579,12 @@ try_add_simple_scan_path(PlannerInfo *root,
 		if ((!allow_host_quals && pp_info->host_quals != NIL) ||
 			(!allow_no_device_quals && pp_info->scan_quals == NIL))
 			return;
+#ifdef GP_VERSION_NUM
+		/* Predicate-free input is private to the PreAgg tracker. A host-only
+		 * scan must not become an unfiltered fused aggregate. */
+		if (pp_info->scan_quals == NIL && pp_info->host_quals != NIL)
+			return;
+#endif
 		if (pp_info->scan_quals != NIL)
 		{
 			CustomPath *cpath = makeNode(CustomPath);
@@ -756,10 +762,11 @@ __xpuScanAddScanPathCommon(PlannerInfo *root,
 #ifdef GP_VERSION_NUM
 									 /* opt-in mixed device/host quals */
 									 cloudberry_enable_host_quals,
+									 cloudberry_enable_unfiltered_agg,
 #else
 									 true,	/* allow host quals */
-#endif
 									 false,	/* disallow no device quals*/
+#endif
 									 xpuscan_path_methods);
 		}
 		else if (rte->relkind == RELKIND_PARTITIONED_TABLE)

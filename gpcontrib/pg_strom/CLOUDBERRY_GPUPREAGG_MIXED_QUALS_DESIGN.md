@@ -1,5 +1,8 @@
 # Cloudberry GpuPreAgg P1-1 mixed host/device quals 设计
 
+> 新增的混合路径可靠性、扩容失败和组合特性用例尚待 GPU 验收；下文的历史
+> 验收不能覆盖这些新增项。当前入口见 `CLOUDBERRY_DEVELOPMENT.md`。
+
 状态（2026-08-14）：源码、静态检查、设计和真实 GPU 验收 runner 已完成；已在
 单机 1 QD + 2 Primary、所有 GPU Service 共享同一块物理 GPU 的环境完成真实 GPU
 验收，P1-1 在该拓扑下验收完成。

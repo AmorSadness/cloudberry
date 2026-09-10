@@ -204,6 +204,14 @@ if [[ $test_operator == gpupreagg ]]; then
         WHERE grp BETWEEN 101 AND 207 AND id > 0;"
 fi
 
+if [[ ${PGSTROM_GPUPREAGG_MIXED_RELIABILITY:-0} == 1 ]]; then
+    [[ $test_operator == gpupreagg ]] || die "mixed reliability requires gpupreagg"
+    gpu_settings+=" SET pg_strom.cloudberry_enable_host_quals=on;"
+    mixed_predicate="id > 0 AND payload ~ '^[0-7]'"
+    signature_query=${signature_query//id > 0/$mixed_predicate}
+    failure_query=${failure_query//id > 0/$mixed_predicate}
+fi
+
 if [[ $("${psql_cmd[@]}" -Atqc "SELECT to_regclass('public.pgstrom_mvp_heap') IS NOT NULL;") != t ]]; then
     die "pgstrom_mvp_heap is missing; run run_demo.sh successfully before this test"
 fi
@@ -214,6 +222,10 @@ fi
 plan=$("${psql_cmd[@]}" -Atqc "
     $gpu_settings
     EXPLAIN (ANALYZE, VERBOSE, COSTS OFF) $signature_query")
+if [[ ${PGSTROM_GPUPREAGG_MIXED_RELIABILITY:-0} == 1 ]]; then
+    grep -q 'Pre-Aggregation Input: CPU host-filtered GpuScan rows' <<<"$plan" ||
+        die "recovery statement did not exercise the two-stage mixed path"
+fi
 if ! grep -q "Custom Scan ($expected_custom_scan)" <<<"$plan" ||
    ! grep -Eq "Motion .*\\(slice[1-9][0-9]*; segments: ${primary_segment_count}\\)" <<<"$plan"; then
     die "baseline query is not a $primary_segment_count-primary $expected_custom_scan"

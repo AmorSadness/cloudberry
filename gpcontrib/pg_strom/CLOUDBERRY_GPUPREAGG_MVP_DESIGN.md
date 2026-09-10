@@ -1,5 +1,8 @@
 # Cloudberry GpuPreAgg Gather-only MVP 设计
 
+> 后续开发的 AVG/FILTER、无条件聚合及 Redistribute-final 默认关闭，尚待 GPU
+> 验收。当前能力和测试入口见 `CLOUDBERRY_DEVELOPMENT.md`；下文保留历史里程碑。
+
 > 前置基线：`CLOUDBERRY_GPUSCAN_HOST_QUALS_MILESTONE.md`  
 > 上游基线：PG-Strom v6.1，commit
 > `4d12ef415759dc48cd4c1421565e9c694b7bd3f9`  

@@ -1334,12 +1334,37 @@ __setupTaskStateRequestBuffer(pgstromTaskState *pts,
 }
 
 /*
- * Materialize rows that survived a mixed-qual GpuScan (device predicate in
- * the child GPU task, host predicate in its QE executor) into a ROW-format
- * KDS.  The parent GpuPreAgg sends this KDS to a second GPU task.  This extra
- * round trip is intentional: evaluating a CPU-only predicate after partial
- * aggregation is semantically invalid.
+ * Materialize native CPU scan/projection or mixed-qual GpuScan rows into a
+ * self-contained ROW KDS. Host predicates and aggregate FILTER projections
+ * must run before partial aggregation, never on already aggregated rows.
  */
+static MinimalTuple
+pgstromMaterializeOuterTuple(TupleTableSlot *slot)
+{
+	TupleDesc desc = slot->tts_tupleDescriptor;
+	Datum *values = palloc(sizeof(Datum) * desc->natts);
+	MinimalTuple tuple;
+
+	slot_getallattrs(slot);
+	memcpy(values, slot->tts_values, sizeof(Datum) * desc->natts);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		if (!slot->tts_isnull[i] && TupleDescAttr(desc, i)->attlen == -1)
+			values[i] = PointerGetDatum(PG_DETOAST_DATUM(values[i]));
+	}
+	/* ROW KDS must be self-contained: neither external TOAST pointers nor
+	 * expanded datums owned by a child's per-tuple context may cross to GPU.
+	 */
+	tuple = heap_form_minimal_tuple(desc, values, slot->tts_isnull, 0);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		if (!slot->tts_isnull[i] && values[i] != slot->tts_values[i])
+			pfree(DatumGetPointer(values[i]));
+	}
+	pfree(values);
+	return tuple;
+}
+
 static XpuCommand *
 pgstromOuterPlanChunk(pgstromTaskState *pts,
 					 struct iovec *xcmd_iov, int *xcmd_iovcnt)
@@ -1386,7 +1411,8 @@ pgstromOuterPlanChunk(pgstromTaskState *pts,
 				pts->scan_done = true;
 				break;
 			}
-			mtup = ExecFetchSlotMinimalTuple(slot, &should_free);
+			mtup = pgstromMaterializeOuterTuple(slot);
+			should_free = true;
 		}
 
 		tuple_sz = MAXALIGN(mtup->t_len + ROWID_SIZE);
@@ -1398,7 +1424,7 @@ pgstromOuterPlanChunk(pgstromTaskState *pts,
 			if (kds->nitems == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("mixed-qual GpuPreAgg input tuple is too large")));
+						 errmsg("CPU GpuPreAgg input tuple is too large")));
 			pts->outer_pending_tuple = heap_copy_minimal_tuple(mtup);
 			if (should_free)
 				heap_free_minimal_tuple(mtup);
@@ -3178,7 +3204,9 @@ pgstromExplainTaskState(CustomScanState *node,
 
 		if ((pp_info->xpu_task_flags & DEVTASK__SCAN_OUTER_CHUNKS) != 0)
 			ExplainPropertyText("Pre-Aggregation Input",
-								"CPU host-filtered GpuScan rows", es);
+				(pp_info->xpu_task_flags & DEVTASK__CPU_INPUT_PROJECTION) != 0
+				? "Native CPU scan/filter/projection rows"
+				: "CPU host-filtered GpuScan rows", es);
 
 		resetStringInfo(&buf);
 		forboth (lc1, pp_info->groupby_actions,

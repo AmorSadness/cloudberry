@@ -2157,6 +2157,7 @@ typedef struct
 												 */
 #define DEVTASK__SCAN_OUTER_CHUNKS	0x00040000U	/* Source rows come from a CPU-filtered
 												 * outer CustomPlan, not a base scan. */
+#define DEVTASK__CPU_INPUT_PROJECTION 0x00080000U /* Native CPU input target, not heap attnos */
 #define DEVTASK__SCAN				0x10000000U	/* xPU-Scan */
 #define DEVTASK__JOIN				0x20000000U	/* xPU-Join */
 #define DEVTASK__PREAGG				0x40000000U	/* xPU-PreAgg */

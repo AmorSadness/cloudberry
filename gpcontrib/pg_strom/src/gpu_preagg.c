@@ -10,6 +10,19 @@
  * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
+#ifdef GP_VERSION_NUM
+#include "cdb/cdbgroupingpaths.h"
+#include "catalog/pg_inherits.h"
+#include "parser/parsetree.h"
+
+static bool cloudberry_enable_extended_agg = false;
+bool cloudberry_enable_unfiltered_agg = false;
+static bool cloudberry_enable_redistribute_final = false;
+static bool cloudberry_enable_count_types = false;
+static bool cloudberry_enable_host_input = false;
+static bool cloudberry_enable_cpu_filter = false;
+static bool cloudberry_enable_heap_partition = false;
+#endif
 
 /* static variables */
 static create_upper_paths_hook_type	create_upper_paths_next = NULL;
@@ -1563,6 +1576,7 @@ typedef struct
 #ifdef GP_VERSION_NUM
 	bool			groupby_collocated;
 	CdbPathLocus	input_locus;
+	PathTarget	   *cpu_input_target;
 #endif
 	PathTarget	   *target_upper;
 	PathTarget	   *target_partial;
@@ -1585,9 +1599,9 @@ typedef struct
 /*
  * cloudberry_gpupreagg_supported_type
  *
- * Keep the first Cloudberry milestone deliberately smaller than upstream's
- * aggregate catalog.  More types can be enabled only after their partial
- * state, Motion, and final aggregate semantics have GPU acceptance coverage.
+ * Arithmetic aggregates retain the integer/float whitelist.  COUNT has a
+ * separate opt-in for device-supported scalar types; it does not widen this
+ * whitelist or enable DISTINCT/composite nullness semantics.
  */
 static bool
 cloudberry_gpupreagg_supported_type(Oid type_oid)
@@ -1630,7 +1644,8 @@ cloudberry_gpupreagg_walker(Node *node, void *__data)
 			aggref->aggvariadic ||
 			aggref->aggdistinct != NIL ||
 			aggref->aggorder != NIL ||
-			aggref->aggfilter != NULL ||
+			(aggref->aggfilter != NULL && !cloudberry_enable_extended_agg &&
+			 !cloudberry_enable_cpu_filter) ||
 			get_func_namespace(aggref->aggfnoid) != PG_CATALOG_NAMESPACE)
 			goto unsupported;
 
@@ -1639,7 +1654,8 @@ cloudberry_gpupreagg_walker(Node *node, void *__data)
 			(strcmp(aggname, "count") != 0 &&
 			 strcmp(aggname, "sum") != 0 &&
 			 strcmp(aggname, "min") != 0 &&
-			 strcmp(aggname, "max") != 0))
+			 strcmp(aggname, "max") != 0 &&
+			 !(cloudberry_enable_extended_agg && strcmp(aggname, "avg") == 0)))
 			goto unsupported;
 
 		if (aggref->aggargtypes == NIL)
@@ -1653,7 +1669,20 @@ cloudberry_gpupreagg_walker(Node *node, void *__data)
 				goto unsupported;
 			argtype = linitial_oid(aggref->aggargtypes);
 			if (!cloudberry_gpupreagg_supported_type(argtype))
-				goto unsupported;
+			{
+				devtype_info *dtype;
+
+				/* COUNT only needs scalar nullness; do not open the arithmetic
+				 * whitelist or accept row/composite NULL semantics implicitly.
+				 */
+				if (!cloudberry_enable_count_types || strcmp(aggname, "count") != 0 ||
+					get_typtype(argtype) != TYPTYPE_BASE ||
+					get_element_type(argtype) != InvalidOid)
+					goto unsupported;
+				dtype = pgstrom_devtype_lookup(argtype);
+				if (!dtype || (dtype->type_flags & DEVKIND__NVIDIA_GPU) == 0)
+					goto unsupported;
+			}
 		}
 
 		if (!aggfunc_catalog_lookup_by_oid(aggref->aggfnoid))
@@ -1674,9 +1703,8 @@ unsupported:
 /*
  * cloudberry_gpupreagg_query_supported
  *
- * GpuScan's path tracker supplies the remaining storage and qualifier
- * guards.  In particular, it does not remember a path with host quals or
- * without a device qual, so a fused GpuPreAgg cannot bypass those rules.
+ * GpuScan's tracker supplies storage/qualifier guards. Mixed inputs use a
+ * CPU-filtered child; predicate-free inputs require their own opt-in.
  */
 static bool
 cloudberry_gpupreagg_query_supported(PlannerInfo *root,
@@ -1873,6 +1901,32 @@ make_alternative_aggref(xpugroupby_build_path_context *con,
 			ReleaseSysCache(htup);
 			return NULL;
 		}
+#ifdef GP_VERSION_NUM
+		if (con->cpu_input_target != NULL)
+		{
+			if (aggref->aggfilter != NULL)
+			{
+				CaseExpr *masked = makeNode(CaseExpr);
+				CaseWhen *when = makeNode(CaseWhen);
+
+				/* FILTER precedes argument evaluation, including casts that
+				 * may throw. FALSE and UNKNOWN both suppress the argument.
+				 * Volatile filters are rejected before constructing this path.
+				 */
+				masked->casetype = exprType((Node *)expr);
+				masked->casecollid = exprCollation((Node *)expr);
+				masked->location = -1;
+				when->expr = aggref->aggfilter;
+				when->result = expr;
+				when->location = -1;
+				masked->args = list_make1(when);
+				masked->defresult = (Expr *)makeNullConst(masked->casetype,
+					exprTypmod((Node *)expr), masked->casecollid);
+				expr = (Expr *)masked;
+			}
+			add_new_column_to_pathtarget(con->cpu_input_target, expr);
+		}
+#endif
 		partfn_args = lappend(partfn_args, expr);
 		if (lc == list_head(aggref->args))
 			groupby_typmod = exprTypmod((Node *)expr);
@@ -1880,17 +1934,26 @@ make_alternative_aggref(xpugroupby_build_path_context *con,
 	/* last argument for filtering */
 	if (aggref->aggfilter)
 	{
-		if (!pgstrom_xpu_expression(aggref->aggfilter,
+		bool filter_executable = pgstrom_xpu_expression(aggref->aggfilter,
 									pp_info->xpu_task_flags,
 									pp_info->scan_relid,
 									con->inner_target_list,
-									NULL))
+									NULL);
+#ifdef GP_VERSION_NUM
+		if (con->cpu_input_target != NULL && cloudberry_enable_cpu_filter)
+			filter_executable = true;
+#endif
+		if (!filter_executable)
 		{
 			elog(DEBUG2, "FILTER-clause of aggregate function is not executable: %s",
 				 nodeToString(aggref->aggfilter));
 			ReleaseSysCache(htup);
 			return NULL;
 		}
+#ifdef GP_VERSION_NUM
+		if (con->cpu_input_target != NULL)
+			add_new_column_to_pathtarget(con->cpu_input_target, aggref->aggfilter);
+#endif
 		partfn_args = lappend(partfn_args, aggref->aggfilter);
 	}
 	partfn = (Expr *)makeFuncExpr(partial_func_oid,
@@ -2318,6 +2381,46 @@ xpugroupby_build_path_target(xpugroupby_build_path_context *con)
 /*
  * try_add_final_groupby_paths
  */
+#ifdef GP_VERSION_NUM
+static void
+cloudberry_add_redistribute_final(xpugroupby_build_path_context *con,
+								 Path *part_path)
+{
+	Query *parse = con->root->parse;
+	List *group_tles;
+	CdbPathLocus locus;
+	bool need_redistribute;
+	Path *motion_path;
+	Path *final_path;
+	double local_groups;
+
+	if (!cloudberry_enable_redistribute_final || con->groupby_collocated ||
+		parse->groupClause == NIL || part_path->param_info != NULL)
+		return;
+	/* Use expressions from the actual partial target, including its sortrefs.
+	 * Hashability for GPU grouping alone does not prove a valid MPP hash opfamily. */
+	group_tles = get_common_group_tles(part_path->pathtarget, parse->groupClause, NIL);
+	locus = choose_grouping_locus(con->root, part_path, group_tles,
+								  &need_redistribute);
+	if (!need_redistribute || !CdbPathLocus_IsHashed(locus))
+		return;
+	motion_path = cdbpath_create_motion_path(con->root, part_path, NIL, false, locus);
+	if (motion_path == NULL)
+		return;
+	/* Each final group now belongs to one QE. Native Motion and Agg own their
+	 * costs; do not reuse pre-Motion local partial group counts here. */
+	local_groups = clamp_row_est(Min(motion_path->rows,
+		con->final_num_groups / CdbPathLocus_NumSegments(locus)));
+	final_path = (Path *)create_agg_path(con->root, con->group_rel, motion_path,
+		con->target_agg_final, AGG_HASHED, AGGSPLIT_SIMPLE, false,
+		parse->groupClause, con->havingAggQuals, &con->final_agg_clause_costs,
+		local_groups);
+	if (con->has_aggfuncs)
+		final_path = pgstrom_create_dummy_path(con->root, final_path);
+	add_path(con->group_rel, final_path, con->root);
+}
+#endif
+
 static void
 try_add_final_groupby_paths(xpugroupby_build_path_context *con,
 							Path *part_path)
@@ -2327,6 +2430,7 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con,
 	double		num_groups;
 
 #ifdef GP_VERSION_NUM
+	cloudberry_add_redistribute_final(con, part_path);
 	/*
 	 * If the input distribution keys are covered by GROUP BY, every global
 	 * group belongs to exactly one Segment.  The GPU partial rows can therefore
@@ -2497,9 +2601,9 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	if (con->outer_path != NULL)
 	{
 		/*
-		 * The child GpuScan has already applied both the device qual and the
-		 * CPU host qual.  This second GPU task consumes its filtered row KDS;
-		 * it must not repeat either predicate or charge a direct base scan.
+		 * The child has already applied WHERE, including the CPU host qual
+		 * (mixed GpuScan or native scan/projection). Consume its ROW KDS without repeating predicates
+		 * or charging a direct base scan; CPU projections include FILTER.
 		 */
 		Assert(pp_info->num_rels == 0);
 		pp_info->xpu_task_flags |= DEVTASK__SCAN_OUTER_CHUNKS;
@@ -2592,7 +2696,9 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	 * Motion and CPU final aggregation are costed by the standard Cloudberry
 	 * paths built in try_add_final_groupby_paths(), so do not duplicate them.
 	 */
-	dma_input_width_factor = Max((double)con->input_rel->reltarget->width /
+	dma_input_width_factor = Max((double)(con->outer_path != NULL
+											 ? con->outer_path->pathtarget->width
+											 : con->input_rel->reltarget->width) /
 								  1024.0, 1.0 / 16.0);
 	dma_output_width_factor = Max((double)target_partial->width / 64.0, 1.0);
 	dma_input_cost = xpu_tuple_cost * dma_input_width_factor *
@@ -2925,9 +3031,11 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 
 #ifdef GP_VERSION_NUM
 	/* Defense in depth against future changes to the GpuScan path tracker. */
-	if (op_leaf->pp_info->scan_quals == NIL ||
-		(op_leaf->pp_info->host_quals != NIL &&
-		 op_leaf->host_qual_path == NULL) ||
+	if (((op_leaf->pp_info->xpu_task_flags & DEVTASK__CPU_INPUT_PROJECTION) == 0 &&
+		 ((op_leaf->pp_info->scan_quals == NIL &&
+		   (!cloudberry_enable_unfiltered_agg || op_leaf->pp_info->host_quals != NIL)) ||
+		  (op_leaf->pp_info->host_quals != NIL &&
+		   op_leaf->host_qual_path == NULL))) ||
 		op_leaf->pp_info->scan_relid <= 0)
 		return;
 #endif
@@ -2952,9 +3060,11 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 		final_num_groups = estimate_num_groups(root, groupExprs,
 										   input_rel->rows,
 										   NULL, NULL);
-		input_locus = cdbpathlocus_from_baserel(root,
+		input_locus = (op_leaf->host_qual_path != NULL
+					   ? op_leaf->host_qual_path->locus
+					   : cdbpathlocus_from_baserel(root,
 										 input_rel,
-										 op_leaf->pp_info->parallel_nworkers);
+										 op_leaf->pp_info->parallel_nworkers));
 		get_sortgroupclauses_tles(parse->groupClause,
 								  gp_extra->targetList,
 								  &group_tles,
@@ -3018,6 +3128,10 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 	con.target_proj_final = create_empty_pathtarget();
 	con.pp_info        = op_leaf->pp_info;
 	con.outer_path     = op_leaf->host_qual_path;
+#ifdef GP_VERSION_NUM
+	if ((con.pp_info->xpu_task_flags & DEVTASK__CPU_INPUT_PROJECTION) != 0)
+		con.cpu_input_target = create_empty_pathtarget();
+#endif
 	con.sibling_param_id = -1;
 	con.inner_paths_list = op_leaf->inner_paths_list;
 	con.inner_target_list = inner_target_list;
@@ -3030,6 +3144,31 @@ __try_add_xpupreagg_normal_path(PlannerInfo *root,
 #endif
 		return;
 	}
+#ifdef GP_VERSION_NUM
+	if (con.cpu_input_target != NULL)
+	{
+		/* Include both explicit grouping keys and functionally dependent
+		 * columns discovered during the final-target/HAVING rewrite.
+		 */
+		foreach (lc, con.groupby_keys)
+		{
+			Expr *key = lfirst(lc);
+
+			if (!pgstrom_xpu_expression(key, TASK_KIND__GPUPREAGG,
+										con.pp_info->scan_relid, NIL, NULL))
+				return;
+			add_new_column_to_pathtarget(con.cpu_input_target, key);
+		}
+		/* COUNT(*) alone still needs one physical column per source tuple. */
+		if (con.cpu_input_target->exprs == NIL)
+			add_new_column_to_pathtarget(con.cpu_input_target,
+										(Expr *)makeBoolConst(true, false));
+		set_pathtarget_cost_width(root, con.cpu_input_target);
+		con.outer_path = (Path *)create_projection_path(root, input_rel,
+														 con.outer_path,
+														 con.cpu_input_target);
+	}
+#endif
 	/* build GpuPreAgg path */
 	cpath = __buildXpuPreAggCustomPath(&con);
 	if (!cpath)
@@ -3862,6 +4001,183 @@ tryGpuSortWithWindowRankPath(PlannerInfo *root,
 	return NULL;
 }
 
+#ifdef GP_VERSION_NUM
+typedef struct
+{
+	Index scan_relid;
+	bool needs_cpu;
+} cloudberry_filter_input_context;
+
+static bool
+cloudberry_find_cpu_filter(Node *node, void *data)
+{
+	cloudberry_filter_input_context *context = data;
+
+	if (!node)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		Aggref *agg = (Aggref *)node;
+
+		if (agg->aggfilter &&
+			!pgstrom_xpu_expression(agg->aggfilter, TASK_KIND__GPUPREAGG,
+									context->scan_relid, NIL, NULL))
+			context->needs_cpu = true;
+	}
+	return expression_tree_walker(node, cloudberry_find_cpu_filter, data);
+}
+
+/* Native Append owns inheritance column translation and partition pruning.
+ * Never read a partition parent as a physical heap, or combine incompatible
+ * distribution policies under a fabricated hashed locus.
+ */
+static bool
+cloudberry_heap_input_supported(RangeTblEntry *rte, RelOptInfo *rel,
+								bool *partitioned)
+{
+	List *relids;
+	ListCell *lc;
+	bool supported = true;
+	char kind = get_rel_relkind(rte->relid);
+	Relation parent;
+
+	*partitioned = (kind == RELKIND_PARTITIONED_TABLE);
+	if (rte->rtekind != RTE_RELATION || rte->tablesample != NULL ||
+		(kind != RELKIND_RELATION && !*partitioned) ||
+		(*partitioned && (!rte->inh || !cloudberry_enable_heap_partition)))
+		return false;
+	relids = find_all_inheritors(rte->relid, AccessShareLock, NULL);
+	parent = table_open(rte->relid, NoLock);
+	if (!*partitioned && list_length(relids) != 1)
+		supported = false; /* traditional inheritance is not this milestone */
+	foreach (lc, relids)
+	{
+		Oid oid = lfirst_oid(lc);
+		Relation child = table_open(oid, NoLock);
+		GpPolicy *policy = GpPolicyFetch(oid);
+
+		if ((child->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
+			 (child->rd_rel->relkind != RELKIND_RELATION ||
+			  child->rd_rel->relam != HEAP_TABLE_AM_OID)) ||
+			!policy || !GpPolicyEqualByName(RelationGetDescr(parent), rel->cdbpolicy,
+										   RelationGetDescr(child), policy))
+			supported = false;
+		if (policy)
+			pfree(policy);
+		table_close(child, NoLock); /* retain planner locks until transaction end */
+	}
+	table_close(parent, NoLock);
+	list_free(relids);
+	return supported;
+}
+
+/* Deliberately narrow native source tree: no Motion, foreign/custom scans,
+ * parallel workers, or parameterized children hidden inside an Append.
+ */
+static bool
+cloudberry_native_heap_path(Path *path)
+{
+	ListCell *lc;
+
+	if (path->param_info || path->parallel_aware || path->parallel_workers > 0 ||
+		path->motionHazard || path->barrierHazard ||
+		!CdbPathLocus_IsPartitioned(path->locus))
+		return false;
+	if (IsA(path, AppendPath))
+	{
+		foreach (lc, ((AppendPath *)path)->subpaths)
+			if (!cloudberry_native_heap_path(lfirst(lc)))
+				return false;
+		return true;
+	}
+	if (IsA(path, ProjectionPath))
+		return cloudberry_native_heap_path(((ProjectionPath *)path)->subpath);
+	return path->pathtype == T_SeqScan || path->pathtype == T_IndexScan ||
+		path->pathtype == T_IndexOnlyScan || path->pathtype == T_BitmapHeapScan;
+}
+
+static void
+cloudberry_add_cpu_input_path(PlannerInfo *root, UpperRelationKind stage,
+								 RelOptInfo *input_rel, RelOptInfo *group_rel,
+								 GroupPathExtraData *extra)
+{
+	RangeTblEntry *rte = planner_rt_fetch(input_rel->relid, root);
+	cloudberry_filter_input_context filters = {input_rel->relid, false};
+	bool partitioned;
+	bool host_qual = false;
+	bool device_qual = false;
+	ListCell *lc;
+	Path *source = NULL;
+	pgstromPlanInfo *pp_info;
+	pgstromOuterPathLeafInfo leaf;
+
+	if ((!cloudberry_enable_host_input && !cloudberry_enable_cpu_filter &&
+		 !cloudberry_enable_heap_partition) || input_rel->lateral_relids != NULL ||
+		contain_volatile_functions((Node *)root->parse->targetList) ||
+		contain_volatile_functions(root->parse->havingQual) ||
+		contain_subplans((Node *)root->parse->targetList) ||
+		contain_subplans(root->parse->havingQual))
+		return;
+	cloudberry_find_cpu_filter((Node *)root->parse->targetList, &filters);
+	cloudberry_find_cpu_filter(root->parse->havingQual, &filters);
+	if (filters.needs_cpu && !cloudberry_enable_cpu_filter)
+		return;
+	foreach (lc, input_rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst(lc);
+
+		if (contain_volatile_functions((Node *)rinfo->clause) ||
+			contain_subplans((Node *)rinfo->clause))
+			return;
+		if (pgstrom_xpu_expression(rinfo->clause, TASK_KIND__GPUPREAGG,
+								 input_rel->relid, NIL, NULL))
+			device_qual = true;
+		else
+			host_qual = true;
+	}
+	if ((!host_qual && !device_qual && !cloudberry_enable_unfiltered_agg) ||
+		(host_qual && !device_qual && !cloudberry_enable_host_input) ||
+		(host_qual && device_qual && !cloudberry_enable_host_quals))
+		return;
+	if (!cloudberry_heap_input_supported(rte, input_rel, &partitioned))
+		return;
+	if (!partitioned && !filters.needs_cpu && !(host_qual && !device_qual))
+		return;
+	if (!partitioned)
+		source = create_seqscan_path(root, input_rel, NULL, 0);
+	else
+	{
+		foreach (lc, input_rel->pathlist)
+		{
+			Path *path = lfirst(lc);
+
+			if (cloudberry_native_heap_path(path) &&
+				(!source || path->total_cost < source->total_cost))
+				source = path;
+		}
+	}
+	if (!source || !cloudberry_native_heap_path(source))
+		return;
+
+	pp_info = palloc0(sizeof(pgstromPlanInfo));
+	pp_info->xpu_task_flags = TASK_KIND__GPUPREAGG | DEVTASK__CPU_INPUT_PROJECTION;
+	pp_info->scan_relid = input_rel->relid;
+	pp_info->scan_tuples = source->rows;
+	pp_info->scan_nrows = source->rows;
+	pp_info->final_nrows = source->rows;
+	pp_info->parallel_divisor = 1.0;
+	pp_info->sibling_param_id = -1;
+	memset(&leaf, 0, sizeof(leaf));
+	leaf.pp_info = pp_info;
+	leaf.leaf_rel = input_rel;
+	leaf.leaf_nrows = source->rows;
+	leaf.leaf_cost = source->total_cost;
+	leaf.host_qual_path = source;
+	__try_add_xpupreagg_normal_path(root, stage, input_rel, group_rel, extra,
+								  TASK_KIND__GPUPREAGG, false, &leaf);
+}
+#endif
+
 /*
  * XpuPreAggAddCustomPath
  */
@@ -3895,6 +4211,7 @@ XpuPreAggAddCustomPath(PlannerInfo *root,
 								 extra,
 								 TASK_KIND__GPUPREAGG,
 								 false);
+	cloudberry_add_cpu_input_path(root, upper_stage, input_rel, upper_rel, extra);
 	return;
 #endif
 	if (upper_stage == UPPERREL_GROUP_AGG || upper_stage == UPPERREL_DISTINCT)
@@ -3973,7 +4290,8 @@ PlanGpuPreAggPath(PlannerInfo *root,
 		Assert(pp_info->num_rels == 0 && list_length(custom_plans) == 1);
 		xpu_custom_plans = NIL;
 		source_paths = cpath->custom_paths;
-		cpath->custom_paths = NIL;
+		if ((pp_info->xpu_task_flags & DEVTASK__CPU_INPUT_PROJECTION) == 0)
+			cpath->custom_paths = NIL;
 	}
 
 	cscan = PlanXpuJoinPathCommon(root,
@@ -4165,6 +4483,43 @@ __pgstrom_init_xpupreagg_common(void)
 void
 pgstrom_init_gpu_preagg(void)
 {
+#ifdef GP_VERSION_NUM
+	DefineCustomBoolVariable("pg_strom.cloudberry_enable_count_types",
+		"Enables COUNT on additional device-supported scalar input types",
+		"Does not enable arithmetic aggregates on these types, arrays or composites",
+		&cloudberry_enable_count_types, false, PGC_USERSET, GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_strom.cloudberry_enable_host_input",
+		"Enables native CPU scan input for host-only WHERE aggregation",
+		"Does not enable host-only standalone GpuScan",
+		&cloudberry_enable_host_input, false, PGC_USERSET, GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_strom.cloudberry_enable_cpu_filter",
+		"Enables CPU projection of aggregate FILTER before GpuPreAgg",
+		"Volatile expressions and subplans retain native aggregation",
+		&cloudberry_enable_cpu_filter, false, PGC_USERSET, GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_strom.cloudberry_enable_heap_partition",
+		"Enables native heap partition scans feeding GpuPreAgg",
+		"Requires uniform distributed heap leaves; native Append owns pruning",
+		&cloudberry_enable_heap_partition, false, PGC_USERSET, GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_strom.cloudberry_enable_extended_agg",
+		"Enables experimental integer/float AVG and device aggregate FILTER",
+		"Requires enable_gpupreagg; numeric inputs and DISTINCT remain unsupported",
+		&cloudberry_enable_extended_agg, false, PGC_USERSET, GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_strom.cloudberry_enable_unfiltered_agg",
+		"Enables experimental GpuPreAgg input without a scan predicate",
+		"Does not enable predicate-free standalone GpuScan or host-only filtering",
+		&cloudberry_enable_unfiltered_agg, false, PGC_USERSET, GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_strom.cloudberry_enable_redistribute_final",
+		"Considers Redistribute Motion followed by per-QE CPU final aggregation",
+		"Gather-final remains a competing candidate; global aggregates still gather",
+		&cloudberry_enable_redistribute_final, false, PGC_USERSET, GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+#endif
 	/* turn on/off GpuPreAgg */
 	DefineCustomBoolVariable("pg_strom.enable_gpupreagg",
 							 "Enables the use of GPU-PreAgg",

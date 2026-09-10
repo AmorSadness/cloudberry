@@ -1456,6 +1456,21 @@ lookup_input_varnode_defitem(codegen_context *context,
 	int32_t		kv_xdatum_sizeof;
 	int32_t		kv_kvec_sizeof;
 
+	/* Native CPU input may project whole expressions (including host FILTER).
+	 * Its ROW KDS uses target positions, never physical heap attribute numbers.
+	 */
+	if (context->pd[0].inner_target != NULL)
+	{
+		depth = 0;
+		resno = 1;
+		foreach (lc, context->pd[0].inner_target->exprs)
+		{
+			if (equal(var, lfirst(lc)))
+				goto found;
+			resno++;
+		}
+		return NULL;
+	}
 	if (!IsA(var, Var))
 		return NULL;
 
@@ -1488,7 +1503,7 @@ found:
 		if (kvdef->kv_depth == depth &&
 			kvdef->kv_resno == resno)
 		{
-			Assert(equalVar(var, kvdef->kv_expr));
+			Assert(equal(var, kvdef->kv_expr) || equalVar(var, kvdef->kv_expr));
 			kvdef->kv_maxref = Max(kvdef->kv_maxref, curr_depth);
 			return kvdef;
 		}
@@ -1652,6 +1667,14 @@ create_codegen_context(PlannerInfo *root,
 	context->kvecs_usage = 0;
 	context->scan_relid = pp_info->scan_relid;
 	context->num_rels = pp_info->num_rels;
+	if ((pp_info->xpu_task_flags & DEVTASK__CPU_INPUT_PROJECTION) != 0)
+	{
+		Path *source = linitial(cpath->custom_paths);
+
+		Assert(pp_info->num_rels == 0 && list_length(cpath->custom_paths) == 1);
+		context->pd[0].inner_target = source->pathtarget;
+		return context;
+	}
 	Assert(pp_info->num_rels == list_length(cpath->custom_paths));
 	foreach (lc, cpath->custom_paths)
 	{
@@ -1790,6 +1813,8 @@ codegen_var_expression(codegen_context *context,
 										 var,
 										 curr_depth,
 										 false);
+	if (!kvdef)
+		__Ereport("variable has no device-supported input slot");
 	if (buf)
 	{
 		kern_expression kexp;

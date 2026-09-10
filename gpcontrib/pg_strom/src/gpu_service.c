@@ -14,6 +14,7 @@
 #include "cuda_common.h"
 #include <cudaProfiler.h>
 #include <sys/file.h>
+#include "gpu_budget_queue.h"
 
 /*
  * Host-wide query-buffer admission control
@@ -25,8 +26,10 @@
  * owned by the individual GPU-Service processes.
  */
 #define GPU_SHARED_BUDGET_MAGIC       0x47534247U /* "GSBG" */
-#define GPU_SHARED_BUDGET_VERSION     1U
+#define GPU_SHARED_BUDGET_VERSION     2U
 #define GPU_SHARED_BUDGET_NSLOTS      128
+/* Existing superuser-only injection API: count=-1 targets one expansion. */
+#define GPU_TEST_INJECT_EXPANSION     UINT32_MAX
 
 typedef struct
 {
@@ -50,6 +53,7 @@ typedef struct
 	uint32_t	waiters;
 	uint32_t	padding;
 	gpuSharedBudgetOwner owners[GPU_SHARED_BUDGET_NSLOTS];
+	GpuBudgetQueue queue;
 } gpuSharedBudgetState;
 
 typedef struct
@@ -203,6 +207,9 @@ typedef struct
  * variables
  */
 static __thread gpuContext		*GpuWorkerCurrentContext = NULL;
+/* Both monitor (OpenSession/pool allocation) and worker command threads set it. */
+static __thread gpuClient       *GpuBudgetCurrentClient = NULL;
+static __thread int              GpuBudgetClientSocket = -1;
 static __thread bool			GpuWorkerCommandFailed = false;
 static __thread bool			GpuWorkerCommandCancelled = false;
 static __thread bool			GpuQueryBufferAllocBudgetRejected = false;
@@ -1554,6 +1561,7 @@ gpuSharedBudgetSweep(gpuSharedBudgetState *state,
 			if (owner->waiters > 0)
 				state->waiters -= Min(state->waiters, owner->waiters);
 			memset(owner, 0, sizeof(*owner));
+			gpu_budget_queue_remove_owner(&state->queue, i + 1);
 			state->stale_reclaims++;
 			continue;
 		}
@@ -1747,6 +1755,7 @@ gpuSharedBudgetReserve(gpuContext *gcontext, size_t bytesize)
 	gpuSharedBudgetState *state = budget->state;
 	struct timespec ts0, ts;
 	bool		waited = false;
+	int         queue_slot = -1;
 	gpuServDeviceStats *dstats = gpuServGetDeviceStats(gcontext);
 	uint64_t	old_max;
 
@@ -1764,9 +1773,16 @@ gpuSharedBudgetReserve(gpuContext *gcontext, size_t bytesize)
 		gpuSharedBudgetOwner *owner;
 		uint64_t effective, reserved, reclaimed;
 		int64_t elapsed_ms;
+		bool cancelled;
 
 		if (gpuSharedBudgetLock(state) != 0)
 			return false;
+		if (budget->owner_slot < 0)
+		{
+			/* Detach already removed this owner's queued requests. */
+			pthread_mutex_unlock(&state->mutex);
+			return false;
+		}
 		effective = gpuSharedBudgetSweep(state, &reserved, &reclaimed);
 		effective = Min(effective,
 					state->device_bytes - Min(state->device_bytes,
@@ -1777,11 +1793,31 @@ gpuSharedBudgetReserve(gpuContext *gcontext, size_t bytesize)
 			pthread_mutex_unlock(&state->mutex);
 			return false;
 		}
-		if (bytesize <= effective && reserved <= effective - bytesize)
+		/* Poll the original socket for disconnect even in the monitor thread,
+		 * which cannot consume EOF while it is waiting here in OpenSession.
+		 * refcnt keeps the client alive until this command/monitor returns. */
+		cancelled = gpuServiceGoingTerminate();
+		if (GpuBudgetCurrentClient)
+		{
+			struct pollfd pfd = { .fd = GpuBudgetClientSocket,
+				.events = POLLRDHUP };
+			cancelled |= (pg_atomic_read_u32(&GpuBudgetCurrentClient->refcnt) & 1) == 0;
+			if (poll(&pfd, 1, 0) > 0 &&
+				(pfd.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)))
+				cancelled = true;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		elapsed_ms = ((ts.tv_sec - ts0.tv_sec) * 1000L +
+					  (ts.tv_nsec - ts0.tv_nsec) / 1000000L);
+		if (!cancelled &&
+			(!waited || elapsed_ms < pgstrom_shared_gpu_budget_timeout_ms) &&
+			gpu_budget_queue_can_admit(&state->queue, queue_slot,
+									   bytesize, effective, reserved))
 		{
 			owner->reserved_bytes += bytesize;
 			reserved += bytesize;
 			state->admissions++;
+			gpu_budget_queue_remove(&state->queue, queue_slot);
 			if (waited)
 			{
 				state->waiters--;
@@ -1792,13 +1828,14 @@ gpuSharedBudgetReserve(gpuContext *gcontext, size_t bytesize)
 			pthread_mutex_unlock(&state->mutex);
 			return true;
 		}
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		elapsed_ms = ((ts.tv_sec - ts0.tv_sec) * 1000L +
-					  (ts.tv_nsec - ts0.tv_nsec) / 1000000L);
-		if (pgstrom_shared_gpu_budget_timeout_ms == 0 ||
+		if (cancelled || bytesize > effective ||
+			pgstrom_shared_gpu_budget_timeout_ms == 0 ||
 			elapsed_ms >= pgstrom_shared_gpu_budget_timeout_ms)
 		{
 			state->rejections++;
+			gpu_budget_queue_remove(&state->queue, queue_slot);
+			if (cancelled && GpuBudgetCurrentClient)
+				GpuWorkerCommandCancelled = true;
 			if (waited)
 			{
 				state->waiters--;
@@ -1811,6 +1848,14 @@ gpuSharedBudgetReserve(gpuContext *gcontext, size_t bytesize)
 		}
 		if (!waited)
 		{
+			queue_slot = gpu_budget_queue_push(&state->queue, budget->owner_slot + 1);
+			if (queue_slot < 0)
+			{
+				state->rejections++;
+				gpuSharedBudgetPublish(gcontext, effective, reserved);
+				pthread_mutex_unlock(&state->mutex);
+				return false;
+			}
 			state->waiters++;
 			state->wait_events++;
 			owner->waiters++;
@@ -1871,6 +1916,7 @@ gpuSharedBudgetDetach(gpuContext *gcontext)
 								 state->owners[budget->owner_slot].waiters);
 			memset(&state->owners[budget->owner_slot], 0,
 				   sizeof(state->owners[budget->owner_slot]));
+			gpu_budget_queue_remove_owner(&state->queue, budget->owner_slot + 1);
 		}
 		effective = gpuSharedBudgetSweep(state, &reserved, &reclaimed);
 		effective = Min(effective,
@@ -2196,7 +2242,7 @@ allocGpuQueryBuffer(gpuQueryBuffer *gq_buf,
 		gpuServDeviceStats *dstats = gpuServGetDeviceStats(GpuWorkerCurrentContext);
 		uint32_t inject_count = pg_atomic_read_u32(&dstats->test_inject_oom);
 
-		while (inject_count > 0)
+		while (inject_count > 0 && inject_count != GPU_TEST_INJECT_EXPANSION)
 		{
 			if (pg_atomic_compare_exchange_u32(&dstats->test_inject_oom,
 										   &inject_count,
@@ -3187,6 +3233,19 @@ __expandGpuQueryGroupByBuffer(gpuClient *gclient,
 						  "shared GPU budget admission rejected GpuPreAgg expansion (bytes=%lu)",
 						  length);
 			return false;
+		}
+		{
+			gpuServDeviceStats *dstats = gpuServGetDeviceStats(GpuWorkerCurrentContext);
+			uint32_t expected = GPU_TEST_INJECT_EXPANSION;
+
+			if (pg_atomic_compare_exchange_u32(&dstats->test_inject_oom, &expected, 0))
+			{
+				gpuSharedBudgetRelease(GpuWorkerCurrentContext, length);
+				pthreadRWLockUnlock(&gq_buf->m_kds_rwlock);
+				gpuClientELog(gclient,
+					"injected GpuPreAgg expansion failure after budget reservation");
+				return false;
+			}
 		}
 		rc = cuMemAllocManaged(&m_devptr, length,
 							   CU_MEM_ATTACH_GLOBAL);
@@ -6772,6 +6831,8 @@ gpuservGpuWorkerMain(void *__arg)
 			pthreadMutexUnlock(&gcontext->lock);
 
 			gclient = xcmd->priv;
+			GpuBudgetCurrentClient = gclient;
+			GpuBudgetClientSocket = gclient->sockfd;
 			GpuWorkerCommandFailed = false;
 			GpuWorkerCommandCancelled = false;
 			/*
@@ -6815,6 +6876,8 @@ gpuservGpuWorkerMain(void *__arg)
 			else if (command_executed)
 				pg_atomic_fetch_add_u64(&dstats->completed_commands, 1);
 			__gpuServiceFreeCommand(xcmd);
+			GpuBudgetCurrentClient = NULL;
+			GpuBudgetClientSocket = -1;
 			gpuClientPut(gclient, false);
 			pthreadMutexLock(&gcontext->lock);
 			count = pg_atomic_fetch_sub_u32(&gcontext->num_commands, 1);
@@ -6850,6 +6913,9 @@ gpuservMonitorClient(void *__priv)
 	gpuContext *gcontext;
 	pgsocket	sockfd = gclient->sockfd;
 	CUresult	rc;
+
+	GpuBudgetCurrentClient = gclient;
+	GpuBudgetClientSocket = sockfd;
 
 	/* switch heterodb-extra ereport callback */
 	heterodbExtraRegisterEreportCallback(gpuservWorkerEreportCallback);
@@ -6900,6 +6966,8 @@ gpuservMonitorClient(void *__priv)
 		}
 	}
 out:
+	GpuBudgetCurrentClient = NULL;
+	GpuBudgetClientSocket = -1;
 	gpuClientPut(gclient, true);
 	return NULL;
 }
@@ -7824,7 +7892,9 @@ pgstrom_gpu_service_status(PG_FUNCTION_ARGS)
  *
  * Acceptance-only hook.  Arm failures in postmaster-local shared state; the
  * GPU Service consumes them after a successful budget reservation and rolls
- * the reservation back without calling CUDA.
+ * the reservation back without calling CUDA. count=-1 targets the next
+ * replacement-buffer expansion; 0 disarms either mode; 1..1000 target initial
+ * query-buffer allocations. The catalog signature and access control are unchanged.
  */
 PG_FUNCTION_INFO_V1(pgstrom_shared_gpu_budget_inject_oom);
 PUBLIC_FUNCTION(Datum)
@@ -7846,12 +7916,12 @@ pgstrom_shared_gpu_budget_inject_oom(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("invalid GPU device index: %d", dindex)));
-		if (count < 0 || count > 1000)
+		if (count < -1 || count > 1000)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("injected failure count must be between 0 and 1000")));
+					 errmsg("injected failure count must be -1 (expansion) or between 0 and 1000")));
 		pg_atomic_write_u32(&gpuserv_shared_state->device_stats[dindex].test_inject_oom,
-							count);
+							count == -1 ? GPU_TEST_INJECT_EXPANSION : (uint32_t)count);
 		fncxt->user_fctx = (void *)(intptr_t)dindex;
 	}
 	fncxt = SRF_PERCALL_SETUP();

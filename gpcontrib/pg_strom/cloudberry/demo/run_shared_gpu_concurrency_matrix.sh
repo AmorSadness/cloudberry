@@ -116,6 +116,17 @@ run_pair() {
     echo "$label: both results matched and resources drained"
 }
 
+if [[ ${PGSTROM_GPUPREAGG_MIXED_RELIABILITY:-0} == 1 ]]; then
+    preagg_settings+=" SET pg_strom.cloudberry_enable_host_quals=on;"
+    mixed_predicate="id > 0 AND payload ~ '^[0-7]'"
+    preagg_query=${preagg_query//id > 0/$mixed_predicate}
+    mixed_plan=$("${psql_cmd[@]}" -Atqc "$preagg_settings EXPLAIN (VERBOSE) $preagg_query")
+    grep -q 'Pre-Aggregation Input: CPU host-filtered GpuScan rows' <<<"$mixed_plan" || {
+        echo "allocation/concurrency query did not exercise mixed input" >&2
+        exit 1
+    }
+fi
+
 require_plan GpuScan "$scan_settings" "$scan_query"
 require_plan GpuPreAgg "$preagg_settings" "$preagg_query"
 scan_cpu=$("${psql_cmd[@]}" -AtF '|' -qc "SET optimizer=off; SET pg_strom.enabled=off; $scan_query")

@@ -160,7 +160,7 @@ submake-generated-headers: $(GENERATED-HEADERS)
 # PGXS does not make a directly requested module target wait for this custom
 # submake target.  Express the real dependency as well, including for -j.
 $(STROM_OBJS): | $(GENERATED-HEADERS)
-gpu_service.o: pgstrom_device_config.h
+gpu_service.o: pgstrom_device_config.h gpu_budget_queue.h
 
 gpu_devattrs.h: $(CUDA_IPATH)/cuda.h
 	cat $(CUDA_IPATH)/cuda.h | \
