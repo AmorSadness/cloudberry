@@ -38,6 +38,9 @@ static bool					pgstrom_enable_gpupreagg = false;
 static bool					pgstrom_enable_partitionwise_gpupreagg = false;
 static bool					pgstrom_enable_numeric_aggfuncs;
 bool						pgstrom_enable_gpusort = false;
+#ifdef GP_VERSION_NUM
+int cloudberry_gpusort_max_buffer_mb = 256;
+#endif
 
 /*
  * pgstrom_is_gpupreagg_path
@@ -4559,6 +4562,13 @@ pgstrom_init_gpu_preagg(void)
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
+#ifdef GP_VERSION_NUM
+	DefineCustomIntVariable("pg_strom.cloudberry_gpusort_max_buffer_size",
+		"Maximum live projection-buffer bytes per QE GpuSort (including merge replacement)",
+		NULL, &cloudberry_gpusort_max_buffer_mb, 256, 32, 4096,
+		PGC_USERSET, GUC_NOT_IN_SAMPLE | GUC_UNIT_MB | GUC_GPDB_NEED_SYNC,
+		NULL, NULL, NULL);
+#endif
 	/* turn on/off GPU-Sort */
 	DefineCustomBoolVariable("pg_strom.enable_gpusort",
 							 "Enables to use GPU-Sort on top of GPU-Projection/PreAgg",

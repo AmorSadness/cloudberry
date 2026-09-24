@@ -33,7 +33,9 @@ GpuJoin 内核、inner KDS、CPU hash 构建和 GPU Service 协议，不实现�
 可以满足本功能规则；不能只按 SQL 文本判断是否必须回退。投影、ORDER BY 和 CPU
 聚合可以位于 GpuJoin 上方。首版不注册 join 结果为后续 GPU leaf，因此不支持多层
 GpuJoin 融合或 Join+GpuPreAgg 融合。GiST、nested-loop、pinned inner、partitionwise
-join、GPU-Sort 不会由本入口创建，修改其上游开关也不会绕过限制。
+join 不会由本入口创建，修改其上游开关也不会绕过限制。
+后续新增的默认关闭 GpuSort 可融合到符合条件的共置连接结果中；其独立限制及待验收项见
+[CLOUDBERRY_GPUSORT_DESIGN.md](CLOUDBERRY_GPUSORT_DESIGN.md)。
 
 ## 2. 共置证明与计划
 

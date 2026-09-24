@@ -130,7 +130,11 @@ pgstrom_init_gucs(void)
 							 ERROR,
 							 __cpu_fallback_options,
 							 PGC_USERSET,
-							 GUC_NOT_IN_SAMPLE,
+							 GUC_NOT_IN_SAMPLE
+#ifdef GP_VERSION_NUM
+							 | GUC_GPDB_NEED_SYNC
+#endif
+							 ,
 							 NULL, NULL, NULL);
 	/* disables some platform specific EXPLAIN output */
 	DefineCustomBoolVariable("pg_strom.regression_test_mode",

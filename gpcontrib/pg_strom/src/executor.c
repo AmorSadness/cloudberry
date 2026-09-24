@@ -784,6 +784,14 @@ pgstromBuildSessionInfo(pgstromTaskState *pts,
 									 VARSIZE(xpucode) - VARHDRSZ);
 		session->gpusort_htup_margin = pp_info->gpusort_htup_margin;
 		session->gpusort_limit_count = pp_info->gpusort_limit_count;
+#ifdef GP_VERSION_NUM
+		/* Cached plans must not silently turn CPU fallback back on and emit
+		 * rows outside the sorted stream. This check runs on the QE. */
+		if (pgstrom_cpu_fallback_elevel < ERROR)
+			elog(ERROR, "Cloudberry GpuSort requires pg_strom.cpu_fallback=off");
+		session->gpusort_max_buffer_bytes =
+			(uint64_t)cloudberry_gpusort_max_buffer_mb * 1024 * 1024;
+#endif
 	}
 	else
 	{
@@ -818,6 +826,10 @@ pgstromBuildSessionInfo(pgstromTaskState *pts,
 					kds_temp->format = KDS_FORMAT_HASH;
 				}
 				kds_temp->length = (512UL << 20);	/* 512MB per buffer */
+#ifdef GP_VERSION_NUM
+				if (pp_info->gpusort_keys_expr != NIL)
+					kds_temp->length = (16UL << 20);
+#endif
 			}
 			else if ((pts->xpu_task_flags & DEVTASK__PINNED_HASH_RESULTS) != 0)
 			{
@@ -2161,7 +2173,8 @@ __pgstromExecTaskOpenConnection(pgstromTaskState *pts)
 	if (!pts->ps_state)
 		pgstromSharedStateInitDSM(&pts->css, NULL, NULL);
 #ifdef GP_VERSION_NUM
-	if (pgstrom_is_gpujoin_state((PlanState *)pts))
+	if (pgstrom_is_gpujoin_state((PlanState *)pts) ||
+		pts->pp_info->gpusort_keys_expr != NIL)
 	{
 		/* plan_node_id repeats across prepared executions/rescans. A Service
 		 * can still hold the old session while its socket close is draining.
@@ -2170,7 +2183,7 @@ __pgstromExecTaskOpenConnection(pgstromTaskState *pts)
 		static uint32 join_execution_id = 0;
 
 		if (join_execution_id == 0x7fffffffU)
-			elog(ERROR, "Cloudberry GpuJoin execution ID exhausted; reconnect");
+			elog(ERROR, "Cloudberry buffered GPU execution ID exhausted; reconnect");
 		pts->ps_state->query_plan_id = ((uint64_t)MyProcPid << 32) |
 			0x80000000U | ++join_execution_id;
 	}
@@ -3390,16 +3403,22 @@ pgstromExplainTaskState(CustomScanState *node,
 							 pp_info->gpusort_htup_margin);
 		if (es->analyze && ps_state)
 		{
-			pgstromSharedInnerState *istate = &ps_state->inners[pp_info->num_rels - 1];
-
 			appendStringInfo(&buf, " [buffer reconstruction: %umsec, GPU-sorting %umsec]",
 							 pg_atomic_read_u32(&ps_state->final_reconstruction_msec),
 							 pg_atomic_read_u32(&ps_state->final_sorting_msec));
-			final_nfiltered = (pg_atomic_read_u64(&istate->stats_join) +
-							   pg_atomic_read_u64(&istate->stats_roj) -
-							   pg_atomic_read_u64(&ps_state->final_nitems));
+			if (pp_info->num_rels > 0)
+			{
+				pgstromSharedInnerState *istate = &ps_state->inners[pp_info->num_rels - 1];
+				final_nfiltered = (pg_atomic_read_u64(&istate->stats_join) +
+					pg_atomic_read_u64(&istate->stats_roj) -
+					pg_atomic_read_u64(&ps_state->final_nitems));
+			}
 		}
 		ExplainPropertyText("GPU-Sort keys", buf.data, es);
+#ifdef GP_VERSION_NUM
+		ExplainPropertyText("Cloudberry GPU-Sort", "Per-QE order; native merge Motion for global order", es);
+		ExplainPropertyInteger("GPU-Sort buffer limit", "MB", cloudberry_gpusort_max_buffer_mb, es);
+#endif
 		
 		if (pp_info->gpusort_limit_count > 0)
 		{

@@ -24,5 +24,5 @@ EOF
     -I"$("$pg_config" --includedir)/internal" -I"$source_dir" \
     -Werror=implicit-function-declaration -Werror=incompatible-pointer-types \
     "$source_dir/gpu_join.c" "$source_dir/gpu_scan.c" \
-    "$source_dir/executor.c" "$source_dir/main.c"
-printf '%s\n' 'GpuJoin host C/API syntax: PASS (opaque CUDA declarations; no SDK, link or device build)'
+    "$source_dir/executor.c" "$source_dir/main.c" "$source_dir/gpu_preagg.c"
+printf '%s\n' 'GpuJoin/GpuSort host C/API syntax: PASS (opaque CUDA declarations; no SDK, link or device build)'

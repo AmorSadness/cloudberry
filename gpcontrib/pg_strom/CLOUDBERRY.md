@@ -37,7 +37,9 @@ tables, foreign/Arrow tables and coordinator-local or replicated tables retain
 native paths.  GpuCache, BRIN acceleration, SELECT-INTO-Direct and every DPU path are not
 registered. GpuJoin is now registered with a default-off, Cloudberry-only
 colocated two-heap INNER hash-join path; GPU acceptance is pending. See
-`CLOUDBERRY_GPUJOIN_COLOCATED_DESIGN.md` for its narrower eligibility and tests.  GpuSort, numeric aggregation and
+`CLOUDBERRY_GPUJOIN_COLOCATED_DESIGN.md` for its narrower eligibility and tests. GpuSort now has a default-off, fixed-width fused GpuScan/GpuJoin
+implementation with per-QE sorting and native merge Motion; GPU acceptance
+is pending. See `CLOUDBERRY_GPUSORT_DESIGN.md`. Numeric aggregation and
 partitionwise GpuPreAgg remain disabled.  GPU-Direct and SELECT-INTO-Direct
 cannot be enabled.
 

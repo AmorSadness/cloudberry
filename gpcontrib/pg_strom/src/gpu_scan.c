@@ -595,12 +595,16 @@ try_add_simple_scan_path(PlannerInfo *root,
 			(!allow_no_device_quals && pp_info->scan_quals == NIL))
 			return;
 #ifdef GP_VERSION_NUM
-		/* Predicate-free input is private to the PreAgg tracker. A host-only
+		/* Predicate-free input is private to PreAgg tracking or Sort. A host-only
 		 * scan must not become an unfiltered fused aggregate. */
 		if (pp_info->scan_quals == NIL && pp_info->host_quals != NIL)
 			return;
 #endif
-		if (pp_info->scan_quals != NIL)
+		if (pp_info->scan_quals != NIL
+#ifdef GP_VERSION_NUM
+			|| (pgstrom_enable_gpusort && root->sort_pathkeys != NIL)
+#endif
+		   )
 		{
 			CustomPath *cpath = makeNode(CustomPath);
 			scan_cpath = cpath;
@@ -636,14 +640,21 @@ try_add_simple_scan_path(PlannerInfo *root,
 			cpath->methods			= xpuscan_path_methods;
 			/* try attach GPU-Sorted version */
 			try_add_sorted_gpujoin_path(root, baserel, cpath, be_parallel);
-			if (be_parallel == 0)
-				add_path(baserel, &cpath->path
 #ifdef GP_VERSION_NUM
-						 , root
+			/* A predicate-free candidate is private to GpuSort. Never add the
+			 * unsorted standalone scan just because sorting was requested. */
+			if (pp_info->scan_quals != NIL)
 #endif
-						 );
-			else
-				add_partial_path(baserel, &cpath->path);
+			{
+				if (be_parallel == 0)
+					add_path(baserel, &cpath->path
+#ifdef GP_VERSION_NUM
+							 , root
+#endif
+							 );
+				else
+					add_partial_path(baserel, &cpath->path);
+			}
 		}
 		/*
 		 * A fused GpuPreAgg cannot evaluate host quals after aggregation.  For
@@ -777,7 +788,8 @@ __xpuScanAddScanPathCommon(PlannerInfo *root,
 #ifdef GP_VERSION_NUM
 									 /* opt-in mixed device/host quals */
 									 cloudberry_enable_host_quals,
-									 cloudberry_enable_unfiltered_agg,
+									 cloudberry_enable_unfiltered_agg ||
+									 (pgstrom_enable_gpusort && root->sort_pathkeys != NIL),
 #else
 									 true,	/* allow host quals */
 									 false,	/* disallow no device quals*/

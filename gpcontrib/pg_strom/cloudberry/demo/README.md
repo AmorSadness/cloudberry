@@ -715,3 +715,14 @@ rejects native fallback for positive cases, saves plan/source/status artifacts,
 and cleans up its unique schema. `--fault-injection` requires a superuser and
 an otherwise idle dedicated cluster. Service cancellation/crash and pressure
 gates remain separate; inspect `.SKIPPED` artifacts before recording acceptance.
+
+## Experimental GpuSort (GPU acceptance pending)
+
+See [CLOUDBERRY_GPUSORT_DESIGN.md](../../CLOUDBERRY_GPUSORT_DESIGN.md) for the
+fixed-width GpuScan/GpuJoin sorting scope and mandatory full host/device rebuild.
+Run `PGDATABASE=pgstrom_mvp python3 run_gpusort_regression.py` after deploying to
+a GPU cluster. The runner requires real fused GPU-Sort plus merge Motion and
+compares results in their original order. `--buffer-limit` adds a million-row
+cached-plan memory-cap check; `--fault-injection` requires a superuser and an
+idle dedicated cluster. Inspect `.SKIPPED` files: selected cases passing does
+not complete cancellation/crash/rescan/pressure or performance acceptance.

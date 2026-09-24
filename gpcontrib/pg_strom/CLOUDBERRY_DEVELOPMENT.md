@@ -246,3 +246,18 @@ replacement-buffer expansion failure, Service crash queue reclamation, and
 prepared/rescan behavior must be executed in the target environment. A static
 PASS or a successful host build does not close these gates. Do not relabel this
 document as accepted until logs for each enabled feature and failure mode exist.
+
+## Experimental GpuSort (GPU acceptance pending)
+
+The default-off fixed-width implementation fuses local sorting into GpuScan or
+colocated GpuJoin and retains native merge Motion for global order. Native
+LIMIT/OFFSET remains above the merge; GPU Top-K is not enabled. See
+[CLOUDBERRY_GPUSORT_DESIGN.md](CLOUDBERRY_GPUSORT_DESIGN.md) for eligibility,
+projection-buffer bounds, full rebuild requirements and the acceptance matrix.
+
+`cloudberry/test_development.sh` now includes ordered-plan oracle tests and CPU
+tests of the actual sort allocation policy header. The GPU suite adds
+`run_gpusort_regression.py`; its optional `--buffer-limit` and
+`--fault-injection` gates must be run separately. Cancellation, Service recovery,
+rescan and shared-memory pressure remain manual GPU gates. No current GPU
+runtime or full CUDA SDK build is claimed for this milestone.

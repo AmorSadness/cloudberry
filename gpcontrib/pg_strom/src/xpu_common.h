@@ -2744,6 +2744,7 @@ typedef struct kern_session_info
 	float4_t	groupby_ngroups_estimation; /* planne's estimation of ngroups */
 
 	/* gpu-sort final buffer */
+	uint64_t	gpusort_max_buffer_bytes; /* Cloudberry: live projection cap; 0 = none */
 	uint32_t	gpusort_htup_margin;	/* extra space at tail of the final
 										 * kern_tupitem for finalization */
 	uint32_t	gpusort_limit_count;	/* limit-pushdown, if positive */

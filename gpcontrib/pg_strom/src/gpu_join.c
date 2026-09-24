@@ -893,6 +893,75 @@ try_add_xpujoin_simple_path(PlannerInfo *root,
 		add_partial_path(join_rel, &cpath->path);
 }
 
+#ifdef GP_VERSION_NUM
+/* Only comparison semantics shared by the built-in CPU btree operator family
+ * and device datum comparator. Floating NaN, collations and numeric are not
+ * covered by this first Cloudberry sort milestone. */
+static bool
+cloudberry_gpusort_type_supported(Oid type)
+{
+	switch (type)
+	{
+		case BOOLOID:
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case DATEOID:
+		case TIMEOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+cloudberry_gpusort_input_supported(PlannerInfo *root, RelOptInfo *rel,
+								  CustomPath *path, bool be_parallel)
+{
+	pgstromPlanInfo *info = linitial(path->custom_private);
+	Query *query = root->parse;
+	ListCell *lc;
+
+	/* Never advertise a base-table order as the order of a larger join, or
+	 * sort partial aggregation states instead of SQL final values. */
+	if (optimizer || numGpuDevAttrs != 1 || be_parallel ||
+		path->path.parallel_workers || path->path.param_info ||
+		path->path.motionHazard || path->path.barrierHazard ||
+		!CdbPathLocus_IsPartitioned(path->path.locus) ||
+		!bms_equal(root->all_baserels, rel->relids) ||
+		(!pgstrom_is_gpuscan_path(&path->path) && !pgstrom_is_gpujoin_path(&path->path)) ||
+		query->commandType != CMD_SELECT || query->hasModifyingCTE ||
+		query->rowMarks != NIL || query->hasAggs || query->groupClause != NIL ||
+		query->groupingSets != NIL || query->distinctClause != NIL ||
+		query->hasWindowFuncs || query->hasTargetSRFs || query->setOperations ||
+		query->scatterClause || root->sort_pathkeys == NIL ||
+		info->host_quals != NIL || info->gpusort_keys_expr != NIL ||
+		(info->xpu_task_flags & (DEVTASK__PREAGG | DEVTASK__SCAN_OUTER_CHUNKS)) != 0)
+		return false;
+	if (pgstrom_is_gpuscan_path(&path->path))
+	{
+		RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+
+		if (rel->reloptkind != RELOPT_BASEREL || rte->inh || rte->tablesample ||
+			rte->securityQuals != NIL || get_rel_relispartition(rte->relid) ||
+			has_subclass(rte->relid))
+			return false;
+	}
+	/* Keep the materialized tuple fixed width. Upper CPU projection may be
+	 * separate, but may not inject unsupported values into this KDS later. */
+	foreach (lc, path->path.pathtarget->exprs)
+	{
+		Node *expr = lfirst(lc);
+		if ((!IsA(expr, Var) && !IsA(expr, Const)) ||
+			!cloudberry_gpusort_type_supported(exprType(expr)))
+			return false;
+	}
+	return true;
+}
+#endif
+
 /*
  * try_add_sorted_gpujoin_path
  */
@@ -933,6 +1002,11 @@ try_add_sorted_gpujoin_path(PlannerInfo *root,
 			 pp_info->xpu_task_flags);
 		return;		/* feture available on GPU only */
 	}
+#ifdef GP_VERSION_NUM
+	if (!cloudberry_gpusort_input_supported(root, join_rel, cpath, be_parallel))
+		return;
+	sortkeys_upper = root->sort_pathkeys;
+#else
 	/* pick up upper sortkeys */
 	if (root->window_pathkeys != NIL)
         sortkeys_upper = root->window_pathkeys;
@@ -947,6 +1021,7 @@ try_add_sorted_gpujoin_path(PlannerInfo *root,
 		elog(DEBUG1, "gpusort: disabled because no sortable pathkeys");
 		return;		/* no upper sortkeys */
 	}
+#endif
 	/*
 	 * buffer size estimation, because GPU-Sort needs kds_final buffer to save
 	 * the result of GPU-Projection until Bitonic-sorting.
@@ -954,9 +1029,24 @@ try_add_sorted_gpujoin_path(PlannerInfo *root,
 	nattrs = list_length(final_target->exprs);
 	unitsz = (MAXALIGN(offsetof(kern_tupitem, t_bits) + BITMAPLEN(nattrs)) +
 			  MAXALIGN(final_target->width));
+#ifdef GP_VERSION_NUM
+	{
+		double bytes = MAXALIGN(offsetof(kern_data_store, colmeta[nattrs])) +
+			(sizeof(uint64_t) + (double)unitsz) * Max(pp_info->final_nrows, 1.0);
+		double cap = (double)cloudberry_gpusort_max_buffer_mb * 1024.0 * 1024.0;
+
+		/* Retain source chunks plus the complete merge replacement. Runtime
+		 * enforces live allocations, not only this estimate; no disk spill. */
+		if (!isfinite(bytes) || pp_info->final_nrows > INT_MAX / 2 ||
+			2.0 * (bytes + (16UL << 20)) > cap)
+			return;
+		buffer_sz = (size_t)ceil(bytes);
+	}
+#else
 	buffer_sz = MAXALIGN(offsetof(kern_data_store, colmeta[nattrs])) +
 		sizeof(uint64_t) * pp_info->final_nrows +
 		unitsz * pp_info->final_nrows;
+#endif
 	devmem_sz = GetGpuMinimalDeviceMemorySize();
 	if (buffer_sz > devmem_sz)
 	{
@@ -995,6 +1085,14 @@ try_add_sorted_gpujoin_path(PlannerInfo *root,
 			Oid		type_oid;
 			devtype_info *dtype;
 
+#ifdef GP_VERSION_NUM
+			if (!IsA(em_expr, Var) ||
+				!cloudberry_gpusort_type_supported(exprType((Node *)em_expr)) ||
+				OidIsValid(ec->ec_collation) ||
+				pk->pk_opfamily != lookup_type_cache(exprType((Node *)em_expr),
+					TYPECACHE_BTREE_OPFAMILY)->btree_opf)
+				continue;
+#endif
 			/* strip Relabel for equal() comparison */
 			while (IsA(em_expr, RelabelType))
 				em_expr = ((RelabelType *)em_expr)->arg;
@@ -1040,7 +1138,7 @@ try_add_sorted_gpujoin_path(PlannerInfo *root,
 	/* duplicate GpuScan/GpuJoin path and attach GPU-Sort */
 	gpusort_cost = (2.0 * pgstrom_gpu_operator_cost *
 					cpath->path.rows *
-					LOG2(cpath->path.rows));
+					LOG2(Max(cpath->path.rows, 2.0)));
 	cpath = (CustomPath *)pgstrom_copy_pathnode(&cpath->path);
 	pp_info = copy_pgstrom_plan_info(pp_info);
 	pp_info->xpu_task_flags |= (DEVTASK__PINNED_ROW_RESULTS |
@@ -1056,6 +1154,18 @@ try_add_sorted_gpujoin_path(PlannerInfo *root,
 								+ gpusort_cost);
 	cpath->path.total_cost   = (cpath->path.startup_cost
 								+ per_tuple_cost * cpath->path.rows / 2.0);
+#ifdef GP_VERSION_NUM
+	/* Local order only: Cloudberry builds merge-receive Motion when the
+	 * result is gathered. Do not mutate this fixed sorting target later. */
+	cpath->path.pathkeys = sortkeys_upper;
+	cpath->flags &= ~CUSTOMPATH_SUPPORT_PROJECTION;
+	cpath->path.parallel_safe = false;
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_workers = 0;
+	cpath->path.memory += 2.0 * (buffer_sz + (16UL << 20));
+	/* Blocking operator: no rows can be returned until all input is sorted. */
+	cpath->path.startup_cost = cpath->path.total_cost;
+#endif
 	/* add path */
 	if (!be_parallel)
 		add_path(join_rel, &cpath->path
@@ -1746,6 +1856,7 @@ cloudberry_add_gpujoin_path(PlannerInfo *root, RelOptInfo *joinrel,
 	path->path.sameslice_relids = joinrel->relids;
 	/* Deliberately not remembered as an outer leaf: no chained GPU joins or
 	 * Join+PreAgg fusion in this milestone. */
+	try_add_sorted_gpujoin_path(root, joinrel, path, false);
 	add_path(joinrel, &path->path, root);
 }
 #endif

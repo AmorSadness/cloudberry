@@ -15,6 +15,7 @@
 #include <cudaProfiler.h>
 #include <sys/file.h>
 #include "gpu_budget_queue.h"
+#include "gpu_sort_policy.h"
 
 /*
  * Host-wide query-buffer admission control
@@ -214,6 +215,7 @@ static __thread bool			GpuWorkerCommandFailed = false;
 static __thread bool			GpuWorkerCommandCancelled = false;
 static __thread bool			GpuQueryBufferAllocBudgetRejected = false;
 static __thread bool			GpuQueryBufferAllocFailureInjected = false;
+static __thread bool			GpuQueryBufferAllocSortLimit = false;
 #define MY_DINDEX_PER_THREAD	(GpuWorkerCurrentContext->cuda_dindex)
 #define MY_DEVICE_PER_THREAD	(GpuWorkerCurrentContext->cuda_device)
 #define MY_CONTEXT_PER_THREAD	(GpuWorkerCurrentContext->cuda_context)
@@ -2139,6 +2141,7 @@ struct gpuQueryBuffer
 									 *  1: buffer is ready,
 									 * -1: error, during buffer setup */
 	uint64_t		buffer_id;		/* unique buffer id */
+	uint64_t		sort_buffer_limit; /* live projection bytes; zero means unlimited */
 	CUdeviceptr		m_kmrels;		/* GpuJoin inner buffer (device) */
 	void		   *h_kmrels;		/* GpuJoin inner buffer (host) */
 	size_t			kmrels_sz;		/* GpuJoin inner buffer size */
@@ -2226,6 +2229,31 @@ allocGpuQueryBuffer(gpuQueryBuffer *gq_buf,
 
 	GpuQueryBufferAllocBudgetRejected = false;
 	GpuQueryBufferAllocFailureInjected = false;
+	GpuQueryBufferAllocSortLimit = false;
+	if (gqbuf_kind == GQBUF_KIND__FINAL_PROJECTION_BUFFER && gq_buf->sort_buffer_limit > 0)
+	{
+		uint64_t used = 0;
+
+		/* Called serially during setup/finalize, or under m_kds_rwlock during
+		 * expansion. Count retained chunks AND the full merge replacement. */
+		for (int i=0; i < gq_buf->gpumem_nitems; i++)
+		{
+			if (gq_buf->gpumem_kinds[i] != GQBUF_KIND__FINAL_PROJECTION_BUFFER)
+				continue;
+			if (!gpu_sort_buffer_can_allocate(gq_buf->sort_buffer_limit,
+											 used, gq_buf->gpumem_lengths[i]))
+			{
+				GpuQueryBufferAllocSortLimit = true;
+				return CUDA_ERROR_OUT_OF_MEMORY;
+			}
+			used += gq_buf->gpumem_lengths[i];
+		}
+		if (!gpu_sort_buffer_can_allocate(gq_buf->sort_buffer_limit, used, bytesize))
+		{
+			GpuQueryBufferAllocSortLimit = true;
+			return CUDA_ERROR_OUT_OF_MEMORY;
+		}
+	}
 	if (!__enlargeGpuQueryBuffer(gq_buf))
 		return CUDA_ERROR_OUT_OF_MEMORY;
 	if (!gpuSharedBudgetReserve(GpuWorkerCurrentContext, bytesize))
@@ -2280,6 +2308,8 @@ allocGpuQueryBuffer(gpuQueryBuffer *gq_buf,
 static const char *
 gpuQueryBufferAllocError(CUresult rc)
 {
+	if (GpuQueryBufferAllocSortLimit)
+		return "Cloudberry GpuSort exceeds cloudberry_gpusort_max_buffer_size";
 	if (GpuQueryBufferAllocBudgetRejected)
 		return "shared GPU budget admission rejected query buffer";
 	if (GpuQueryBufferAllocFailureInjected)
@@ -3449,6 +3479,7 @@ __getGpuQueryBuffer(gpuClient *gclient, uint64_t buffer_id, bool may_create)
 		gq_buf->refcnt = 1;
 		gq_buf->phase  = 0;	/* not initialized yet */
 		gq_buf->buffer_id = buffer_id;
+		gq_buf->sort_buffer_limit = gclient->h_session->gpusort_max_buffer_bytes;
 		pthreadRWLockInit(&gq_buf->m_kds_rwlock);
 		if (!__initSelectIntoState(&gq_buf->si_state, gclient->h_session))
 		{
@@ -6132,6 +6163,11 @@ gpuservSortingFinalBuffer(gpuClient *gclient,
 	CUresult		rc;
 	bool			retval = false;
 
+	if (kds_final->nitems > INT_MAX / 2)
+	{
+		gpuClientELog(gclient, "GpuSort input exceeds supported row-index range");
+		return false;
+	}
 	if (!kexp_gpusort || kds_final->nitems <= 1)
 		return true;	/* nothing to do */
 
@@ -6163,8 +6199,8 @@ gpuservSortingFinalBuffer(gpuClient *gclient,
 	t_chunk = gpuMemAllocManaged(required);
 	if (!t_chunk)
 	{
-		gpuClientFatal(gclient, "failed on gpuMemAllocManaged: %lu",
-					   sizeof(kern_gputask));
+		gpuClientELog(gclient, "GpuSort scratch allocation failed (bytes=%lu)",
+						 required);
 		goto bailout;
 	}
 	kgtask = (kern_gputask *)t_chunk->m_devptr;
@@ -6506,8 +6542,11 @@ __gpuservHandleGpuScanJoinFinal(gpuClient *gclient,
 	gettimeofday(&tv1, NULL);
 	for (int i=0; i < gq_buf->gpumem_nitems; i++)
 	{
-		kern_data_store *__kds = (kern_data_store *)gq_buf->gpumem_devptrs[i];
+		kern_data_store *__kds;
 
+		if (gq_buf->gpumem_kinds[i] != GQBUF_KIND__FINAL_PROJECTION_BUFFER)
+			continue;
+		__kds = (kern_data_store *)gq_buf->gpumem_devptrs[i];
 		if (__kds && __kds->nitems > 0)
 		{
 			if (!kds_prime)
@@ -6517,6 +6556,12 @@ __gpuservHandleGpuScanJoinFinal(gpuClient *gclient,
 			kds_source_count++;
 		}
 	}
+	if (kds_final_nitems > INT_MAX / 2)
+	{
+		gpuClientELog(gclient, "GpuSort input exceeds supported row-index range");
+		return false;
+	}
+
 	if (!kds_prime)
 		return true;	/* empty results */
 	if (kds_source_count == 1)

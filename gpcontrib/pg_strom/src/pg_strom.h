@@ -170,6 +170,7 @@
 #ifdef GP_VERSION_NUM
 extern bool cloudberry_enable_unfiltered_agg;
 extern bool cloudberry_enable_host_quals;
+extern int cloudberry_gpusort_max_buffer_mb;
 #endif
 
 /* ------------------------------------------------
