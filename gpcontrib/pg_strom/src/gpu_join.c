@@ -11,7 +11,16 @@
  */
 #include "pg_strom.h"
 #include "cuda_common.h"
+#ifdef GP_VERSION_NUM
+#include "catalog/pg_inherits.h"
+#include "access/stratnum.h"
+#include "parser/parsetree.h"
+#endif
 
+
+#ifdef GP_VERSION_NUM
+static int cloudberry_gpujoin_max_inner_mb = 256;
+#endif
 
 /* static variables */
 static set_join_pathlist_hook_type	set_join_pathlist_next = NULL;
@@ -315,7 +324,7 @@ __fixup_join_varnullingrels_walker(Node *node, void *__data)
 		{
 			Var	   *__var = lfirst(lc);
 
-			if (var->varno == __var->varno &&
+			if (IsA(__var, Var) && var->varno == __var->varno &&
 				var->varattno == __var->varattno)
 			{
 				Assert(var->vartype   == __var->vartype &&
@@ -374,11 +383,14 @@ __buildXpuJoinPlanInfo(PlannerInfo *root,
 	pgstromPlanInfo *pp_info;
 	pgstromPlanInnerInfo *pp_inner;
 	Path		   *inner_path = llast(inner_paths_list);
+#ifndef GP_VERSION_NUM
 	Path		   *temp_path;
+#endif
 	RelOptInfo	   *inner_rel = inner_path->parent;
 	RelOptInfo	   *outer_rel = op_prev->leaf_rel;
 	Cardinality		outer_nrows;
 	Cardinality		inner_nrows;
+	double			join_nrows = joinrel->rows;
 	Cost			startup_cost;
 	Cost			inner_cost;
 	Cost			run_cost;
@@ -386,7 +398,9 @@ __buildXpuJoinPlanInfo(PlannerInfo *root,
 	Cost			comp_cost = 0.0;
 	Cost			inner_final_cost = 0.0;
 	bool			enable_xpuhashjoin;
+#ifndef GP_VERSION_NUM
 	bool			enable_xpugistindex;
+#endif
 	double			xpu_tuple_cost;
 	Cost			xpu_operator_cost;
 	Cost			xpu_ratio;
@@ -399,6 +413,11 @@ __buildXpuJoinPlanInfo(PlannerInfo *root,
 	ListCell	   *lc;
 	bool			clauses_are_immutable = true;
 
+#ifdef GP_VERSION_NUM
+	/* RelOptInfo statistics are global; this join runs independently per QE. */
+	join_nrows /= planner_segment_count(outer_rel->cdbpolicy);
+#endif
+
 	/* cross join is not welcome */
 	if (!restrict_clauses)
 		return NULL;
@@ -409,7 +428,9 @@ __buildXpuJoinPlanInfo(PlannerInfo *root,
 	if ((pp_prev->xpu_task_flags & DEVKIND__ANY) == DEVKIND__NVIDIA_GPU)
 	{
 		enable_xpuhashjoin  = pgstrom_enable_gpuhashjoin;
+#ifndef GP_VERSION_NUM
 		enable_xpugistindex = pgstrom_enable_gpugistindex;
+#endif
 		xpu_tuple_cost      = pgstrom_gpu_tuple_cost;
 		xpu_operator_cost   = cpu_operator_cost * pgstrom_gpu_operator_ratio();
 		xpu_ratio           = pgstrom_gpu_operator_ratio();
@@ -417,7 +438,9 @@ __buildXpuJoinPlanInfo(PlannerInfo *root,
 	else if ((pp_prev->xpu_task_flags & DEVKIND__ANY) == DEVKIND__NVIDIA_DPU)
 	{
 		enable_xpuhashjoin  = pgstrom_enable_dpuhashjoin;
+#ifndef GP_VERSION_NUM
 		enable_xpugistindex = pgstrom_enable_dpugistindex;
+#endif
 		xpu_tuple_cost      = pgstrom_dpu_tuple_cost;
 		xpu_operator_cost   = cpu_operator_cost * pgstrom_dpu_operator_ratio();
 		xpu_ratio           = pgstrom_dpu_operator_ratio();
@@ -555,6 +578,12 @@ __buildXpuJoinPlanInfo(PlannerInfo *root,
 	pp_inner->hash_inner_keys = hash_inner_keys;
 	pp_inner->join_quals = join_quals;
 	pp_inner->other_quals = other_quals;
+#ifdef GP_VERSION_NUM
+	/* Cloudberry only constructs hash joins. Never reach GiST/nested-loop or
+	 * pinned-buffer paths, even when their upstream GUCs are changed. */
+	if (hash_outer_keys == NIL || hash_inner_keys == NIL)
+		return NULL;
+#else
 	/* GiST-Index availability checks */
 	if (enable_xpugistindex &&
 		hash_outer_keys == NIL &&
@@ -582,6 +611,7 @@ __buildXpuJoinPlanInfo(PlannerInfo *root,
 	if (temp_path)
 		llast(inner_paths_list) = inner_path = temp_path;
 
+#endif
 	/*
 	 * Cost estimation
 	 */
@@ -679,17 +709,17 @@ __buildXpuJoinPlanInfo(PlannerInfo *root,
 	/* discount if CPU parallel is enabled */
 	run_cost += (comp_cost / pp_info->parallel_divisor);
 	/* cost for DMA receive (xPU --> Host) */
-	run_cost += (xpu_tuple_cost * joinrel->rows) / pp_info->parallel_divisor;
+	run_cost += (xpu_tuple_cost * join_nrows) / pp_info->parallel_divisor;
 	/* cost for host projection */
 	final_cost += (joinrel->reltarget->cost.per_tuple *
-				   joinrel->rows / pp_info->parallel_divisor);
+				   join_nrows / pp_info->parallel_divisor);
 
 	pp_info->startup_cost = startup_cost;
 	pp_info->inner_cost = inner_cost;
 	pp_info->run_cost = run_cost;
 	pp_info->final_cost = final_cost;
-	pp_info->final_nrows = joinrel->rows;
-	pp_inner->join_nrows = clamp_row_est(joinrel->rows / pp_info->parallel_divisor);
+	pp_info->final_nrows = join_nrows;
+	pp_inner->join_nrows = clamp_row_est(join_nrows / pp_info->parallel_divisor);
 
 	return fixup_join_varnullingrels(joinrel, pp_info);
 }
@@ -1546,6 +1576,180 @@ __xpuJoinTryAddPartitionLeafs(PlannerInfo *root,
 							  be_parallel);
 }
 
+#ifdef GP_VERSION_NUM
+/* Match physical policies, not just similarly named SQL keys. No casts,
+ * expressions, partial composite keys, EC-only proofs or random policies. */
+static bool
+cloudberry_gpujoin_base_supported(PlannerInfo *root, RelOptInfo *rel)
+{
+	RangeTblEntry *rte;
+	ListCell *lc;
+
+	if (rel->reloptkind != RELOPT_BASEREL || rel->relid == 0 ||
+		rel->lateral_relids || !rel->cdbpolicy ||
+		!GpPolicyIsPartitioned(rel->cdbpolicy) || rel->cdbpolicy->nattrs <= 0 ||
+		rel->cdbpolicy->numsegments != getgpsegmentCount())
+		return false;
+	rte = planner_rt_fetch(rel->relid, root);
+	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION ||
+		rte->inh || rte->tablesample || rte->securityQuals != NIL ||
+		has_subclass(rte->relid) || get_rel_relispartition(rte->relid) ||
+		get_relation_am(rte->relid, true) != HEAP_TABLE_AM_OID)
+		return false;
+	foreach (lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst(lc);
+
+		if (rinfo->pseudoconstant || contain_volatile_functions((Node *)rinfo->clause) ||
+			contain_subplans((Node *)rinfo->clause) ||
+			!pgstrom_xpu_expression(rinfo->clause, TASK_KIND__GPUJOIN,
+								   rel->relid, NIL, NULL))
+			return false;
+	}
+	return true;
+}
+
+static bool
+cloudberry_gpujoin_colocated(RelOptInfo *outerrel, RelOptInfo *innerrel,
+							List *clauses)
+{
+	GpPolicy *a = outerrel->cdbpolicy;
+	GpPolicy *b = innerrel->cdbpolicy;
+
+	if (a->nattrs != b->nattrs || a->numsegments != b->numsegments)
+		return false;
+	for (int k=0; k < a->nattrs; k++)
+	{
+		ListCell *lc;
+		bool matched = false;
+
+		if (a->opclasses[k] != b->opclasses[k])
+			return false;
+		foreach (lc, clauses)
+		{
+			RestrictInfo *rinfo = lfirst(lc);
+			OpExpr *op;
+			Var *v1, *v2;
+			Oid eqop;
+
+			if (!is_opclause(rinfo->clause) || rinfo->pseudoconstant)
+				continue;
+			op = (OpExpr *)rinfo->clause;
+			if (list_length(op->args) != 2 ||
+				!IsA(linitial(op->args), Var) || !IsA(lsecond(op->args), Var))
+				continue;
+			v1 = linitial_node(Var, op->args);
+			v2 = lsecond_node(Var, op->args);
+			if (v1->varno == innerrel->relid)
+			{
+				Var *tmp = v1;
+				v1 = v2;
+				v2 = tmp;
+			}
+			if (v1->varno != outerrel->relid || v2->varno != innerrel->relid ||
+				v1->varlevelsup || v2->varlevelsup ||
+				v1->varattno != a->attrs[k] || v2->varattno != b->attrs[k] ||
+				v1->vartype != v2->vartype ||
+				(v1->vartype != INT2OID && v1->vartype != INT4OID && v1->vartype != INT8OID))
+				continue;
+			eqop = get_opfamily_member(INTEGER_BTREE_FAM_OID, v1->vartype,
+									  v1->vartype, BTEqualStrategyNumber);
+			if (op->opno == eqop && rinfo->hashjoinoperator == eqop &&
+				get_opfamily_member(get_opclass_family(a->opclasses[k]),
+					v1->vartype, v1->vartype, HTEqualStrategyNumber) == eqop)
+			{
+				matched = true;
+				break;
+			}
+		}
+		if (!matched)
+			return false;
+	}
+	return true;
+}
+
+static void
+cloudberry_add_gpujoin_path(PlannerInfo *root, RelOptInfo *joinrel,
+						   RelOptInfo *outerrel, RelOptInfo *innerrel,
+						   JoinType jointype, JoinPathExtraData *extra)
+{
+	pgstromOuterPathLeafInfo *leaf;
+	Path *inner;
+	Path outer = {0};
+	CustomPath *path;
+	CdbPathLocus outer_locus;
+	double inner_bytes;
+	ListCell *lc;
+
+	if (optimizer || !pgstrom_enable_gpujoin || !pgstrom_enable_gpuhashjoin ||
+		jointype != JOIN_INNER || bms_num_members(root->all_baserels) != 2 ||
+		bms_num_members(joinrel->relids) != 2 || root->parse->rowMarks != NIL ||
+		root->parse->commandType != CMD_SELECT || root->parse->hasModifyingCTE ||
+		!cloudberry_gpujoin_base_supported(root, outerrel) ||
+		!cloudberry_gpujoin_base_supported(root, innerrel) ||
+		!cloudberry_gpujoin_colocated(outerrel, innerrel, extra->restrictlist))
+		return;
+	foreach (lc, extra->restrictlist)
+	{
+		RestrictInfo *rinfo = lfirst(lc);
+		if (rinfo->pseudoconstant || contain_volatile_functions((Node *)rinfo->clause) ||
+			contain_subplans((Node *)rinfo->clause))
+			return;
+		/* Extra equality clauses may also become GPU hash keys. Do not assume
+		 * cross-type device hashes agree merely because SQL equality exists. */
+		if (OidIsValid(rinfo->hashjoinoperator) && is_opclause(rinfo->clause))
+		{
+			OpExpr *op = (OpExpr *)rinfo->clause;
+			if (list_length(op->args) != 2 ||
+				exprType(linitial(op->args)) != exprType(lsecond(op->args)))
+				return;
+		}
+	}
+	/* No Motion, CustomScan, parameterized or parallel inner child. CPU scan
+	 * owns MVCC and filtering. Its target retains the join inputs. */
+	inner = create_seqscan_path(root, innerrel, NULL, 0);
+	outer_locus = cdbpathlocus_from_baserel(root, outerrel, 0);
+	if (!CdbPathLocus_IsHashed(outer_locus) ||
+		!CdbPathLocus_IsHashed(inner->locus) ||
+		CdbPathLocus_NumSegments(outer_locus) != outerrel->cdbpolicy->numsegments ||
+		CdbPathLocus_NumSegments(inner->locus) != innerrel->cdbpolicy->numsegments ||
+		inner->param_info ||
+		inner->parallel_workers || inner->motionHazard || inner->barrierHazard)
+		return;
+	/* Conservative estimate, not a reservation. Runtime also caps the actual
+	 * hash KDS before mapping it. Skew/TOAST may exceed the estimate. */
+	inner_bytes = 8192.0 + inner->rows * (MAXALIGN(inner->pathtarget->width) + 96.0);
+	if (!isfinite(inner_bytes) ||
+		inner_bytes > (double)cloudberry_gpujoin_max_inner_mb * 1024.0 * 1024.0)
+		return;
+	leaf = cloudberry_build_join_scan(root, outerrel);
+	if (!leaf)
+		return;
+	outer.parent = outerrel;
+	outer.rows = leaf->leaf_nrows;
+	outer.locus = outer_locus;
+	path = __build_simple_xpujoin_path(root, joinrel, &outer, inner, jointype,
+		leaf, NULL, extra->restrictlist, extra->sjinfo, extra->param_source_rels,
+		false, -1, 1.0, TASK_KIND__GPUJOIN, &gpujoin_path_methods);
+	if (!path)
+		return;
+	/* Projection may drop every distribution key. Strewn is conservative and
+	 * prevents upper operators from assuming a nonexistent hashed target. */
+	CdbPathLocus_MakeStrewn(&path->path.locus, outerrel->cdbpolicy->numsegments, 0);
+	path->path.parallel_aware = false;
+	path->path.parallel_safe = false;
+	path->path.parallel_workers = 0;
+	path->path.memory = inner_bytes; /* executor bytes per QE */
+	path->path.motionHazard = false;
+	path->path.barrierHazard = false;
+	path->path.rescannable = true;
+	path->path.sameslice_relids = joinrel->relids;
+	/* Deliberately not remembered as an outer leaf: no chained GPU joins or
+	 * Join+PreAgg fusion in this milestone. */
+	add_path(joinrel, &path->path, root);
+}
+#endif
+
 /*
  * XpuJoinAddCustomPath
  */
@@ -1565,6 +1769,11 @@ XpuJoinAddCustomPath(PlannerInfo *root,
 							   innerrel,
 							   join_type,
 							   extra);
+#ifdef GP_VERSION_NUM
+	if (pgstrom_enabled() && gpuserv_ready_accept())
+		cloudberry_add_gpujoin_path(root, joinrel, outerrel, innerrel, join_type, extra);
+	return;
+#endif
 	/* quick bailout if PG-Strom is not enabled */
 	if (pgstrom_enabled())
 	{
@@ -2244,6 +2453,19 @@ execInnerPreloadOneDepth(MemoryContext memcxt,
 			preload_buf->rows[index] = mtup;
 			preload_buf->usage += MAXALIGN(mtup->t_len + ROWID_SIZE);
 		}
+#ifdef GP_VERSION_NUM
+		if (pgstrom_is_gpujoin_state((PlanState *)pts))
+		{
+			size_t bytes = PAGE_ALIGN(MAXALIGN(offsetof(kern_multirels, chunks[1])) +
+				estimate_kern_data_store(tupdesc) +
+				MAXALIGN(sizeof(uint64_t) * preload_buf->nitems) +
+				MAXALIGN(sizeof(uint64_t) * Max(320, preload_buf->nitems)) +
+				MAXALIGN(preload_buf->usage));
+			if (bytes > (size_t)cloudberry_gpujoin_max_inner_mb * 1024 * 1024)
+				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					errmsg("Cloudberry GpuJoin inner buffer exceeds cloudberry_gpujoin_max_inner_size")));
+		}
+#endif
 		MemoryContextSwitchTo(oldcxt);
 	}
 	istate->preload_buffer = preload_buf;
@@ -2605,6 +2827,12 @@ again:
 	}
 	offset = PAGE_ALIGN(offset);
 
+#ifdef GP_VERSION_NUM
+	if (pgstrom_is_gpujoin_state((PlanState *)pts) &&
+		offset > (size_t)cloudberry_gpujoin_max_inner_mb * 1024 * 1024)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			errmsg("Cloudberry GpuJoin inner buffer exceeds cloudberry_gpujoin_max_inner_size")));
+#endif
 	/*
 	 * allocation of the host inner-buffer
 	 */
@@ -3005,6 +3233,16 @@ __pgstrom_init_xpujoin_common(void)
 	}
 }
 
+#ifdef GP_VERSION_NUM
+static void
+ExplainCloudberryGpuJoin(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	ExplainPropertyText("Cloudberry Join", "Colocated INNER hash join", es);
+	ExplainPropertyText("Inner Input", "Native QE heap scan; no Motion", es);
+	pgstromExplainTaskState(node, ancestors, es);
+}
+#endif
+
 /*
  * pgstrom_init_gpu_join
  */
@@ -3013,12 +3251,23 @@ pgstrom_init_gpu_join(void)
 {
 	size_t		dram_sz = 0;
 
+#ifdef GP_VERSION_NUM
+	DefineCustomIntVariable("pg_strom.cloudberry_gpujoin_max_inner_size",
+		"Maximum per-QE Cloudberry GpuJoin inner hash buffer", NULL,
+		&cloudberry_gpujoin_max_inner_mb, 256, 1, 4096,
+		PGC_USERSET, GUC_NOT_IN_SAMPLE | GUC_UNIT_MB | GUC_GPDB_NEED_SYNC,
+		NULL, NULL, NULL);
+#endif
 	/* turn on/off gpujoin */
 	DefineCustomBoolVariable("pg_strom.enable_gpujoin",
 							 "Enables the use of GpuJoin logic",
 							 NULL,
 							 &pgstrom_enable_gpujoin,
+#ifdef GP_VERSION_NUM
+							 false,
+#else
 							 true,
+#endif
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
@@ -3105,7 +3354,12 @@ pgstrom_init_gpu_join(void)
 	gpujoin_exec_methods.InitializeDSMCustomScan = pgstromSharedStateInitDSM;
 	gpujoin_exec_methods.InitializeWorkerCustomScan = pgstromSharedStateAttachDSM;
 	gpujoin_exec_methods.ShutdownCustomScan		= pgstromSharedStateShutdownDSM;
-	gpujoin_exec_methods.ExplainCustomScan		= pgstromExplainTaskState;
+	gpujoin_exec_methods.ExplainCustomScan		=
+#ifdef GP_VERSION_NUM
+		ExplainCloudberryGpuJoin;
+#else
+		pgstromExplainTaskState;
+#endif
 	/* common portion */
 	__pgstrom_init_xpujoin_common();
 }

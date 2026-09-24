@@ -703,3 +703,15 @@ ended with `Cloudberry shared-GPU P0a/P0c concurrency matrix passed`.  Combined
 with the earlier multi-GpuPreAgg, cancel, and SIGKILL/stale-reclaim results,
 P0a, P0b, and P0c are complete for the documented single-host topology.  M4b
 changes this matrix to require a new adaptive request below 1GiB.
+
+
+## Experimental colocated GpuJoin (GPU acceptance pending)
+
+The default-off two-heap INNER hash-join implementation and complete acceptance
+instructions are in [`CLOUDBERRY_GPUJOIN_COLOCATED_DESIGN.md`](../../CLOUDBERRY_GPUJOIN_COLOCATED_DESIGN.md).
+Run `PGDATABASE=pgstrom_mvp python3 run_gpujoin_regression.py` from this directory
+on a freshly built GPU cluster. The runner compares full result multisets,
+rejects native fallback for positive cases, saves plan/source/status artifacts,
+and cleans up its unique schema. `--fault-injection` requires a superuser and
+an otherwise idle dedicated cluster. Service cancellation/crash and pressure
+gates remain separate; inspect `.SKIPPED` artifacts before recording acceptance.

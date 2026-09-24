@@ -5,6 +5,23 @@ without a GPU. Historical 2026-08-14 acceptance does not validate these changes.
 The supported validation topology remains one host, at least two Primaries,
 one shared GPU, one UID and one PID namespace, PostgreSQL planner.
 
+## Colocated GpuJoin development (2026-09-24)
+
+A default-off `pg_strom.enable_gpujoin` now enables a restricted two-table
+colocated INNER hash join. Full same-type integer distribution keys, identical
+hash opclasses/key order/Segment counts and ordinary heap storage are required.
+The inner input is a native serial QE Seq Scan; no input Motion, replicated,
+partition, outer/semi/anti join or Join+PreAgg fusion is admitted. Predicate-free
+fused join input does not enable standalone predicate-free GpuScan.
+`pg_strom.cloudberry_gpujoin_max_inner_size` defaults to 256MB per QE; estimates
+above it retain native paths and actual preload overflow fails explicitly.
+
+Source/API syntax and GPU-free checks passed; **all GPU runtime acceptance is
+pending**. See `CLOUDBERRY_GPUJOIN_COLOCATED_DESIGN.md` for the implementation,
+manual GPU runner, shared-buffer lifecycle and remaining failure/recovery gates.
+The development suite now includes `run_gpujoin_regression.py`; its default
+run does not execute destructive Service tests or allocation injection.
+
 ## Ordered implementation
 
 1. Mixed-input reliability: dedicated cancellation/recovery/concurrency and

@@ -993,9 +993,7 @@ _PG_init(void)
 	{
 		pgstrom_init_gpu_service();
 		pgstrom_init_gpu_scan();
-#ifndef GP_VERSION_NUM
 		pgstrom_init_gpu_join();
-#endif
 		pgstrom_init_gpu_preagg();
 #ifndef GP_VERSION_NUM
 		pgstrom_init_gpu_cache();

@@ -2160,6 +2160,21 @@ __pgstromExecTaskOpenConnection(pgstromTaskState *pts)
 	/* attach pgstromSharedState, if none */
 	if (!pts->ps_state)
 		pgstromSharedStateInitDSM(&pts->css, NULL, NULL);
+#ifdef GP_VERSION_NUM
+	if (pgstrom_is_gpujoin_state((PlanState *)pts))
+	{
+		/* plan_node_id repeats across prepared executions/rescans. A Service
+		 * can still hold the old session while its socket close is draining.
+		 * Give each serial QE execution a separate buffer identity; the high
+		 * bit separates these IDs from positive plan_node_id-based IDs. */
+		static uint32 join_execution_id = 0;
+
+		if (join_execution_id == 0x7fffffffU)
+			elog(ERROR, "Cloudberry GpuJoin execution ID exhausted; reconnect");
+		pts->ps_state->query_plan_id = ((uint64_t)MyProcPid << 32) |
+			0x80000000U | ++join_execution_id;
+	}
+#endif
 	/* preload inner buffer, if any */
 	if (pts->num_rels > 0)
 	{
@@ -2452,6 +2467,16 @@ pgstromExecResetTaskState(CustomScanState *node)
 		__munmapShmem(pts->h_kmrels);
 		pts->h_kmrels = NULL;
 	}
+#ifdef GP_VERSION_NUM
+	if (ps_state && pgstrom_is_gpujoin_state((PlanState *)pts))
+	{
+		/* Do not overwrite an mmap still owned by a draining Service session. */
+		if (ps_state->preload_shmem_handle != 0)
+			__shmemDrop(ps_state->preload_shmem_handle);
+		ps_state->preload_shmem_handle = 0;
+		ps_state->preload_shmem_handle = __shmemCreate(pts->ds_entry);
+	}
+#endif
 	/* reset child plans */
 	foreach (lc, pts->css.custom_ps)
 		ExecReScan((PlanState *) lfirst(lc));

@@ -6,6 +6,8 @@ work=$(mktemp -d /tmp/pgstrom-development-check.XXXXXX)
 trap 'rm -rf "$work"' EXIT
 bash "$test_dir/test_static_mvp.sh"
 python3 "$test_dir/test_operator_static.py"
+python3 "$test_dir/test_gpujoin.py"
+bash -n "$test_dir/check_gpujoin_host_syntax.sh"
 for script in "$test_dir"/demo/*.sh; do bash -n "$script"; done
 python3 - "$test_dir/demo/run_development_regression.py" <<'PY'
 import ast

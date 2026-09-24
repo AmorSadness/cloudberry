@@ -1195,6 +1195,10 @@ extern void		pgstrom_remember_op_leafs(PlannerInfo *root,
 										  RelOptInfo *parent_rel,
 										  List *op_leaf_list,
 										  bool be_parallel);
+#ifdef GP_VERSION_NUM
+extern pgstromOuterPathLeafInfo *cloudberry_build_join_scan(PlannerInfo *root,
+														RelOptInfo *baserel);
+#endif
 extern pgstromOuterPathLeafInfo *pgstrom_find_op_normal(PlannerInfo *root,
 														RelOptInfo *outer_rel,
 														uint32_t xpu_task_flags,

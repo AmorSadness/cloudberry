@@ -34,8 +34,10 @@ experimental GpuPreAgg path (Gather-final or proven colocated local-final).
 Both are restricted to a
 non-partitioned, ordinarily distributed heap table.  AO, AOCO, partitioned
 tables, foreign/Arrow tables and coordinator-local or replicated tables retain
-native paths.  GpuJoin, GpuCache, BRIN acceleration, SELECT-INTO-Direct and
-every DPU path are not registered.  GpuSort, numeric aggregation and
+native paths.  GpuCache, BRIN acceleration, SELECT-INTO-Direct and every DPU path are not
+registered. GpuJoin is now registered with a default-off, Cloudberry-only
+colocated two-heap INNER hash-join path; GPU acceptance is pending. See
+`CLOUDBERRY_GPUJOIN_COLOCATED_DESIGN.md` for its narrower eligibility and tests.  GpuSort, numeric aggregation and
 partitionwise GpuPreAgg remain disabled.  GPU-Direct and SELECT-INTO-Direct
 cannot be enabled.
 

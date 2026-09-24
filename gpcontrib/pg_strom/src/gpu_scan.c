@@ -458,6 +458,21 @@ buildSimpleScanPlanInfo(PlannerInfo *root,
 }
 
 #ifdef GP_VERSION_NUM
+/* Private fused-join input: does not change standalone GpuScan eligibility.
+ * Caller proves heap storage/distribution and rejects parameterization. */
+pgstromOuterPathLeafInfo *
+cloudberry_build_join_scan(PlannerInfo *root, RelOptInfo *baserel)
+{
+	pgstromOuterPathLeafInfo *leaf =
+		buildSimpleScanPlanInfo(root, baserel, TASK_KIND__GPUSCAN, false);
+
+	if (!leaf || leaf->leaf_param || leaf->pp_info->host_quals != NIL)
+		return NULL;
+	return leaf;
+}
+#endif
+
+#ifdef GP_VERSION_NUM
 /*
  * Build a row target whose output positions match base-table attribute
  * numbers.  build_physical_tlist() exposes every base attribute as a Var,

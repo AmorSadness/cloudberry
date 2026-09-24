@@ -20,7 +20,7 @@ git -C "$repo_root" diff --binary -- gpcontrib/pg_strom src/backend/cdb/cdbplan.
         | xargs -0 sha256sum
 ) >"$results/source-sha256.txt"
 # Historical runners explicitly test the pre-development feature boundary.
-export PGOPTIONS="${PGOPTIONS:-} -c pg_strom.cloudberry_enable_extended_agg=off -c pg_strom.cloudberry_enable_unfiltered_agg=off -c pg_strom.cloudberry_enable_redistribute_final=off -c pg_strom.cloudberry_enable_count_types=off -c pg_strom.cloudberry_enable_host_input=off -c pg_strom.cloudberry_enable_cpu_filter=off -c pg_strom.cloudberry_enable_heap_partition=off"
+export PGOPTIONS="${PGOPTIONS:-} -c pg_strom.enable_gpujoin=off -c pg_strom.cloudberry_enable_extended_agg=off -c pg_strom.cloudberry_enable_unfiltered_agg=off -c pg_strom.cloudberry_enable_redistribute_final=off -c pg_strom.cloudberry_enable_count_types=off -c pg_strom.cloudberry_enable_host_input=off -c pg_strom.cloudberry_enable_cpu_filter=off -c pg_strom.cloudberry_enable_heap_partition=off"
 
 run() {
     local label=$1
@@ -33,6 +33,8 @@ for runner in run_demo run_gpupreagg_mvp run_gpupreagg_m4b run_gpupreagg_m5a \
               run_gpupreagg_having run_gpupreagg_mixed_quals; do
     run "$runner" bash "$demo_dir/$runner.sh"
 done
+run gpujoin env PGSTROM_RESULTS="$results/gpujoin-artifacts" \
+    python3 "$demo_dir/run_gpujoin_regression.py"
 run development env PGSTROM_RESULTS="$results/development-artifacts" \
     python3 "$demo_dir/run_development_regression.py" --stage all
 if [[ ${PGSTROM_DEVELOPMENT_EXPANSION_FAILURE:-0} == 1 ]]; then

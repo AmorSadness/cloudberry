@@ -3118,6 +3118,11 @@ __setupGpuQueryJoinInnerBuffer(gpuClient *gclient,
 
 error:
 	releaseGpuQueryBufferAll(gq_buf);
+	/* Local cleanup owns the mapping on failure, even if setup had already
+	 * published it. The query-buffer destructor must not unmap it again. */
+	gq_buf->h_kmrels = NULL;
+	gq_buf->m_kmrels = 0;
+	gq_buf->kmrels_sz = 0;
 	if (h_kmrels != NULL &&
 		h_kmrels != MAP_FAILED)
 		munmap(h_kmrels, mmap_sz);
